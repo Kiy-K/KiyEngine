@@ -1,40 +1,40 @@
-import re
 import json
+import re
 
-def parse_medgemma_response(raw_text):
-    """
-    Parses the raw response from MedGemma.
-    Extracts the thought process (between <unused94> and <unused95>)
-    and the final JSON object.
-    """
-    # 1. Extract Thought Process (Using Regex)
-    thought_match = re.search(r'<unused94>thought\s*(.*?)\s*<unused95>', raw_text, re.DOTALL)
-    thought = thought_match.group(1).strip() if thought_match else None
 
-    # 2. Extract JSON Data (Using Regex as requested)
+def parse_medgemma_response(raw_text: str) -> dict:
+    """
+    Robust parser for MedGemma responses.
+    Supports both <think>...</think> and <unused94>thought...<unused95> formats.
+    Returns a dict with thought, is_json flag, and content.
+    """
+    # 1. Extract Thought (support both <think> and <unused94>)
+    thought_match = re.search(
+        r'(<unused94>thought|<think>)(.*?)(<unused95>|</think>)',
+        raw_text,
+        re.DOTALL
+    )
+    thought = thought_match.group(2).strip() if thought_match else ""
     
-    # Remove the thought part from the text to avoid matching braces inside thought
-    text_without_thought = raw_text
-    if thought_match:
-        text_without_thought = raw_text.replace(thought_match.group(0), "")
-
+    # 2. Extract JSON (Robust fallback)
+    # Remove thought block from text first
+    clean_text = re.sub(
+        r'(<unused94>thought|<think>).*?(<unused95>|</think>)',
+        '',
+        raw_text,
+        flags=re.DOTALL
+    ).strip()
+    
+    json_data = None
     try:
-        # We look for a JSON object structure: starting with { and ending with }
-        # encompassing everything in between.
-        json_match = re.search(r'(\{.*\})', text_without_thought, re.DOTALL)
-        
+        json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
         if json_match:
-            json_str = json_match.group(1)
-            data = json.loads(json_str)
-        else:
-            data = None
-            
-    except json.JSONDecodeError:
-        data = None
-    
-    # Fallback: Exception handling / malformed JSON
-    # Return raw text if JSON parsing fails or no data
-    if data is None:
-        return text_without_thought.strip() if text_without_thought.strip() else raw_text
+            json_data = json.loads(json_match.group(0))
+    except (json.JSONDecodeError, Exception):
+        pass
 
-    return {"thought": thought, "data": data}
+    return {
+        "thought": thought,
+        "is_json": json_data is not None,
+        "content": json_data if json_data else clean_text
+    }
