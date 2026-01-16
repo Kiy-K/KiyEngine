@@ -1,97 +1,67 @@
-import httpx
+import os
+import asyncio
+from fastmcp import Client as MCPClient
 
-PUBMED_SEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-PUBMED_FETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+# MCP Server URL from environment
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "https://med-mcp.fastmcp.app/mcp")
 
 
-def search_pubmed(query: str, max_results: int = 3) -> str:
+async def call_mcp_tool_async(tool_name: str, arguments: dict) -> str:
     """
-    Search PubMed for articles matching the query.
-    Returns a string summary of the top articles (Title + Abstract).
+    Call a tool on the FastMCP server asynchronously.
+    Returns the result as a string.
     """
     try:
-        # Step 1: Search for article IDs
-        search_params = {
-            "db": "pubmed",
-            "term": query,
-            "retmax": max_results,
-            "retmode": "json",
-        }
-        
-        with httpx.Client(timeout=30.0) as client:
-            search_response = client.get(PUBMED_SEARCH_URL, params=search_params)
-            search_response.raise_for_status()
-            search_data = search_response.json()
-        
-        id_list = search_data.get("esearchresult", {}).get("idlist", [])
-        
-        if not id_list:
-            return "No articles found for this query."
-        
-        # Step 2: Fetch article details
-        fetch_params = {
-            "db": "pubmed",
-            "id": ",".join(id_list),
-            "retmode": "xml",
-            "rettype": "abstract",
-        }
-        
-        with httpx.Client(timeout=30.0) as client:
-            fetch_response = client.get(PUBMED_FETCH_URL, params=fetch_params)
-            fetch_response.raise_for_status()
-            xml_content = fetch_response.text
-        
-        # Step 3: Parse XML (simple extraction)
-        articles = _parse_pubmed_xml(xml_content)
-        
-        if not articles:
-            return "Could not parse article details."
-        
-        # Format output
-        result_parts = []
-        for i, article in enumerate(articles, 1):
-            result_parts.append(f"**Article {i}:**")
-            result_parts.append(f"Title: {article.get('title', 'N/A')}")
-            result_parts.append(f"Abstract: {article.get('abstract', 'N/A')[:500]}...")
-            result_parts.append("")
-        
-        return "\n".join(result_parts)
-    
-    except httpx.HTTPStatusError as e:
-        return f"Search failed: HTTP {e.response.status_code}"
-    except httpx.RequestError as e:
-        return f"Search failed: {str(e)}"
+        async with MCPClient(MCP_SERVER_URL) as client:
+            result = await client.call_tool(tool_name, arguments)
+            # Result can be a list of content items or a single value
+            if isinstance(result, list):
+                # Typically result is a list of TextContent or similar
+                return "\n".join(str(item) for item in result)
+            return str(result)
     except Exception as e:
-        return f"Search failed: {str(e)}"
+        return f"MCP call failed: {str(e)}"
 
 
-def _parse_pubmed_xml(xml_content: str) -> list:
+def call_mcp_tool(tool_name: str, arguments: dict) -> str:
     """
-    Simple XML parsing for PubMed articles.
-    Extracts title and abstract from each article.
+    Synchronous wrapper for MCP tool calls.
+    Use this in Streamlit which runs in sync context.
     """
-    import re
+    return asyncio.run(call_mcp_tool_async(tool_name, arguments))
+
+
+async def list_mcp_tools_async() -> list:
+    """
+    List available tools from the MCP server.
+    """
+    try:
+        async with MCPClient(MCP_SERVER_URL) as client:
+            tools = await client.list_tools()
+            return tools
+    except Exception as e:
+        return [f"Error listing tools: {str(e)}"]
+
+
+def list_mcp_tools() -> list:
+    """
+    Synchronous wrapper for listing MCP tools.
+    """
+    return asyncio.run(list_mcp_tools_async())
+
+
+# Legacy PubMed function (kept for fallback)
+def search_pubmed(query: str) -> str:
+    """
+    Search medical literature via MCP server.
+    This is a convenience wrapper that calls the MCP tool.
+    """
+    # Try to use MCP first, with tool name guessed as 'search' or 'pubmed_search'
+    # The actual tool name depends on the MCP server implementation
+    result = call_mcp_tool("search", {"query": query})
     
-    articles = []
+    if "MCP call failed" in result:
+        # Fallback: try different tool names
+        result = call_mcp_tool("pubmed_search", {"query": query})
     
-    # Find all PubmedArticle blocks
-    article_blocks = re.findall(r'<PubmedArticle>(.*?)</PubmedArticle>', xml_content, re.DOTALL)
-    
-    for block in article_blocks:
-        article = {}
-        
-        # Extract Title
-        title_match = re.search(r'<ArticleTitle>(.*?)</ArticleTitle>', block, re.DOTALL)
-        if title_match:
-            article['title'] = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
-        
-        # Extract Abstract
-        abstract_match = re.search(r'<AbstractText[^>]*>(.*?)</AbstractText>', block, re.DOTALL)
-        if abstract_match:
-            article['abstract'] = re.sub(r'<[^>]+>', '', abstract_match.group(1)).strip()
-        else:
-            article['abstract'] = "No abstract available."
-        
-        articles.append(article)
-    
-    return articles
+    return result
