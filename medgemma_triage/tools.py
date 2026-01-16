@@ -1,67 +1,65 @@
 import os
 import asyncio
-from fastmcp import Client as MCPClient
+from fastmcp import Client
 
-# MCP Server URL from environment
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "https://med-mcp.fastmcp.app/mcp")
+# Load URL from env, default to the one that works with FastMCP Client
+# Note: FastMCP Client usually expects the base URL (e.g., .../mcp or .../sse)
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "https://med-mcp.fastmcp.app/sse")
 
-
-async def call_mcp_tool_async(tool_name: str, arguments: dict) -> str:
+async def _call_tool_async(tool_name: str, args: dict):
     """
-    Call a tool on the FastMCP server asynchronously.
-    Returns the result as a string.
+    Internal async function to call the MCP tool using FastMCP Client.
     """
     try:
-        async with MCPClient(MCP_SERVER_URL) as client:
-            result = await client.call_tool(tool_name, arguments)
-            # Result can be a list of content items or a single value
+        # Initialize client with the URL
+        client = Client(MCP_SERVER_URL)
+        
+        async with client:
+            # 1. Ping to ensure connection (Optional but good for debug)
+            # await client.ping()
+            
+            # 2. Call the tool
+            result = await client.call_tool(tool_name, args)
+            
+            # 3. Handle result (FastMCP returns list of content or direct value)
             if isinstance(result, list):
-                # Typically result is a list of TextContent or similar
-                return "\n".join(str(item) for item in result)
+                # Extract text from TextContent objects if present
+                texts = [item.text for item in result if hasattr(item, 'text')]
+                if texts:
+                    return "\n".join(texts)
+                # Fallback for list of strings
+                return "\n".join([str(item) for item in result])
+            
             return str(result)
+
     except Exception as e:
-        return f"MCP call failed: {str(e)}"
+        return f"❌ MCP Connection Error: {str(e)}"
 
+def call_mcp_tool(tool_name: str, args: dict):
+    """
+    Synchronous wrapper for Streamlit to call async MCP tools.
+    """
+    return asyncio.run(_call_tool_async(tool_name, args))
 
-def call_mcp_tool(tool_name: str, arguments: dict) -> str:
-    """
-    Synchronous wrapper for MCP tool calls.
-    Use this in Streamlit which runs in sync context.
-    """
-    return asyncio.run(call_mcp_tool_async(tool_name, arguments))
+# --- EXPORTED TOOLS ---
 
+def search_pubmed(query: str):
+    """
+    Search PubMed via the MCP Server.
+    Maps to the 'search_pubmed' tool on the remote server.
+    """
+    return call_mcp_tool("search_pubmed", {"query": query})
 
-async def list_mcp_tools_async() -> list:
+def get_available_tools():
     """
-    List available tools from the MCP server.
+    Helper to list tools for debugging
     """
-    try:
-        async with MCPClient(MCP_SERVER_URL) as client:
+    async def _list():
+        client = Client(MCP_SERVER_URL)
+        async with client:
             tools = await client.list_tools()
-            return tools
-    except Exception as e:
-        return [f"Error listing tools: {str(e)}"]
-
-
-def list_mcp_tools() -> list:
-    """
-    Synchronous wrapper for listing MCP tools.
-    """
-    return asyncio.run(list_mcp_tools_async())
-
-
-# Legacy PubMed function (kept for fallback)
-def search_pubmed(query: str) -> str:
-    """
-    Search medical literature via MCP server.
-    This is a convenience wrapper that calls the MCP tool.
-    """
-    # Try to use MCP first, with tool name guessed as 'search' or 'pubmed_search'
-    # The actual tool name depends on the MCP server implementation
-    result = call_mcp_tool("search", {"query": query})
-    
-    if "MCP call failed" in result:
-        # Fallback: try different tool names
-        result = call_mcp_tool("pubmed_search", {"query": query})
-    
-    return result
+            return [t.name for t in tools]
+    try:
+        return asyncio.run(_list())
+    except:
+        return ["Error listing tools"]
