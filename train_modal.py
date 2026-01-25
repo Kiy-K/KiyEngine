@@ -165,6 +165,7 @@ def train():
 
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10000) # T_max is a placeholder, will be updated
 
     # --- 2. Training Loop ---
     batch_size = 1024
@@ -180,6 +181,11 @@ def train():
 
     print(f"Training on {len(fens)} positions...")
     model.train()
+
+    # Update T_max for the scheduler
+    num_batches = len(fens) // batch_size
+    scheduler.T_max = num_batches * num_epochs
+
     for epoch in range(num_epochs):
         for i in range(0, len(fens), batch_size):
             batch_fens = fens[i:i+batch_size]
@@ -196,9 +202,10 @@ def train():
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
             if i % (10 * batch_size) == 0:
-                print(f"Epoch {epoch+1}, Batch {i//batch_size}, Loss: {loss.item():.4f}")
+                print(f"Epoch {epoch+1}, Batch {i//batch_size}, Loss: {loss.item():.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
 
     engine.quit()
     print("Training finished.")
