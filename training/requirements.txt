@@ -12,3 +12,6 @@ safetensors
 
 # For progress bars in the training loop
 tqdm
+
+# For plotting in the Jupyter Notebook
+matplotlib
