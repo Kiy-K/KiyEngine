@@ -1,0 +1,18 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+
+# Large Engine Binaries (Keep only v1.0 for small repo size or none)
+KiyEngine_*
+!KiyEngine_v1.0
+
+# Logs and debug info
+engine_*.log
+*.png
+
+# Python environment and caches
+__pycache__/
+*.pickle
+
+# Cutechess data
+cutechess/
