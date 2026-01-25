@@ -1,0 +1,14 @@
+# PyTorch for the model and training loop
+torch
+
+# For data loading and manipulation
+python-chess
+
+# For handling configuration files
+pyyaml
+
+# For saving model weights in the required format
+safetensors
+
+# For progress bars in the training loop
+tqdm

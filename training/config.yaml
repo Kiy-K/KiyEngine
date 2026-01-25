@@ -1,0 +1,33 @@
+# config.yaml
+
+# Model Architecture (Must match Rust core)
+model:
+  d_model: 384
+  n_layers: 4
+  n_experts: 8
+  top_k: 2
+  d_state: 16
+  d_conv: 4
+  expansion_factor: 2
+  vocab_size: 768 # 12 pieces * 64 squares
+
+# Training Hyperparameters
+training:
+  batch_size: 128
+  learning_rate: 1.0e-4
+  epochs: 10
+
+  # Noise Parameters
+  noise_sigma: 0.01   # Std deviation for Gaussian noise injection
+  temperature: 1.0    # Softmax temperature for policy logits
+
+  # Composite Loss Weights
+  policy_weight: 1.0
+  value_weight: 1.0
+  aux_loss_lambda: 0.01 # Weight for the MoE load balancing loss
+
+# Data Paths (Placeholders)
+paths:
+  train_data_path: "/path/to/lichess_db_standard_rated_2023-01.pgn"
+  save_path: "./snapshots"
+  model_save_name: "model.safetensors"
