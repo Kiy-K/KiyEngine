@@ -1,4 +1,4 @@
-# ♟️ KiyEngine 1.0
+## KiyEngine 1.0
 
 KiyEngine is a professional-grade, high-performance UCI chess engine written in Rust. It combines modern bitboard techniques with advanced search algorithms to deliver a powerful and stable competitive experience.
 
@@ -31,20 +31,20 @@ cargo build --release
 
 The compiled binary will be located at `./target/release/kiy_engine`.
 
-## 🖥️ GUI Integration (e.g., En Croissant)
+## GUI Integration (e.g., En Croissant)
 
 1. Open your favorite Chess GUI.
 2. Navigate to **Engines > Add New Engine**.
 3. Select **Local Executable** and browse to the `kiy_engine` binary created in the build step.
 4. The engine will be identified as **KiyEngine 1.0**.
 
-## 📊 Technical Specs
+## Technical Specification
 
 - **Language**: Rust
 - **Architecture**: Bitboards (Magic)
 - **Evaluation**: Tapered PeSTo-style PST + Bishop Pair/Material.
 - **NPS**: ~3,000,000+ nodes/second (hardware dependent).
 
-## 📄 License
+## License
 
-This project is open-source. See the repository for details.
+This project is open-source under Apache 2.0 License. See the repository for details.
