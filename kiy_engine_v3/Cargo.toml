@@ -1,0 +1,15 @@
+[package]
+name = "kiy_engine_v3"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chess = "3.2.0"
+ndarray = "0.17.2"
+ndarray-rand = "0.16.0"
+ndarray-stats = "0.7.0"
+rand = "0.8.5" # Pinned to match ndarray-rand and ndarray-stats
+safetensors = "0.7.0"
+
+[features]
+noise = []
