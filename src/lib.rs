@@ -6,6 +6,7 @@ pub mod movegen;
 pub mod search;
 pub mod tt;
 pub mod magic;
+pub mod nnue_v2;
 
 use std::sync::atomic::AtomicBool;
 pub static STOP_SEARCH: AtomicBool = AtomicBool::new(false);
@@ -14,7 +15,7 @@ pub static SEARCHING: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::defs::{Color, PieceType};
+    use crate::defs::{Color};
 
     #[test]
     fn test_initial_position() {
