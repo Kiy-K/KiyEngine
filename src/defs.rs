@@ -19,6 +19,10 @@ impl Color {
             Color::Black => Color::White,
         }
     }
+
+    pub fn from_usize(i: usize) -> Color {
+        if i == 0 { Color::White } else { Color::Black }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +34,19 @@ pub enum PieceType {
     Rook,
     Queen,
     King,
+}
+
+impl PieceType {
+    pub fn from_usize(i: usize) -> PieceType {
+        match i {
+            0 => PieceType::Pawn,
+            1 => PieceType::Knight,
+            2 => PieceType::Bishop,
+            3 => PieceType::Rook,
+            4 => PieceType::Queen,
+            _ => PieceType::King,
+        }
+    }
 }
 
 /// Helper constants for board squares to avoid magic numbers.

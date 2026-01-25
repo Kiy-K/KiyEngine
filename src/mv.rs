@@ -1,4 +1,4 @@
-use crate::defs::{PieceType, A1, H8};
+use crate::defs::{PieceType};
 
 /// Represents a chess move.
 /// Encoded as a 16-bit integer (u16).
