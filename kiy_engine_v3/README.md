@@ -21,7 +21,7 @@ KiyEngine V3 is a high-performance, single-core optimized chess engine written i
 ### Compilation
 1. **Clone the repository:**
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/Kiy-K/KiyEngine.git
    cd kiy_engine_v3
    ```
 
