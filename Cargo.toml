@@ -1,9 +1,16 @@
 [package]
-name = "kiy_engine"
+name = "kiy_engine_v3"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-lazy_static = "1.4.0"
-memmap2 = "0.9.9"
-rand = "0.8.5"
+candle-core = "0.9.1"
+candle-nn = "0.9.1"
+anyhow = "1.0.86"
+parking_lot = "0.12.3"
+chess = "3.2.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"

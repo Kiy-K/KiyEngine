@@ -1,86 +1,102 @@
-use crate::mv::Move;
+//! Huge Transposition Table for caching search results.
+//!
+//! A large transposition table is critical for high-performance chess engines.
+//! It stores the results of previous searches, allowing the engine to avoid
+//! re-calculating positions it has already seen. This is especially important
+//! when using a computationally expensive neural network for evaluation, as it
+//! dramatically reduces the number of calls to the network.
 
+use chess::ChessMove;
+use std::mem;
+
+/// The flag for a transposition table entry, indicating the type of score.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum HashFlag {
-    Exact,
-    Alpha,
-    Beta,
+#[repr(u8)]
+pub enum TTFlag {
+    Exact, // The score is an exact value for the position.
+    Alpha, // The score is a lower bound (alpha).
+    Beta,  // The score is an upper bound (beta).
 }
 
+/// A single entry in the transposition table.
+///
+/// We align this struct to 16 bytes for efficient memory access.
 #[derive(Clone, Copy, Debug)]
+#[repr(C, align(16))]
 pub struct TTEntry {
-    pub hash: u64,
-    pub depth: u8,
-    pub score: i32,
-    pub flag: HashFlag,
-    pub best_move: Option<Move>,
+    pub key: u64,  // 8 bytes: The Zobrist key of the position.
+    pub best_move: Option<ChessMove>, // 2 bytes + padding: The best move found.
+    pub score: i16,       // 2 bytes: The score of the position.
+    pub depth: i8,        // 1 byte: The depth of the search that found this score.
+    pub flag: TTFlag,     // 1 byte: The type of score (Exact, Alpha, or Beta).
 }
 
+impl Default for TTEntry {
+    fn default() -> Self {
+        TTEntry {
+            key: 0,
+            best_move: None,
+            score: 0,
+            depth: 0,
+            flag: TTFlag::Exact,
+        }
+    }
+}
+
+/// The transposition table itself.
 pub struct TranspositionTable {
-    pub entries: std::sync::Mutex<Vec<Option<TTEntry>>>,
-    pub size: std::sync::atomic::AtomicUsize,
+    entries: Vec<TTEntry>,
+    size_mb: usize,
 }
 
 impl TranspositionTable {
-    pub fn new(mb: usize) -> Self {
-        let count = (mb * 1024 * 1024) >> 5; // ~32 bytes per entry
-        TranspositionTable {
-            entries: std::sync::Mutex::new(vec![None; count]),
-            size: std::sync::atomic::AtomicUsize::new(count),
+    /// The default size of the transposition table in megabytes.
+    pub const DEFAULT_SIZE_MB: usize = 512;
+
+    /// Creates a new transposition table with the specified size in megabytes.
+    pub fn new(size_mb: usize) -> Self {
+        let entry_size = mem::size_of::<TTEntry>();
+        let num_entries = (size_mb * 1024 * 1024) / entry_size;
+        Self {
+            entries: vec![TTEntry::default(); num_entries],
+            size_mb,
         }
     }
 
-    pub fn resize(&self, mb: usize) {
-        let count = (mb * 1024 * 1024) >> 5;
-        let mut entries = self.entries.lock().unwrap();
-        *entries = vec![None; count];
-        self.size.store(count, std::sync::atomic::Ordering::SeqCst);
+    /// Resizes the transposition table to the new size in megabytes.
+    pub fn resize(&mut self, new_size_mb: usize) {
+        let entry_size = mem::size_of::<TTEntry>();
+        let num_entries = (new_size_mb * 1024 * 1024) / entry_size;
+        self.entries.resize(num_entries, TTEntry::default());
+        self.size_mb = new_size_mb;
     }
 
-    pub fn store(&self, hash: u64, depth: u8, score: i32, flag: HashFlag, best_move: Option<Move>) {
-        let size = self.size.load(std::sync::atomic::Ordering::Relaxed);
-        if size == 0 { return; }
-        let index = (hash as usize) % size;
-        let mut entries = self.entries.lock().unwrap();
-        // Guard against index out of bounds during concurrent resize
-        if index >= entries.len() { return; }
-        
-        if let Some(existing) = entries[index] {
-            if existing.depth > depth && existing.hash == hash {
-                return; 
-            }
+    /// Probes the transposition table for a given key.
+    pub fn probe(&self, key: u64) -> Option<&TTEntry> {
+        let index = (key as usize) % self.entries.len();
+        let entry = &self.entries[index];
+        if entry.key == key {
+            Some(entry)
+        } else {
+            None
         }
-
-        entries[index] = Some(TTEntry {
-            hash, depth, score, flag, best_move,
-        });
     }
 
-    pub fn probe(&self, hash: u64, depth: u8, alpha: i32, beta: i32) -> Option<(i32, Option<Move>)> {
-        let size = self.size.load(std::sync::atomic::Ordering::Relaxed);
-        if size == 0 { return None; }
-        let index = (hash as usize) % size;
-        let entries = self.entries.lock().unwrap();
-        if index >= entries.len() { return None; }
-        
-        if let Some(entry) = entries[index] {
-            if entry.hash == hash {
-                let stored_move = entry.best_move;
-                if entry.depth >= depth {
-                    let score = entry.score;
-                    match entry.flag {
-                        HashFlag::Exact => return Some((score, stored_move)),
-                        HashFlag::Alpha if score <= alpha => return Some((alpha, stored_move)),
-                        HashFlag::Beta if score >= beta => return Some((beta, stored_move)),
-                        _ => {}
-                    }
-                }
-                return Some((0, stored_move));
-            }
-        }
-        None
+    /// Stores an entry in the transposition table.
+    pub fn store(&mut self, entry: TTEntry) {
+        let index = (entry.key as usize) % self.entries.len();
+        self.entries[index] = entry;
+    }
+
+    /// Returns the size of the table in megabytes.
+    pub fn size_mb(&self) -> usize {
+        self.size_mb
     }
 }
 
-// Global TT (initialized in main)
-// In a true engine, this would be inside a Search object.
+impl Default for TranspositionTable {
+    /// Creates a new transposition table with the default size.
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_SIZE_MB)
+    }
+}
