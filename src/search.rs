@@ -1,311 +1,127 @@
-use crate::board::Board;
-use crate::evaluate::evaluate;
-use crate::movegen::MoveGen;
-use crate::mv::{Move, MoveList};
-use crate::defs::{Color};
-use crate::tt::{TranspositionTable, HashFlag};
+// src/search.rs
 
-#[derive(Clone)]
-pub struct Search {
-    pub tt: std::sync::Arc<TranspositionTable>,
-    pub nodes: u64,
-    pub killer_moves: [[Option<Move>; 2]; 64],
-    pub history: [[i32; 64]; 12],
+use crate::engine::{Engine, GameState};
+use chess::{Board, ChessMove, MoveGen, Piece, EMPTY};
+
+/// Manages the state and execution of the alpha-beta search algorithm.
+///
+/// This struct holds a reference to the `Engine` (for evaluation), the current `GameState`,
+/// and statistics about the search, such as the number of nodes visited.
+pub struct SearchHandler<'a> {
+    /// A reference to the neural network model used for evaluation.
+    engine: &'a Engine,
+    /// The current state of the game being searched. This is updated as the search explores moves.
+    pub game_state: GameState,
+    /// A counter for the number of nodes (positions) evaluated during the search.
+    pub nodes_searched: u64,
 }
 
-impl Search {
-    pub fn new() -> Self {
-        Search {
-            tt: std::sync::Arc::new(TranspositionTable::new(64)),
-            nodes: 0,
-            killer_moves: [[None; 2]; 64],
-            history: [[0; 64]; 12],
+/// Maps a `ChessMove` to a token index for the model's embedding layer.
+/// The vocabulary is structured as [Piece; Square], so we can calculate the index.
+fn move_to_token(mv: &ChessMove, board: &Board) -> usize {
+    let piece = board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn); // Default to pawn if source is empty (should not happen)
+
+    let piece_idx = mv.get_promotion().map_or_else(
+        || piece.to_index(),
+        |promo_piece| promo_piece.to_index(),
+    );
+    let to_square_idx = mv.get_dest().to_int() as usize;
+
+    // A simple mapping, this might need to be more sophisticated
+    // depending on the final training setup.
+    piece_idx * 64 + to_square_idx
+}
+
+impl<'a> SearchHandler<'a> {
+    pub fn new(engine: &'a Engine, board: Board) -> Self {
+        Self {
+            engine,
+            game_state: GameState::new(board),
+            nodes_searched: 0,
         }
     }
 
-    pub fn loop_search(&mut self, board: &Board, max_depth: u8) -> Option<Move> {
+    /// The main entry point for starting a search.
+    /// Implements iterative deepening.
+    pub fn search(&mut self, depth: u8) -> (Option<ChessMove>, f32) {
         let mut best_move = None;
-        self.nodes = 0;
-        let start_time = std::time::Instant::now();
+        let mut best_eval = -f32::INFINITY;
 
-        for depth in 1..=max_depth {
-            if crate::STOP_SEARCH.load(std::sync::atomic::Ordering::Relaxed) { break; }
-            let mut alpha = -30000;
-            let beta = 30000;
-            
-            // Search at this depth
-            let mut moves = MoveGen::generate_moves(board);
-            
-            let mut tt_move = None;
-            if let Some((_, m)) = self.tt.probe(board.hash, depth, alpha, beta) {
-                tt_move = m;
-            }
-
-            self.score_moves(board, &mut moves, tt_move, depth);
-            Self::sort_moves(&mut moves);
-            
-            let mut current_best_moves = Vec::new();
-            let mut best_score = -50000;
-
-            for i in 0..moves.count {
-                let m = moves.moves[i];
-                let mut new_board = board.clone();
-                
-                if new_board.make_move(m) {
-                    // LEGALE CHECK
-                    let king_bb = new_board.pieces[board.side as usize][crate::defs::PieceType::King as usize];
-                    if king_bb != 0 {
-                        let king_sq = king_bb.trailing_zeros() as u8;
-                        if new_board.is_square_attacked(king_sq, new_board.side) { continue; }
-                    }
-
-                    let score = -self.alpha_beta(&new_board, depth - 1, -beta, -alpha);
-                    if crate::STOP_SEARCH.load(std::sync::atomic::Ordering::Relaxed) { break; }
-                    
-                    if score > alpha {
-                        alpha = score;
-                        current_best_moves.clear();
-                        current_best_moves.push(m);
-                        best_score = score;
-                    } else if score == alpha && !current_best_moves.is_empty() {
-                        current_best_moves.push(m);
-                    }
-                }
-            }
-            if crate::STOP_SEARCH.load(std::sync::atomic::Ordering::Relaxed) { break; }
-            
-            if !current_best_moves.is_empty() {
-                use rand::seq::SliceRandom;
-                let mut rng = rand::thread_rng();
-                let m = current_best_moves.choose(&mut rng).unwrap();
-                best_move = Some(*m);
-                
-                let elapsed = start_time.elapsed().as_millis() as u64;
-                let nps = if elapsed > 0 { (self.nodes * 1000) / elapsed } else { 0 };
-                println!("info depth {} score cp {} nodes {} nps {} time {} pv {}", 
-                    depth, best_score, self.nodes, nps, elapsed, m.to_string());
+        for i in 1..=depth {
+            let (mv, eval) = self.alphabeta(-f32::INFINITY, f32::INFINITY, i);
+            if let Some(m) = mv {
+                best_move = Some(m);
+                best_eval = eval;
+                println!("info depth {} score cp {} pv {}", i, (eval * 100.0) as i32, m);
             }
         }
 
-        best_move
+        (best_move, best_eval)
     }
 
-    fn alpha_beta(&mut self, board: &Board, depth: u8, mut alpha: i32, beta: i32) -> i32 {
-        if self.nodes % 2048 == 0 {
-             if crate::STOP_SEARCH.load(std::sync::atomic::Ordering::Relaxed) { return alpha; }
-             // Periodic stats (simplified for now, ideally with a timer)
-             if self.nodes % 131072 == 0 {
-                  println!("info nodes {} nps {}", self.nodes, 1000000); // Placeholder for real metrics
-             }
-        }
-        self.nodes += 1;
-        
-        let side = board.side;
-        let king_bb = board.pieces[side as usize][crate::defs::PieceType::King as usize];
-        let king_sq = if king_bb != 0 { king_bb.trailing_zeros() as u8 } else { 0 };
-        let in_check = board.is_square_attacked(king_sq, side.opposite());
+    /// The core alpha-beta search function with state management.
+    fn alphabeta(&mut self, mut alpha: f32, beta: f32, depth: u8) -> (Option<ChessMove>, f32) {
+        self.nodes_searched += 1;
 
-        // --- 1. TT Probe ---
-        let mut tt_move = None;
-        if let Some((score, m)) = self.tt.probe(board.hash, depth, alpha, beta) {
-            if depth > 0 && score != 0 { return score; }
-            tt_move = m;
-        }
+        let move_gen = MoveGen::new_legal(&self.game_state.board);
+        let moves_empty = move_gen.len() == 0;
 
-        if depth == 0 {
-            return self.quiescence(board, alpha, beta);
-        }
-
-        // --- 2. Null Move Pruning (NMP) ---
-        if !in_check && depth >= 3 {
-             let mut null_board = board.clone();
-             null_board.side = side.opposite();
-             null_board.hash ^= crate::board::ZOBRIST.side;
-             let reduction = 3;
-             let next_depth = if depth > reduction + 1 { depth - reduction - 1 } else { 0 };
-             let score = -self.alpha_beta(&null_board, next_depth, -beta, -beta + 1);
-             if score >= beta { return beta; }
-        }
-
-        let mut moves = MoveGen::generate_moves(board);
-        self.score_moves(board, &mut moves, tt_move, depth);
-        Self::sort_moves(&mut moves);
-
-        let mut legal_moves_found = 0;
-        let mut best_move = None;
-        let old_alpha = alpha;
-
-        for i in 0..moves.count {
-            let m = moves.moves[i];
-            let mut new_board = board.clone();
-            
-            if new_board.make_move(m) {
-                // Legality check
-                let k_bb = new_board.pieces[side as usize][crate::defs::PieceType::King as usize];
-                if k_bb != 0 {
-                    let k_sq = k_bb.trailing_zeros() as u8;
-                    if new_board.is_square_attacked(k_sq, new_board.side) { continue; }
-                }
-
-                legal_moves_found += 1;
-                
-                // --- 3. Stable Extensions ---
-                // We only extend if we haven't reached a crazy depth already
-                let mut extension = 0;
-                if in_check && depth < 32 { 
-                    extension = 1; 
-                }
-
-                let mut score;
-                let is_capture = (board.occupancy[side.opposite() as usize] >> m.target()) & 1 == 1;
-
-                if depth >= 3 && legal_moves_found > 4 && !is_capture && !in_check {
-                    // LMR
-                    score = -self.alpha_beta(&new_board, depth - 2, -alpha - 1, -alpha);
-                    if score > alpha {
-                        score = -self.alpha_beta(&new_board, depth - 1 + extension, -beta, -alpha);
-                    }
-                } else {
-                    // Standard search
-                    let next_depth = if depth > 0 { depth - 1 + extension } else { 0 };
-                    // Hard safety: if extension is used, ensure we don't loop forever at depth 1
-                    let safe_depth = if next_depth >= depth && depth > 0 { depth - 1 } else { next_depth };
-                    score = -self.alpha_beta(&new_board, safe_depth, -beta, -alpha);
-                }
-                
-                if score >= beta {
-                    // Update Heuristics for non-captures
-                    if !is_capture && depth < 64 {
-                        self.killer_moves[(depth as usize).min(63)][1] = self.killer_moves[(depth as usize).min(63)][0];
-                        self.killer_moves[(depth as usize).min(63)][0] = Some(m);
-                        
-                        let pt_idx = (0..6).find(|&pt| (board.pieces[side as usize][pt] >> m.source()) & 1 == 1).unwrap_or(0);
-                        self.history[(side as usize)*6 + pt_idx][m.target() as usize] += (depth as i32) * (depth as i32);
-                    }
-
-                    self.tt.store(board.hash, depth, beta, HashFlag::Beta, Some(m));
-                    return beta;
-                }
-                if score > alpha {
-                    alpha = score;
-                    best_move = Some(m);
-                }
-            }
-        }
-
-        if legal_moves_found == 0 {
-            if in_check { return -29000 + (depth as i32); }
-            return 0; // Stalemate
-        }
-
-        let flag = if alpha <= old_alpha { HashFlag::Alpha } else { HashFlag::Exact };
-        self.tt.store(board.hash, depth, alpha, flag, best_move);
-
-        alpha
-    }
-
-    fn quiescence(&mut self, board: &Board, mut alpha: i32, beta: i32) -> i32 {
-        self.nodes += 1;
-        let stand_pat = Self::evaluate_relative(board);
-        if stand_pat >= beta { return beta; }
-        if stand_pat > alpha { alpha = stand_pat; }
-
-        let mut moves = MoveGen::generate_moves(board);
-        self.score_moves(board, &mut moves, None, 0);
-        Self::sort_moves(&mut moves);
-        
-        let side = board.side;
-        for i in 0..moves.count {
-            let m = moves.moves[i];
-            let is_capture = (board.occupancy[side.opposite() as usize] >> m.target()) & 1 == 1;
-            if !is_capture { continue; }
-
-            let mut new_board = board.clone();
-            if new_board.make_move(m) {
-                // Legality check in Q-search
-                let k_bb = new_board.pieces[side as usize][crate::defs::PieceType::King as usize];
-                if k_bb != 0 {
-                    let k_sq = k_bb.trailing_zeros() as u8;
-                    if new_board.is_square_attacked(k_sq, new_board.side) {
-                        continue;
-                    }
-                }
-                let score = -self.quiescence(&new_board, -beta, -alpha);
-                if score >= beta { return beta; }
-                if score > alpha { alpha = score; }
-            }
-        }
-        alpha
-    }
-
-    fn evaluate_relative(board: &Board) -> i32 {
-        let eval = evaluate(board);
-        if board.side == Color::White { eval } else { -eval }
-    }
-
-    fn score_moves(&self, board: &Board, moves: &mut MoveList, tt_move: Option<Move>, depth: u8) {
-        let side_offset = (board.side as usize) * 6;
-        for i in 0..moves.count {
-            let m = &mut moves.moves[i];
-            
-            // 1. TT Move Priority
-            if let Some(tm) = tt_move {
-                if m.source() == tm.source() && m.target() == tm.target() {
-                    m.score = 2_000_000;
-                    continue;
-                }
-            }
-
-            // 2. Captures (MVV-LVA)
-            let target = m.target();
-            let mut victim_type = None;
-            for pt in 0..crate::defs::PIECE_TYPE_COUNT {
-                if (board.pieces[board.side.opposite() as usize][pt] >> target) & 1 == 1 {
-                    victim_type = Some(pt);
-                    break;
-                }
-            }
-
-            if let Some(v) = victim_type {
-                let mut attacker = 0;
-                for pt in 0..crate::defs::PIECE_TYPE_COUNT {
-                    if (board.pieces[board.side as usize][pt] >> m.source()) & 1 == 1 {
-                        attacker = pt;
-                        break;
-                    }
-                }
-                m.score = 1_000_000 + (v as i32 * 100) - (attacker as i32);
+        // Handle terminal nodes (checkmate/stalemate)
+        if moves_empty {
+            if self.game_state.board.checkers() == &EMPTY {
+                return (None, 0.0); // Stalemate
             } else {
-                // 3. Killer Moves
-                if depth < 64 {
-                    if let Some(k1) = self.killer_moves[depth as usize][0] {
-                        if m.source() == k1.source() && m.target() == k1.target() {
-                            m.score = 900_000;
-                        }
-                    } else if let Some(k2) = self.killer_moves[depth as usize][1] {
-                        if m.source() == k2.source() && m.target() == k2.target() {
-                            m.score = 800_000;
-                        }
-                    }
-                }
-
-                // 4. History Heuristic
-                if m.score == 0 {
-                    // Identify piece type for history lookup
-                    let mut pt_idx = 0;
-                    for pt in 0..crate::defs::PIECE_TYPE_COUNT {
-                        if (board.pieces[board.side as usize][pt] >> m.source()) & 1 == 1 {
-                            pt_idx = pt;
-                            break;
-                        }
-                    }
-                    m.score = self.history[side_offset + pt_idx][m.target() as usize];
-                }
+                return (None, -f32::INFINITY); // Checkmate
             }
         }
-    }
 
-    fn sort_moves(moves: &mut MoveList) {
-        moves.sort();
+        let mut best_move = None;
+        let mut best_score = -f32::INFINITY;
+
+        // --- Policy Head Move Ordering ---
+        let (policy_logits, _) = self.engine.forward(0, &mut self.game_state.clone()); // Use a dummy token to get policy
+        let mut move_scores: Vec<(ChessMove, f32)> = move_gen.map(|mv| {
+            let token = move_to_token(&mv, &self.game_state.board);
+            let score = policy_logits[token];
+            (mv, score)
+        }).collect();
+
+        move_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        for (mv, _) in move_scores {
+            // --- State Push ---
+            // Clone the current state before making a move.
+            let original_state = self.game_state.clone();
+
+            // Make the move on the board and update the Mamba state.
+            let token = move_to_token(&mv, &self.game_state.board);
+            self.game_state.board = self.game_state.board.make_move_new(mv);
+            let (_, mut score) = self.engine.forward(token, &mut self.game_state);
+
+            // --- Recurse or Evaluate ---
+            if depth > 1 {
+                let (_, recursive_score) = self.alphabeta(-beta, -alpha, depth - 1);
+                score = -recursive_score; // Negamax framework
+            }
+
+            // --- State Pop ---
+            // Restore the original state for the next move at this ply.
+            self.game_state = original_state;
+
+            // --- Update Alpha and Best Move ---
+            if score > best_score {
+                best_score = score;
+                best_move = Some(mv);
+            }
+
+            alpha = alpha.max(best_score);
+
+            // --- Pruning ---
+            if alpha >= beta {
+                break;
+            }
+        }
+
+        (best_move, best_score)
     }
 }

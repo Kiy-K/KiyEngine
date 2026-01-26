@@ -1,27 +1,11 @@
-pub mod defs;
-pub mod board;
-pub mod evaluate;
-pub mod mv;
-pub mod movegen;
+//! # KiyEngine V3 Crate
+//!
+//! This crate provides the core functionality for KiyEngine V3, a high-performance,
+//! single-core optimized chess engine. It features a novel evaluation and move ordering
+//! system based on a Mixture-of-Experts (MoE) Mamba (State Space Model) architecture.
+
+pub mod engine;
+pub mod mamba;
+pub mod moe;
 pub mod search;
-pub mod tt;
-pub mod magic;
-pub mod nnue_v2;
-
-use std::sync::atomic::AtomicBool;
-pub static STOP_SEARCH: AtomicBool = AtomicBool::new(false);
-pub static SEARCHING: AtomicBool = AtomicBool::new(false);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::defs::{Color};
-
-    #[test]
-    fn test_initial_position() {
-        let board = board::Board::new();
-        assert_ne!(board.occupancy[Color::White as usize], 0);
-        let score = evaluate::evaluate(&board);
-        assert_eq!(score, 0, "Initial position evaluation should be 0");
-    }
-}
+pub mod uci;

@@ -16,3 +16,8 @@ __pycache__/
 
 # Cutechess data
 cutechess/
+
+
+# Added by cargo
+
+/target
