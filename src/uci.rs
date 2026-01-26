@@ -2,12 +2,16 @@
 
 use crate::engine::Engine;
 use crate::search::SearchHandler;
+use crate::tt::TranspositionTable;
 use chess::{Board, ChessMove};
 use std::str::FromStr;
+
+const TT_SIZE_MB: usize = 64;
 
 pub struct UciHandler {
     engine: Engine,
     board: Board,
+    tt: TranspositionTable,
 }
 
 impl UciHandler {
@@ -15,6 +19,7 @@ impl UciHandler {
         Self {
             engine: Engine::new(),
             board: Board::default(),
+            tt: TranspositionTable::new(TT_SIZE_MB),
         }
     }
 
@@ -23,6 +28,7 @@ impl UciHandler {
         match parts.get(0) {
             Some(&"uci") => self.handle_uci(),
             Some(&"isready") => self.handle_isready(),
+            Some(&"ucinewgame") => self.handle_new_game(),
             Some(&"position") => self.handle_position(&parts[1..]),
             Some(&"go") => self.handle_go(&parts[1..]),
             Some(&"bench") => self.handle_bench(),
@@ -39,6 +45,10 @@ impl UciHandler {
 
     fn handle_isready(&self) {
         println!("readyok");
+    }
+
+    fn handle_new_game(&mut self) {
+        self.tt.clear();
     }
 
     fn handle_position(&mut self, parts: &[&str]) {
@@ -73,14 +83,14 @@ impl UciHandler {
             }
         }
 
-        let mut searcher = SearchHandler::new(&self.engine, self.board);
+        let mut searcher = SearchHandler::new(&self.engine, &mut self.tt, self.board);
         if let (Some(best_move), _) = searcher.search(depth) {
             println!("bestmove {}", best_move);
         }
     }
 
     fn handle_bench(&mut self) {
-        let mut searcher = SearchHandler::new(&self.engine, Board::default());
+        let mut searcher = SearchHandler::new(&self.engine, &mut self.tt, Board::default());
         let start_time = std::time::Instant::now();
 
         searcher.search(8); // A reasonable depth for a quick benchmark
