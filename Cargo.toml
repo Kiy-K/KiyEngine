@@ -1,16 +1,15 @@
 [package]
 name = "kiy_engine_v3"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-candle-core = "0.9.2"
-candle-nn = "0.9.2"
-anyhow = "1.0.100"
-parking_lot = "0.12.5"
 chess = "3.2.0"
+ndarray = "0.17.2"
+ndarray-rand = "0.16.0"
+ndarray-stats = "0.7.0"
+rand = "0.8.5" # Pinned to match ndarray-rand and ndarray-stats
+safetensors = "0.7.0"
 
-[profile.release]
-lto = true
-codegen-units = 1
-panic = "abort"
+[features]
+noise = []
