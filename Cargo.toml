@@ -5,11 +5,13 @@ edition = "2024"
 
 [dependencies]
 chess = "3.2.0"
-ndarray = "0.17.2"
-ndarray-rand = "0.16.0"
-ndarray-stats = "0.7.0"
-rand = "0.8.5" # Pinned to match ndarray-rand and ndarray-stats
+candle-core = "0.9.2"
+candle-nn = "0.9.2"
+anyhow = "1.0.95"
 safetensors = "0.7.0"
+memmap2 = "0.9.5"
+half = { version = "2.4.1", features = ["num-traits", "use-intrinsics", "rand_distr"] }
 
 [features]
 noise = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
