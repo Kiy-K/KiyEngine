@@ -2,14 +2,14 @@
 
 use chess::ChessMove;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TTFlag {
     EXACT,
     LOWERBOUND,
     UPPERBOUND,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TTEntry {
     pub key: u64, // The full Zobrist key to prevent hash collisions
     pub best_move: Option<ChessMove>,
@@ -49,11 +49,23 @@ impl TranspositionTable {
     }
 
     /// Stores a new entry in the TT.
-    /// It uses the "always replace" strategy, overwriting any existing entry
-    /// at the calculated index.
+    /// It uses a depth-preferred replacement strategy:
+    /// - If the new entry has a higher depth, replace.
+    /// - If the depths are equal, replace if the existing entry is not EXACT.
     pub fn store(&mut self, entry: TTEntry) {
         let index = (entry.key % self.size as u64) as usize;
-        self.entries[index] = Some(entry);
+        if let Some(existing) = &self.entries[index] {
+            if entry.depth > existing.depth {
+                self.entries[index] = Some(entry);
+            } else if entry.depth == existing.depth {
+                // Same depth: replace if existing is not EXACT or if new is EXACT
+                if existing.flag != TTFlag::EXACT || entry.flag == TTFlag::EXACT {
+                    self.entries[index] = Some(entry);
+                }
+            }
+        } else {
+            self.entries[index] = Some(entry);
+        }
     }
 
     /// Clears the transposition table by resetting all entries to None.

@@ -7,7 +7,7 @@ use crate::tt::TranspositionTable;
 use chess::{Board, ChessMove};
 use std::str::FromStr;
 
-const TT_SIZE_MB: usize = 64;
+const TT_SIZE_MB: usize = 512;
 
 pub struct UciHandler {
     engine: Engine,

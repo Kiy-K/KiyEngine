@@ -7,7 +7,7 @@ use chess::{Board, Square};
 /// and as a leaf-node evaluation component.
 
 // Material values (Midgame, Endgame)
-const MG_VALUE: [i32; 6] = [82, 337, 365, 477, 1025, 0];
+pub const MG_VALUE: [i32; 6] = [82, 337, 365, 477, 1025, 0];
 const EG_VALUE: [i32; 6] = [94, 281, 297, 512, 936, 0];
 
 // Game phase increments for each piece type
