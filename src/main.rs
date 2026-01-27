@@ -3,8 +3,8 @@
 use kiy_engine_v3::uci::UciHandler;
 use std::io::{self, BufRead};
 
-fn main() {
-    let mut uci_handler = UciHandler::new();
+fn main() -> anyhow::Result<()> {
+    let mut uci_handler = UciHandler::new()?;
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let command = line.unwrap_or_else(|_| String::new());
@@ -12,4 +12,5 @@ fn main() {
             uci_handler.handle_command(&command);
         }
     }
+    Ok(())
 }

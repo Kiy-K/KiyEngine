@@ -3,6 +3,7 @@
 use std::time::Instant;
 
 use crate::engine::{Engine, GameState};
+use crate::tutor::Tutor;
 use crate::tt::{TTEntry, TTFlag, TranspositionTable};
 use chess::{Board, ChessMove, MoveGen, Piece, EMPTY};
 
@@ -11,56 +12,38 @@ const MATE_SCORE: i32 = 30_000;
 const INFINITY: i32 = 32_000;
 
 /// Maps a `ChessMove` to a token index for the model's embedding layer.
-/// This is required to look up the move's probability in the policy head's output.
 fn move_to_token(mv: &ChessMove, board: &Board) -> usize {
-    // This function's implementation must be perfectly synchronized with the model's training.
-    // A mismatch here would lead to the engine misinterpreting the policy output.
-    let piece = board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn); // Should not happen in a legal position
-
+    let piece = board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
     let piece_idx = mv.get_promotion().map_or_else(
         || piece.to_index(),
         |promo_piece| promo_piece.to_index(),
     );
     let to_square_idx = mv.get_dest().to_int() as usize;
-
-    // The vocabulary is structured as [Piece; Square]
     piece_idx * 64 + to_square_idx
 }
 
-/// Manages the state and execution of the policy-guided Negamax search.
-///
-/// This struct holds references to the core engine components (model, TT) and tracks
-/// search statistics.
 pub struct SearchHandler<'a> {
-    /// A reference to the neural network model used for evaluation (Policy + Value).
     engine: &'a Engine,
-    /// A mutable reference to the transposition table to store and retrieve search results.
+    tutor: &'a Tutor,
     tt: &'a mut TranspositionTable,
-    /// The current state of the game being searched. This is updated as the search explores moves.
     pub game_state: GameState,
-    /// A counter for the number of nodes (positions) evaluated during the search.
     pub nodes_searched: u64,
-    /// A counter for the number of times a TT entry was used to prune the search.
     pub tt_hits: u64,
 }
 
 impl<'a> SearchHandler<'a> {
-    /// Creates a new `SearchHandler` to begin a search.
-    pub fn new(engine: &'a Engine, tt: &'a mut TranspositionTable, board: Board) -> Self {
+    pub fn new(engine: &'a Engine, tutor: &'a Tutor, tt: &'a mut TranspositionTable, board: Board) -> Self {
+        let game_state = GameState::new(board, &engine.device).expect("Failed to initialize GameState");
         Self {
             engine,
+            tutor,
             tt,
-            game_state: GameState::new(board),
+            game_state,
             nodes_searched: 0,
             tt_hits: 0,
         }
     }
 
-    /// The main entry point for starting a search.
-    ///
-    /// This function implements iterative deepening. It calls the core `negamax` search
-    /// for increasing depths and prints UCI-compliant information after each iteration.
-    /// The best move is retrieved from the transposition table after the search.
     pub fn search(&mut self, max_depth: u8) -> (Option<ChessMove>, i32) {
         let start_time = Instant::now();
         self.nodes_searched = 0;
@@ -75,7 +58,6 @@ impl<'a> SearchHandler<'a> {
             let nps = (self.nodes_searched * 1000) / (elapsed.as_millis() as u64 + 1);
             best_score = score;
 
-            // After each depth, we probe the TT for the best move found so far.
             if let Some(entry) = self.tt.probe(self.game_state.board.get_hash()) {
                 if let Some(mv) = entry.best_move {
                     println!(
@@ -93,14 +75,10 @@ impl<'a> SearchHandler<'a> {
         (best_move, best_score)
     }
 
-    /// Converts the model's f32 value ([-1.0, 1.0]) to an i32 centipawn score.
     fn value_to_cp(value: f32) -> i32 {
         (value * 800.0) as i32
     }
 
-    /// The core policy-guided Negamax search function.
-    /// This function operates on `self.game_state` and uses a save/restore mechanism
-    /// for the Mamba state to avoid expensive cloning.
     fn negamax(&mut self, depth: u8, mut alpha: i32, mut beta: i32) -> i32 {
         self.nodes_searched += 1;
 
@@ -125,23 +103,49 @@ impl<'a> SearchHandler<'a> {
         if self.game_state.board.status() == chess::BoardStatus::Stalemate {
             return 0;
         }
+
+        // --- Static Evaluation (Gatekeeper) ---
+        let static_score = self.tutor.evaluate(&self.game_state.board);
+
         if depth == 0 {
             return self.quiescence_search(alpha, beta);
         }
 
-        // --- Model Evaluation (Policy & Value) ---
-        // To get the policy for the current node without permanently altering its Mamba state,
-        // we back up the state, perform the forward pass, and then restore it. This avoids
-        // a deep clone of the entire GameState.
+        // --- Null Move Pruning ---
+        if depth >= 3 && !(*self.game_state.board.checkers() != EMPTY) {
+            // If static eval is high enough, try null move
+            if static_score >= beta {
+                let board_backup = self.game_state.board;
+                if let Some(null_board) = board_backup.null_move() {
+                    let mamba_backup = self.game_state.mamba_states.clone();
+                    self.game_state.board = null_board;
+                    // We don't update Mamba state for null move to keep it simple and fast
+                    let score = -self.negamax(depth - 3, -beta, -beta + 1);
+                    self.game_state.board = board_backup;
+                    self.game_state.mamba_states = mamba_backup;
+
+                    if score >= beta {
+                        return beta;
+                    }
+                }
+            }
+        }
+
+        // --- Futility Pruning ---
+        // Handled in the move loop.
+
+        // --- Model Evaluation (Policy) ---
         let mamba_backup = self.game_state.mamba_states.clone();
-        let (policy_logits, _value) = self.engine.forward(0, &mut self.game_state);
+        let (policy_logits, _value) = self.engine.forward(0, &mut self.game_state).expect("Forward pass failed");
         self.game_state.mamba_states = mamba_backup;
+
+        let logits_vec = policy_logits.to_vec1::<f32>().expect("Failed to get logits");
 
         let mut move_scores: Vec<(ChessMove, f32)> =
             MoveGen::new_legal(&self.game_state.board)
                 .map(|mv| {
                     let token = move_to_token(&mv, &self.game_state.board);
-                    let score = *policy_logits.get(token).unwrap_or(&-100.0);
+                    let score = *logits_vec.get(token).unwrap_or(&-100.0);
                     (mv, score)
                 })
                 .collect();
@@ -153,15 +157,22 @@ impl<'a> SearchHandler<'a> {
 
         for (i, (mv, _)) in move_scores.iter().enumerate() {
             let board_backup = self.game_state.board;
-            let mamba_backup = self.game_state.mamba_states.clone();
 
-            // To apply LMR correctly, we must not reduce tactical moves.
             let is_capture = board_backup.piece_on(mv.get_dest()).is_some();
             let is_promotion = mv.get_promotion().is_some();
 
+            // Futility Pruning check
+            if depth == 1 && i > 0 && !is_capture && !is_promotion && !(*board_backup.checkers() != EMPTY) {
+                if static_score + 150 < alpha {
+                    continue;
+                }
+            }
+
+            let mamba_backup = self.game_state.mamba_states.clone();
+
             self.game_state.board = self.game_state.board.make_move_new(*mv);
             let token = move_to_token(mv, &board_backup);
-            self.engine.forward(token, &mut self.game_state);
+            self.engine.forward(token, &mut self.game_state).expect("Forward pass failed");
 
             let is_check = *self.game_state.board.checkers() != EMPTY;
             let is_tactical = is_capture || is_promotion || is_check;
@@ -169,11 +180,9 @@ impl<'a> SearchHandler<'a> {
             let score = if i == 0 {
                 -self.negamax(depth - 1, -beta, -alpha)
             } else {
-                // Apply LMR to late, non-tactical moves.
                 let reduction = if depth > 2 && i > 3 && !is_tactical { 2 } else { 1 };
                 let mut search_score = -self.negamax(depth - reduction, -alpha - 1, -alpha);
 
-                // Re-search if the null-window search beats alpha.
                 if search_score > alpha && search_score < beta {
                     search_score = -self.negamax(depth - 1, -beta, -alpha);
                 }
@@ -202,18 +211,19 @@ impl<'a> SearchHandler<'a> {
         best_score
     }
 
-    /// A specialized search function to handle tactical "explosions" (captures and promotions)
-    /// at the leaves of the main search tree. This prevents the horizon effect.
     fn quiescence_search(&mut self, mut alpha: i32, beta: i32) -> i32 {
         self.nodes_searched += 1;
 
-        // --- Stand-Pat Evaluation ---
-        // To get the stand-pat score, we must evaluate the position without permanently
-        // altering the Mamba state. We use the same backup/restore pattern as in negamax.
+        // --- Combined Evaluation (Leaf) ---
         let mamba_backup = self.game_state.mamba_states.clone();
-        let (_, value) = self.engine.forward(0, &mut self.game_state);
-        self.game_state.mamba_states = mamba_backup; // Restore the state
-        let stand_pat = Self::value_to_cp(value);
+        let (_, ai_value) = self.engine.forward(0, &mut self.game_state).expect("Forward pass failed");
+        self.game_state.mamba_states = mamba_backup;
+
+        let ai_score = Self::value_to_cp(ai_value);
+        let static_score = self.tutor.evaluate(&self.game_state.board);
+
+        // Linear combination: 50% AI, 50% Static
+        let stand_pat = (ai_score + static_score) / 2;
 
         if stand_pat >= beta {
             return beta;
@@ -222,27 +232,17 @@ impl<'a> SearchHandler<'a> {
             alpha = stand_pat;
         }
 
-        // --- Generate and Score Tactical Moves ---
-        let move_scores: Vec<(ChessMove, f32)> =
-            MoveGen::new_legal(&self.game_state.board)
-                .filter(|m| {
-                    // Only consider captures and promotions in q-search
-                    self.game_state.board.piece_on(m.get_dest()).is_some() || m.get_promotion().is_some()
-                })
-                .map(|mv| (mv, 0.0)) // We don't need policy for q-search move ordering
-                .collect();
+        let moves: Vec<ChessMove> = MoveGen::new_legal(&self.game_state.board)
+            .filter(|m| self.game_state.board.piece_on(m.get_dest()).is_some() || m.get_promotion().is_some())
+            .collect();
 
-        // A simple MVV-LVA (Most Valuable Victim - Least Valuable Attacker) heuristic could be added here
-        // for better move ordering, but for now, we search them as they come.
-
-        for (mv, _) in move_scores.iter() {
-            // --- PUSH/POP State Management ---
+        for mv in moves {
             let board_backup = self.game_state.board;
             let mamba_backup = self.game_state.mamba_states.clone();
 
-            self.game_state.board = self.game_state.board.make_move_new(*mv);
-            let token = move_to_token(mv, &board_backup);
-            self.engine.forward(token, &mut self.game_state);
+            self.game_state.board = self.game_state.board.make_move_new(mv);
+            let token = move_to_token(&mv, &board_backup);
+            self.engine.forward(token, &mut self.game_state).expect("Forward pass failed");
 
             let score = -self.quiescence_search(-beta, -alpha);
 
@@ -250,7 +250,7 @@ impl<'a> SearchHandler<'a> {
             self.game_state.mamba_states = mamba_backup;
 
             if score >= beta {
-                return beta; // Beta-cutoff
+                return beta;
             }
             if score > alpha {
                 alpha = score;

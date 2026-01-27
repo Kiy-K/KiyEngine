@@ -1,6 +1,7 @@
 // src/uci.rs
 
 use crate::engine::Engine;
+use crate::tutor::Tutor;
 use crate::search::SearchHandler;
 use crate::tt::TranspositionTable;
 use chess::{Board, ChessMove};
@@ -10,17 +11,21 @@ const TT_SIZE_MB: usize = 64;
 
 pub struct UciHandler {
     engine: Engine,
+    tutor: Tutor,
     board: Board,
     tt: TranspositionTable,
 }
 
 impl UciHandler {
-    pub fn new() -> Self {
-        Self {
-            engine: Engine::new(),
+    pub fn new() -> anyhow::Result<Self> {
+        let engine = Engine::new()?;
+        let tutor = Tutor::new();
+        Ok(Self {
+            engine,
+            tutor,
             board: Board::default(),
             tt: TranspositionTable::new(TT_SIZE_MB),
-        }
+        })
     }
 
     pub fn handle_command(&mut self, command: &str) {
@@ -83,14 +88,14 @@ impl UciHandler {
             }
         }
 
-        let mut searcher = SearchHandler::new(&self.engine, &mut self.tt, self.board);
+        let mut searcher = SearchHandler::new(&self.engine, &self.tutor, &mut self.tt, self.board);
         if let (Some(best_move), _) = searcher.search(depth) {
             println!("bestmove {}", best_move);
         }
     }
 
     fn handle_bench(&mut self) {
-        let mut searcher = SearchHandler::new(&self.engine, &mut self.tt, Board::default());
+        let mut searcher = SearchHandler::new(&self.engine, &self.tutor, &mut self.tt, Board::default());
         let start_time = std::time::Instant::now();
 
         searcher.search(8); // A reasonable depth for a quick benchmark
