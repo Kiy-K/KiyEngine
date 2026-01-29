@@ -2,6 +2,7 @@
 
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Linear, Module};
+use std::sync::Arc;
 
 // Constants based on the spec
 pub const D_MODEL: usize = 384;
@@ -13,16 +14,16 @@ pub const D_INNER: usize = D_MODEL * EXPANSION_FACTOR;
 /// Represents the state of a Mamba block that needs to be tracked during search.
 #[derive(Clone)]
 pub struct MambaState {
-    pub conv_state: Tensor, // Shape: (D_INNER, D_CONV - 1)
-    pub ssm_state: Tensor,  // Shape: (D_INNER, D_STATE)
+    pub conv_state: Arc<Tensor>, // Shape: (D_INNER, D_CONV - 1)
+    pub ssm_state: Arc<Tensor>,  // Shape: (D_INNER, D_STATE)
 }
 
 impl MambaState {
     /// Creates a new, zero-initialized MambaState.
     pub fn new(device: &Device) -> Result<Self> {
         Ok(Self {
-            conv_state: Tensor::zeros((D_INNER, D_CONV - 1), DType::F32, device)?,
-            ssm_state: Tensor::zeros((D_INNER, D_STATE), DType::F32, device)?,
+            conv_state: Arc::new(Tensor::zeros((D_INNER, D_CONV - 1), DType::F32, device)?),
+            ssm_state: Arc::new(Tensor::zeros((D_INNER, D_STATE), DType::F32, device)?),
         })
     }
 }
@@ -56,10 +57,10 @@ impl MambaBlock {
         // state.conv_state: (D_INNER, D_CONV - 1)
 
         // current_conv_input: (D_INNER, D_CONV)
-        let current_conv_input = Tensor::cat(&[&state.conv_state, &x_inner.reshape((D_INNER, 1))?], 1)?;
+        let current_conv_input = Tensor::cat(&[state.conv_state.as_ref(), &x_inner.reshape((D_INNER, 1))?], 1)?;
 
-        // Update state for next time
-        state.conv_state = current_conv_input.narrow(1, 1, D_CONV - 1)?;
+        // Update state for next time (zero-clone update of Arc)
+        state.conv_state = Arc::new(current_conv_input.narrow(1, 1, D_CONV - 1)?);
 
         // conv1d_w: (D_INNER, 1, D_CONV)
         // Single token conv is just element-wise mul and sum
@@ -71,8 +72,8 @@ impl MambaBlock {
         x_inner = candle_nn::ops::silu(&x_inner)?;
 
         // 4. SSM (S6) - Selective Scan
-        let (y, new_ssm_state) = self.ssm(&x_inner, &state.ssm_state)?;
-        state.ssm_state = new_ssm_state;
+        let (y, new_ssm_state) = self.ssm(&x_inner, state.ssm_state.as_ref())?;
+        state.ssm_state = Arc::new(new_ssm_state);
 
         // 5. Gating
         z = candle_nn::ops::silu(&z)?;
