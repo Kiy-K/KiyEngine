@@ -658,6 +658,7 @@ dependencies = [
  "half",
  "memmap2",
  "safetensors 0.7.0",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,125 +1,183 @@
 // src/mamba.rs
+//
+// Simplified Mamba block matching the PyTorch "Gated CNN" variant from HuggingFace.
+// This version does NOT use SSM state tracking - it's a stateless sequence model.
 
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Linear, Module};
-use std::sync::Arc;
 
-// Constants based on the spec
+// Constants based on the spec (matching config.json)
 pub const D_MODEL: usize = 384;
 pub const D_STATE: usize = 16;
 pub const D_CONV: usize = 4;
 pub const EXPANSION_FACTOR: usize = 2;
-pub const D_INNER: usize = D_MODEL * EXPANSION_FACTOR;
-
-/// Represents the state of a Mamba block that needs to be tracked during search.
-#[derive(Clone)]
-pub struct MambaState {
-    pub conv_state: Arc<Tensor>, // Shape: (D_INNER, D_CONV - 1)
-    pub ssm_state: Arc<Tensor>,  // Shape: (D_INNER, D_STATE)
-}
-
-impl MambaState {
-    /// Creates a new, zero-initialized MambaState.
-    pub fn new(device: &Device) -> Result<Self> {
-        Ok(Self {
-            conv_state: Arc::new(Tensor::zeros((D_INNER, D_CONV - 1), DType::F32, device)?),
-            ssm_state: Arc::new(Tensor::zeros((D_INNER, D_STATE), DType::F32, device)?),
-        })
-    }
-}
+pub const D_INNER: usize = D_MODEL * EXPANSION_FACTOR; // 768
 
 /// The weights for a single Mamba block.
+/// This matches the PyTorch MambaBlock structure exactly.
 pub struct MambaBlock {
+    /// Input projection: (d_model) -> (2 * d_inner) for x and z
     pub in_proj: Linear,
-    pub conv1d_w: Tensor, // Shape: (D_INNER, 1, D_CONV)
-    pub conv1d_b: Tensor, // Shape: (D_INNER)
+
+    /// 1D depthwise convolution weights
+    /// PyTorch shape: (D_INNER, 1, D_CONV) with groups=D_INNER
+    pub conv1d_w: Tensor,
+    pub conv1d_b: Tensor,
+
+    /// These are present in the weights but NOT used in the simplified forward
+    /// Kept for weight loading compatibility
     pub x_proj: Linear,
     pub dt_proj: Linear,
-    pub a_log: Tensor,    // Shape: (D_INNER, D_STATE)
-    pub d: Tensor,        // Shape: (D_INNER)
+    pub a_log: Tensor,
+
+    /// The D parameter used for gating
+    pub d: Tensor,
+
+    /// Output projection: (d_inner) -> (d_model)
     pub out_proj: Linear,
 }
 
 impl MambaBlock {
-    /// Performs the forward pass for a single Mamba block on a single token.
-    pub fn forward(&self, x: &Tensor, state: &mut MambaState) -> Result<Tensor> {
-        // x shape: (D_MODEL)
-        // Add batch and sequence dims: (1, 1, D_MODEL)
-        let x_reshaped = x.reshape((1, 1, D_MODEL))?;
+    /// Performs the forward pass for a Mamba block.
+    ///
+    /// This matches the PyTorch implementation which uses a simplified "Gated CNN" approach:
+    /// 1. Input projection splits into x_inner and z (gate)
+    /// 2. Conv1D on x_inner with causal padding
+    /// 3. SiLU activation
+    /// 4. Element-wise multiply with D
+    /// 5. Gate with SiLU(z)
+    /// 6. Output projection
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor of shape (batch, seq_len, d_model)
+    ///
+    /// # Returns
+    /// * Output tensor of shape (batch, seq_len, d_model)
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (_batch, seq_len, _) = x.dims3()?;
 
-        // 1. Input Projection
-        let xz = self.in_proj.forward(&x_reshaped)?; // (1, 1, 2 * D_INNER)
-        let mut x_inner = xz.narrow(2, 0, D_INNER)?.squeeze(0)?.squeeze(0)?; // (D_INNER)
-        let mut z = xz.narrow(2, D_INNER, D_INNER)?.squeeze(0)?.squeeze(0)?; // (D_INNER)
+        // 1. Input Projection: (B, L, D_MODEL) -> (B, L, 2*D_INNER)
+        let xz = self.in_proj.forward(x)?;
 
-        // 2. 1D Convolution (Single token update)
-        // Update conv state: [C-1] -> [C-1]
-        // state.conv_state: (D_INNER, D_CONV - 1)
+        // Split into x_inner and z (gate)
+        let x_inner = xz.narrow(2, 0, D_INNER)?; // (B, L, D_INNER)
+        let z = xz.narrow(2, D_INNER, D_INNER)?; // (B, L, D_INNER)
 
-        // current_conv_input: (D_INNER, D_CONV)
-        let current_conv_input = Tensor::cat(&[state.conv_state.as_ref(), &x_inner.reshape((D_INNER, 1))?], 1)?;
+        // 2. Conv1D expects (B, C, L) format
+        let x_conv = x_inner.transpose(1, 2)?; // (B, D_INNER, L)
 
-        // Update state for next time (zero-clone update of Arc)
-        state.conv_state = Arc::new(current_conv_input.narrow(1, 1, D_CONV - 1)?);
+        // Apply depthwise conv1d manually
+        // PyTorch uses padding=d_conv-1 and then truncates to [:, :, :L]
+        let x_conv = self.depthwise_conv1d(&x_conv, seq_len)?;
 
-        // conv1d_w: (D_INNER, 1, D_CONV)
-        // Single token conv is just element-wise mul and sum
-        let conv_weights = self.conv1d_w.squeeze(1)?; // (D_INNER, D_CONV)
-        x_inner = (&current_conv_input * &conv_weights)?.sum(1)?; // (D_INNER)
-        x_inner = x_inner.broadcast_add(&self.conv1d_b)?;
+        // Transpose back: (B, D_INNER, L) -> (B, L, D_INNER)
+        let x_conv = x_conv.transpose(1, 2)?;
 
-        // 3. Activation (SiLU)
-        x_inner = candle_nn::ops::silu(&x_inner)?;
+        // 3. SiLU activation on conv output
+        let x_activated = candle_nn::ops::silu(&x_conv)?;
 
-        // 4. SSM (S6) - Selective Scan
-        let (y, new_ssm_state) = self.ssm(&x_inner, state.ssm_state.as_ref())?;
-        state.ssm_state = Arc::new(new_ssm_state);
+        // 4. Element-wise multiply with D parameter
+        // D shape: (D_INNER) -> broadcast to (B, L, D_INNER)
+        let y = x_activated.broadcast_mul(&self.d)?;
 
-        // 5. Gating
-        z = candle_nn::ops::silu(&z)?;
-        let output = (y * z)?;
+        // 5. Gate with SiLU(z)
+        let z_gate = candle_nn::ops::silu(&z)?;
+        let y = (y * z_gate)?;
 
-        // 6. Output Projection
-        self.out_proj.forward(&output.reshape((1, 1, D_INNER))?)?.squeeze(0)?.squeeze(0)
+        // 6. Output projection: (B, L, D_INNER) -> (B, L, D_MODEL)
+        self.out_proj.forward(&y)
     }
 
-    fn ssm(&self, x: &Tensor, ssm_state: &Tensor) -> Result<(Tensor, Tensor)> {
-        // x: (D_INNER)
-        // ssm_state: (D_INNER, D_STATE)
+    /// Performs depthwise 1D convolution with causal padding.
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor of shape (B, D_INNER, L)
+    /// * `seq_len` - Original sequence length for truncation
+    ///
+    /// # Returns
+    /// * Output tensor of shape (B, D_INNER, L)
+    fn depthwise_conv1d(&self, x: &Tensor, seq_len: usize) -> Result<Tensor> {
+        let (batch, channels, _len) = x.dims3()?;
 
-        // Project x to get dt, B, C
-        let ssm_params = self.x_proj.forward(&x.reshape((1, 1, D_INNER))?)?.squeeze(0)?.squeeze(0)?; // (D_INNER + 2 * D_STATE)
+        // Pad input with zeros on the left (causal padding)
+        // padding = d_conv - 1 = 3
+        let padding = D_CONV - 1;
+        let zeros = Tensor::zeros((batch, channels, padding), x.dtype(), x.device())?;
+        let x_padded = Tensor::cat(&[&zeros, x], 2)?; // (B, D_INNER, L + padding)
 
-        let dt_params = ssm_params.narrow(0, 0, D_INNER)?;
-        let b = ssm_params.narrow(0, D_INNER, D_STATE)?; // (D_STATE)
-        let c = ssm_params.narrow(0, D_INNER + D_STATE, D_STATE)?; // (D_STATE)
+        // Squeeze conv weights: (D_INNER, 1, D_CONV) -> (D_INNER, D_CONV)
+        let weights = self.conv1d_w.squeeze(1)?;
 
-        // Discretize dt
-        let dt = self.dt_proj.forward(&dt_params.reshape((1, 1, D_INNER))?)?.squeeze(0)?.squeeze(0)?; // (D_INNER)
-        // Softplus: log(1 + exp(x))
-        let dt = (dt.exp()? + 1.0)?.log()?;
+        // Manual depthwise convolution
+        // For each channel, convolve independently
+        let padded_len = x_padded.dim(2)?;
+        let out_len = padded_len - D_CONV + 1;
 
-        // Discretize A and B
-        // A_bar = exp(dt * A)
-        let a = self.a_log.exp()?; // (D_INNER, D_STATE)
-        let dt_reshaped = dt.reshape((D_INNER, 1))?;
-        let a_bar = (&dt_reshaped * &a)?.exp()?;
+        // Unfold the padded input to create sliding windows
+        // We'll compute this efficiently using matrix operations
+        let mut output_slices = Vec::with_capacity(out_len);
 
-        // B_bar = dt * B
-        let b_reshaped = b.reshape((1, D_STATE))?;
-        let b_bar = (&dt_reshaped * &b_reshaped)?;
+        for i in 0..out_len {
+            // Extract window: (B, D_INNER, D_CONV)
+            let window = x_padded.narrow(2, i, D_CONV)?;
+            // Element-wise multiply with weights and sum over conv dimension
+            // weights: (D_INNER, D_CONV) -> broadcast to (B, D_INNER, D_CONV)
+            let weighted = window.broadcast_mul(&weights)?;
+            let summed = weighted.sum(2)?; // (B, D_INNER)
+            output_slices.push(summed.unsqueeze(2)?); // (B, D_INNER, 1)
+        }
 
-        // Update SSM state: h_new = A_bar * h_old + B_bar * x
-        let x_reshaped = x.reshape((D_INNER, 1))?;
-        let new_ssm_state = ((&a_bar * ssm_state)? + (&b_bar * &x_reshaped)?)?;
+        // Concatenate all output positions
+        let output = Tensor::cat(&output_slices, 2)?; // (B, D_INNER, out_len)
 
-        // Calculate output: y = sum(h_new * C, axis=1)
-        let c_reshaped = c.reshape((1, D_STATE))?;
-        let y = (&new_ssm_state * &c_reshaped)?.sum(1)?;
+        // Add bias: (D_INNER) -> broadcast
+        let output = output.broadcast_add(&self.conv1d_b.reshape((1, D_INNER, 1))?)?;
 
-        // Add residual D connection
-        let y = (y + (x * &self.d)?)?;
+        // Truncate to original sequence length (matching PyTorch [:, :, :L])
+        output.narrow(2, 0, seq_len)
+    }
+}
 
-        Ok((y, new_ssm_state))
+/// Creates a new MambaBlock with zero-initialized weights (for testing).
+pub fn create_zero_block(device: &Device) -> Result<MambaBlock> {
+    Ok(MambaBlock {
+        in_proj: Linear::new(
+            Tensor::zeros((2 * D_INNER, D_MODEL), DType::F32, device)?,
+            None,
+        ),
+        conv1d_w: Tensor::zeros((D_INNER, 1, D_CONV), DType::F32, device)?,
+        conv1d_b: Tensor::zeros(D_INNER, DType::F32, device)?,
+        x_proj: Linear::new(
+            Tensor::zeros((D_INNER + 2 * D_STATE, D_INNER), DType::F32, device)?,
+            None,
+        ),
+        dt_proj: Linear::new(
+            Tensor::zeros((D_INNER, D_INNER), DType::F32, device)?,
+            Some(Tensor::zeros(D_INNER, DType::F32, device)?),
+        ),
+        a_log: Tensor::zeros((D_INNER, D_STATE), DType::F32, device)?,
+        d: Tensor::ones(D_INNER, DType::F32, device)?,
+        out_proj: Linear::new(
+            Tensor::zeros((D_MODEL, D_INNER), DType::F32, device)?,
+            None,
+        ),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mamba_block_forward() -> Result<()> {
+        let device = Device::Cpu;
+        let block = create_zero_block(&device)?;
+
+        // Create dummy input: (batch=1, seq_len=16, d_model=384)
+        let x = Tensor::zeros((1, 16, D_MODEL), DType::F32, &device)?;
+        let output = block.forward(&x)?;
+
+        assert_eq!(output.dims(), &[1, 16, D_MODEL]);
+        Ok(())
     }
 }

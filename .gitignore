@@ -21,3 +21,6 @@ cutechess/
 # Added by cargo
 
 /target
+
+# Model weights
+*.safetensors

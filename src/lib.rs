@@ -7,6 +7,7 @@
 pub mod engine;
 pub mod mamba;
 pub mod moe;
+pub mod safetensor_loader;
 pub mod search;
 pub mod tt;
 pub mod uci;
