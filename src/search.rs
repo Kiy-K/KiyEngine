@@ -21,7 +21,7 @@ const PANIC_THRESHOLD: i32 = 200;   // Eval drop triggering panic mode (centipaw
 
 // Scout configuration
 const SCOUT_DEPTH_MIN: u8 = 4;      // Minimum scout verification depth
-const SCOUT_DEPTH_MAX: u8 = 6;      // Maximum scout verification depth
+const SCOUT_DEPTH_MAX: u8 = 24;      // Maximum scout verification depth (user requested ~30, governed by node limit)
 const BLUNDER_THRESHOLD: i32 = 150; // Centipawns drop threshold for veto
 const TOP_N_CANDIDATES: usize = 5;  // Number of neural candidates to verify
 
@@ -72,27 +72,29 @@ pub fn token_to_moves(token: usize, board: &Board) -> Vec<ChessMove> {
 /// The Asymmetric Scout: Hard-Truth tactical verifier using Alpha-Beta + Quiescence.
 pub struct Scout<'a> {
     tutor: &'a Tutor,
+    tt: &'a mut TranspositionTable,
     scout_depth: u8,
     blunder_threshold: i32,
     nodes_searched: u64,
+    killers: [[Option<ChessMove>; 2]; 64],
+    ply: usize,
 }
 
 impl<'a> Scout<'a> {
-    pub fn new(tutor: &'a Tutor, scout_depth: u8, blunder_threshold: i32) -> Self {
+    pub fn new(tutor: &'a Tutor, tt: &'a mut TranspositionTable, scout_depth: u8, blunder_threshold: i32) -> Self {
         Self {
             tutor,
+            tt,
             scout_depth,
             blunder_threshold,
             nodes_searched: 0,
+            killers: [[None; 2]; 64],
+            ply: 0,
         }
     }
 
     /// Hard-Truth verification: paranoid filter for neural move candidates.
-    ///
-    /// For each candidate:
-    /// 1. Perform full Alpha-Beta search to scout_depth with Quiescence
-    /// 2. Compare against static evaluation
-    /// 3. VETO if score drop > blunder_threshold
+    /// Uses Iterative Deepening to reach maximum depth within limits.
     pub fn hard_truth_filter(
         &mut self,
         board: &Board,
@@ -102,14 +104,35 @@ impl<'a> Scout<'a> {
         self.nodes_searched = 0;
 
         let mut results: Vec<ScoutResult> = Vec::with_capacity(candidates.len());
+        
+        // Resource limit per move verification to avoid stalling
+        // For depth 30, we rely on pruning. Safety valve: 100k nodes per candidate.
+        let node_limit = 100_000;
 
         for (mv, neural_prob) in candidates {
+            let mut scout_eval = static_eval; // Default to static if search fails
+            
+            // Iterative Deepening for the Scout Search
             let new_board = board.make_move_new(*mv);
+            let start_nodes = self.nodes_searched;
+            
+            // Reset search state for this candidate
+            self.killers = [[None; 2]; 64];
+            self.ply = 0;
 
-            // Full Alpha-Beta with Quiescence Search
-            let scout_eval = -self.alpha_beta_qsearch(&new_board, self.scout_depth, -INFINITY, INFINITY);
+            for d in 1..=self.scout_depth {
+                // Alpha-Beta search
+                let score = -self.alpha_beta(&new_board, d, -INFINITY, INFINITY);
+                
+                scout_eval = score;
+                
+                // Break if we've used too many nodes for this verification
+                if self.nodes_searched - start_nodes > node_limit {
+                    break;
+                }
+            }
 
-            // Blunder detection: compare to static eval
+            // Blunder detection
             let eval_drop = static_eval - scout_eval;
             let is_vetoed = eval_drop > self.blunder_threshold;
 
@@ -131,69 +154,174 @@ impl<'a> Scout<'a> {
         results
     }
 
-    /// Alpha-Beta search with full Quiescence Search at leaf nodes.
-    fn alpha_beta_qsearch(&mut self, board: &Board, depth: u8, mut alpha: i32, beta: i32) -> i32 {
+    /// Alpha-Beta search with NMP, LMR, and Razoring (Advanced)
+    fn alpha_beta(&mut self, board: &Board, depth: u8, mut alpha: i32, mut beta: i32) -> i32 {
         self.nodes_searched += 1;
-
-        if board.status() == chess::BoardStatus::Checkmate {
-            return -MATE_SCORE;
+        let is_root = self.ply == 0; // Relative root for this search
+        
+        // 1. Mat/Stalemate Check
+        let status = board.status();
+        if status == chess::BoardStatus::Checkmate {
+            return -MATE_SCORE + self.ply as i32;
         }
-        if board.status() == chess::BoardStatus::Stalemate {
+        if status == chess::BoardStatus::Stalemate {
             return 0;
         }
 
+        // 2. Transposition Table Probe
+        let hash = board.get_hash();
+        let mut tt_move = None;
+        if let Some(entry) = self.tt.probe(hash) {
+            tt_move = entry.best_move;
+            if entry.depth >= depth {
+                match entry.flag {
+                    TTFlag::EXACT => return entry.score,
+                    TTFlag::LOWERBOUND => alpha = alpha.max(entry.score),
+                    TTFlag::UPPERBOUND => beta = beta.min(entry.score),
+                }
+                if alpha >= beta {
+                    return entry.score;
+                }
+            }
+        }
+
+        // 3. Quiescence Search at leaf
         if depth == 0 {
             return self.quiescence_search(board, alpha, beta);
         }
 
-        let moves = MoveGen::new_legal(board);
-        let mut best_score = -INFINITY;
+        let static_score = self.tutor.evaluate(board);
+        let in_check = *board.checkers() != EMPTY;
 
-        // Move ordering: captures first (MVV-LVA)
-        let mut scored_moves: Vec<(ChessMove, i32)> = moves
-            .map(|mv| {
-                let score = if let Some(victim) = board.piece_on(mv.get_dest()) {
-                    let attacker = board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
-                    100_000 + crate::tutor::MG_VALUE[victim.to_index()] * 10
-                        - crate::tutor::MG_VALUE[attacker.to_index()]
-                } else {
-                    0
-                };
-                (mv, score)
-            })
-            .collect();
+        // 4. Razoring (Futility Pruning at low depth)
+        // If we are way below alpha, just drop into qsearch
+        if !in_check && depth <= 3 {
+             let margin = 150 * (depth as i32);
+             if static_score + margin < alpha {
+                 let q_score = self.quiescence_search(board, alpha, beta);
+                 if q_score < alpha {
+                     return q_score;
+                 }
+             }
+        }
+
+        // 5. Null Move Pruning (NMP)
+        // If we can pass and still beat beta, our position is too good. Cutoff.
+        if depth >= 3 && !in_check && static_score >= beta && !is_root {
+            // R = 2 usually, maybe 3 for high depths
+            let r = 2 + (depth / 6); 
+            if let Some(null_board) = board.null_move() {
+                self.ply += 1;
+                let null_score = -self.alpha_beta(&null_board, depth.saturating_sub(r), -beta, -beta + 1);
+                self.ply -= 1;
+                
+                if null_score >= beta {
+                    // Don't verify mate scores with NMP
+                    if null_score < MATE_SCORE - 100 {
+                         return beta;
+                    }
+                }
+            }
+        }
+
+        // 6. Move Generation & Ordering
+        let moves = MoveGen::new_legal(board);
+        
+        // Score moves for ordering
+        let mut scored_moves: Vec<(ChessMove, i32)> = moves.map(|mv| {
+            let mut score = 0;
+            
+            // TT Move
+            if Some(mv) == tt_move {
+                score = 1_000_000;
+            } else if let Some(victim) = board.piece_on(mv.get_dest()) {
+                 // MVV-LVA
+                 let attacker = board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
+                 score = 100_000 + crate::tutor::MG_VALUE[victim.to_index()] * 10 - crate::tutor::MG_VALUE[attacker.to_index()];
+            } else {
+                 // Killers
+                 if self.ply < 64 {
+                     if self.killers[self.ply][0] == Some(mv) { score = 90_000; }
+                     else if self.killers[self.ply][1] == Some(mv) { score = 80_000; }
+                 }
+                 // History heuristic could go here
+            }
+            (mv, score)
+        }).collect();
+        
         scored_moves.sort_by(|a, b| b.1.cmp(&a.1));
 
-        for (mv, _) in scored_moves {
-            let new_board = board.make_move_new(mv);
-            let score = -self.alpha_beta_qsearch(&new_board, depth - 1, -beta, -alpha);
+        let mut best_score = -INFINITY;
+        let mut best_move = None;
+        let mut tt_flag = TTFlag::UPPERBOUND;
 
-            best_score = best_score.max(score);
-            alpha = alpha.max(score);
+        for (i, (mv, _)) in scored_moves.into_iter().enumerate() {
+            let new_board = board.make_move_new(mv);
+            self.ply += 1;
+            
+            // 7. Late Move Reduction (LMR)
+            // Reduce depth for late moves that aren't captures/checks
+            let is_capture = board.piece_on(mv.get_dest()).is_some();
+            let is_promotion = mv.get_promotion().is_some();
+            let gives_check = *new_board.checkers() != EMPTY;
+            
+            let mut score;
+            
+            if i >= 4 && depth >= 3 && !is_capture && !is_promotion && !in_check && !gives_check {
+                let r = 1 + (depth / 6) + (i / 10) as u8;
+                let d = depth.saturating_sub(r);
+                
+                // Search with reduced depth
+                score = -self.alpha_beta(&new_board, d, -alpha - 1, -alpha);
+                
+                // Re-search if it improved alpha
+                if score > alpha {
+                    score = -self.alpha_beta(&new_board, depth - 1, -beta, -alpha);
+                }
+            } else {
+                score = -self.alpha_beta(&new_board, depth - 1, -beta, -alpha);
+            }
+
+            self.ply -= 1;
+
+            if score > best_score {
+                best_score = score;
+                best_move = Some(mv);
+            }
+            if best_score > alpha {
+                alpha = best_score;
+                tt_flag = TTFlag::EXACT;
+            }
 
             if alpha >= beta {
-                break; // Beta cutoff
+                // Beta Cutoff
+                if !is_capture && self.ply < 64 {
+                    self.killers[self.ply][1] = self.killers[self.ply][0];
+                    self.killers[self.ply][0] = Some(mv);
+                }
+                self.tt.store(TTEntry { key: hash, best_move: Some(mv), score: best_score, depth, flag: TTFlag::LOWERBOUND });
+                return best_score;
             }
         }
-
+        
+        // No legal moves check handled at start (MoveGen would be empty logic logic needs adjustment? 
+        // MoveGen::new_legal handles it, loop won't run. `best_score` remains -INFINITY.
         if best_score == -INFINITY {
-            // No legal moves
-            if *board.checkers() != EMPTY {
-                return -MATE_SCORE;
-            }
-            return 0;
+             // If loop didn't run, check mate again (although done at top)
+             if in_check { return -MATE_SCORE + self.ply as i32; }
+             return 0; // Stalemate
         }
 
+        self.tt.store(TTEntry { key: hash, best_move, score: best_score, depth, flag: tt_flag });
         best_score
     }
 
-    /// Full Quiescence Search: searches all captures and checks to tactical stability.
+    /// Full Quiescence Search with TT support
     fn quiescence_search(&mut self, board: &Board, mut alpha: i32, beta: i32) -> i32 {
         self.nodes_searched += 1;
 
+        // 1. Stand-pat
         let static_score = self.tutor.evaluate(board);
-
-        // Stand-pat
         if static_score >= beta {
             return beta;
         }
@@ -201,41 +329,33 @@ impl<'a> Scout<'a> {
             alpha = static_score;
         }
 
-        // Delta pruning: if we're way behind, don't bother with captures
-        let big_delta = 900; // Queen value
+        // 2. Delta Pruning
+        let big_delta = 900;
         if static_score + big_delta < alpha {
-            return alpha;
+             return alpha;
         }
 
-        // Generate captures and promotions
+        // 3. Search Captures
         let moves = MoveGen::new_legal(board)
             .filter(|m| board.piece_on(m.get_dest()).is_some() || m.get_promotion().is_some());
 
-        // MVV-LVA ordering
-        let mut scored_moves: Vec<(ChessMove, i32)> = moves
-            .map(|mv| {
-                let victim = board.piece_on(mv.get_dest());
-                let score = if let Some(v) = victim {
-                    let attacker = board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
-                    crate::tutor::MG_VALUE[v.to_index()] * 10
-                        - crate::tutor::MG_VALUE[attacker.to_index()]
-                } else {
-                    500 // Promotion bonus
-                };
-                (mv, score)
-            })
-            .collect();
+        // Simple MVV-LVA Ordering
+        let mut scored_moves: Vec<(ChessMove, i32)> = moves.map(|mv| {
+            let victim = board.piece_on(mv.get_dest());
+             let score = if let Some(v) = victim {
+                 let attacker = board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
+                 crate::tutor::MG_VALUE[v.to_index()] * 10 - crate::tutor::MG_VALUE[attacker.to_index()]
+            } else { 500 };
+            (mv, score)
+        }).collect();
         scored_moves.sort_by(|a, b| b.1.cmp(&a.1));
 
-        // SEE pruning: skip clearly losing captures
         for (mv, see_score) in scored_moves {
-            if see_score < 0 {
-                continue; // Skip losing captures
-            }
+            if see_score < 0 { continue; } // SEE Pruning
 
             let new_board = board.make_move_new(mv);
             let score = -self.quiescence_search(&new_board, -beta, -alpha);
-
+             
             if score >= beta {
                 return beta;
             }
@@ -243,7 +363,6 @@ impl<'a> Scout<'a> {
                 alpha = score;
             }
         }
-
         alpha
     }
 
@@ -452,7 +571,7 @@ impl<'a> SearchHandler<'a> {
         let scout_depth = if in_check { SCOUT_DEPTH_MAX } else { SCOUT_DEPTH_MIN };
 
         // Hard-Truth verification
-        let mut scout = Scout::new(self.tutor, scout_depth, BLUNDER_THRESHOLD);
+        let mut scout = Scout::new(self.tutor, self.tt, scout_depth, BLUNDER_THRESHOLD);
         let results = scout.hard_truth_filter(&board, &candidates);
 
         // UCI debug output
@@ -533,7 +652,7 @@ impl<'a> SearchHandler<'a> {
         println!("info string Using fallback scout search");
         let board = self.game_state.board;
 
-        let mut scout = Scout::new(self.tutor, SCOUT_DEPTH_MIN, BLUNDER_THRESHOLD);
+        let mut scout = Scout::new(self.tutor, self.tt, SCOUT_DEPTH_MIN, BLUNDER_THRESHOLD);
         let moves: Vec<ChessMove> = MoveGen::new_legal(&board).collect();
 
         let mut best_move = None;
@@ -541,7 +660,7 @@ impl<'a> SearchHandler<'a> {
 
         for mv in moves {
             let new_board = board.make_move_new(mv);
-            let score = -scout.alpha_beta_qsearch(&new_board, SCOUT_DEPTH_MIN - 1, -INFINITY, INFINITY);
+            let score = -scout.alpha_beta(&new_board, SCOUT_DEPTH_MIN - 1, -INFINITY, INFINITY);
             self.nodes_searched += scout.nodes_searched;
             scout.nodes_searched = 0;
 

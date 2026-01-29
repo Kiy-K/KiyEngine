@@ -59,7 +59,7 @@ impl UciHandler {
         println!();
         println!("option name Hash type spin default 512 min 1 max 4096");
         println!("option name Debug type check default true");
-        println!("option name ScoutDepth type spin default 4 min 2 max 8");
+        println!("option name ScoutDepth type spin default 6 min 2 max 32");
         println!("option name BlunderThreshold type spin default 150 min 50 max 500");
         println!("option name OverheadMs type spin default 50 min 0 max 500");
         println!("uciok");
