@@ -18,10 +18,12 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact_name: kiy_engine_linux
-            asset_name: kiy_engine_linux.tar.gz
+            asset_name: kiy_engine_v3_linux.tar.gz
+            binary_name: kiy_engine_v3
           - os: windows-latest
             artifact_name: kiy_engine_windows
-            asset_name: kiy_engine_windows.exe
+            asset_name: kiy_engine_v3_windows.exe
+            binary_name: kiy_engine_v3.exe
 
     steps:
       - name: Checkout code
@@ -36,12 +38,12 @@ jobs:
       - name: Package Linux artifact
         if: matrix.os == 'ubuntu-latest'
         run: |
-          tar -czvf ${{ matrix.asset_name }} -C target/release kiy_engine
+          tar -czvf ${{ matrix.asset_name }} -C target/release ${{ matrix.binary_name }}
 
       - name: Prepare Windows artifact
         if: matrix.os == 'windows-latest'
         run: |
-          cp target/release/kiy_engine.exe ${{ matrix.asset_name }}
+          cp target/release/${{ matrix.binary_name }} ${{ matrix.asset_name }}
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
@@ -71,8 +73,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            kiy_engine_linux.tar.gz
-            kiy_engine_windows.exe
+            kiy_engine_v3_linux.tar.gz
+            kiy_engine_v3_windows.exe
           name: KiyEngine Release ${{ github.ref_name }}
           draft: false
           prerelease: false
