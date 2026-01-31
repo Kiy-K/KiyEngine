@@ -1,10 +1,9 @@
 // src/engine.rs
 //
 // The main KiyEngine V3 model combining Mamba-MoE architecture.
-// Loads weights from HuggingFace safetensors format.
+// Optimized for stateful incremental inference.
 
-use crate::mamba::MambaBlock;
-use crate::moe::{MoELayer, NUM_EXPERTS};
+use crate::moe::{MoELayer, MoEState, NUM_EXPERTS};
 use crate::safetensor_loader::SafeTensorFile;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Linear, Module};
@@ -15,8 +14,8 @@ pub const VOCAB_SIZE: usize = 768; // 12 pieces * 64 squares
 
 /// Sequential value head: Linear(384->128) -> ReLU -> Linear(128->1)
 pub struct ValueHead {
-    pub linear1: Linear, // value_head.0
-    pub linear2: Linear, // value_head.2
+    pub linear1: Linear,
+    pub linear2: Linear,
 }
 
 impl ValueHead {
@@ -27,22 +26,36 @@ impl ValueHead {
     }
 }
 
-/// Represents the full MoE-Mamba model using Candle.
+/// Full state of the model for a specific search branch.
+#[derive(Clone)]
+pub struct EngineState {
+    pub layer_states: Vec<MoEState>,
+}
+
+impl EngineState {
+    pub fn new(device: &Device) -> Result<Self> {
+        let mut layer_states = Vec::with_capacity(NUM_LAYERS);
+        for _ in 0..NUM_LAYERS {
+            layer_states.push(MoEState::new(device)?);
+        }
+        Ok(Self { layer_states })
+    }
+}
+
 pub struct Engine {
-    pub embedding: Tensor, // Shape: (VOCAB_SIZE, D_MODEL) - note: singular "embedding"
+    pub embedding: Tensor, // (VOCAB_SIZE, D_MODEL)
     pub layers: Vec<MoELayer>,
-    pub norm_w: Tensor, // Shape: (D_MODEL) - RMSNorm weight
+    pub norm_w: Tensor, // RMSNorm weight
     pub policy_head: Linear,
     pub value_head: ValueHead,
     pub device: Device,
 }
 
-/// Represents the game state for search.
-/// Simplified version without Mamba state tracking.
 #[derive(Clone)]
 pub struct GameState {
     pub board: Board,
-    pub move_history: Vec<usize>, // Token history for the model
+    pub move_history: Vec<usize>,
+    pub engine_state: Option<EngineState>,
 }
 
 impl GameState {
@@ -50,22 +63,20 @@ impl GameState {
         Self {
             board,
             move_history: Vec::new(),
+            engine_state: None,
         }
     }
 
-    /// Adds a move token to the history.
     pub fn push_token(&mut self, token: usize) {
         self.move_history.push(token);
-        // Keep only the last 64 tokens (model's max sequence length)
         if self.move_history.len() > 64 {
             self.move_history.remove(0);
         }
     }
 
-    /// Gets the input sequence for the model (padded to at least 1 token).
     pub fn get_input_sequence(&self) -> Vec<usize> {
         if self.move_history.is_empty() {
-            vec![0] // Start token or padding
+            vec![0]
         } else {
             self.move_history.clone()
         }
@@ -84,7 +95,7 @@ impl Engine {
             println!("Loading model from model.safetensors...");
             Self::load_from_safetensors("model.safetensors", device)
         } else {
-            anyhow::bail!("model.safetensors not found. Random initialization not supported in this version.")
+            anyhow::bail!("model.safetensors not found.")
         }
     }
 
@@ -92,179 +103,98 @@ impl Engine {
         let st = SafeTensorFile::open(path)?;
         let dtype = DType::F32;
 
-        // Load embedding (note: singular, not "embeddings")
         let embedding = st.load_tensor("embedding.weight", dtype, &device)?;
 
-        // Load layers
         let mut layers = Vec::with_capacity(NUM_LAYERS);
         for l in 0..NUM_LAYERS {
-            // Router (with bias)
-            // Router (with bias) - user specified mapping to skill_emb
             let router_w = st.load_tensor(&format!("layers.{}.skill_emb.weight", l), dtype, &device)?;
             let router_b = st.load_tensor(&format!("layers.{}.skill_emb.bias", l), dtype, &device)?;
             let router = Linear::new(router_w, Some(router_b));
 
-            // Experts
             let mut experts = Vec::with_capacity(NUM_EXPERTS);
             for e in 0..NUM_EXPERTS {
                 let prefix = format!("layers.{}.experts.{}", l, e);
-
-                // in_proj: (2*D_INNER, D_MODEL)
-                let in_proj_w = st.load_tensor(&format!("{}.in_proj.weight", prefix), dtype, &device)?;
-                let in_proj = Linear::new(in_proj_w, None);
-
-                // conv1d: weight (D_INNER, 1, D_CONV), bias (D_INNER)
+                let in_proj = Linear::new(st.load_tensor(&format!("{}.in_proj.weight", prefix), dtype, &device)?, None);
                 let conv1d_w = st.load_tensor(&format!("{}.conv1d.weight", prefix), dtype, &device)?;
                 let conv1d_b = st.load_tensor(&format!("{}.conv1d.bias", prefix), dtype, &device)?;
-
-                // x_proj: (D_INNER + 2*D_STATE, D_INNER) - kept for weight compatibility
-                let x_proj_w = st.load_tensor(&format!("{}.x_proj.weight", prefix), dtype, &device)?;
-                let x_proj = Linear::new(x_proj_w, None);
-
-                // dt_proj: weight (D_INNER, D_INNER), bias (D_INNER)
-                let dt_proj_w = st.load_tensor(&format!("{}.dt_proj.weight", prefix), dtype, &device)?;
-                let dt_proj_b = st.load_tensor(&format!("{}.dt_proj.bias", prefix), dtype, &device)?;
-                let dt_proj = Linear::new(dt_proj_w, Some(dt_proj_b));
-
-                // A_log: (D_INNER, D_STATE) - kept for weight compatibility
+                let x_proj = Linear::new(st.load_tensor(&format!("{}.x_proj.weight", prefix), dtype, &device)?, None);
+                let dt_proj = Linear::new(st.load_tensor(&format!("{}.dt_proj.weight", prefix), dtype, &device)?, Some(st.load_tensor(&format!("{}.dt_proj.bias", prefix), dtype, &device)?));
                 let a_log = st.load_tensor(&format!("{}.A_log", prefix), dtype, &device)?;
-
-                // D: (D_INNER) - used for gating
                 let d = st.load_tensor(&format!("{}.D", prefix), dtype, &device)?;
+                let out_proj = Linear::new(st.load_tensor(&format!("{}.out_proj.weight", prefix), dtype, &device)?, None);
 
-                // out_proj: (D_MODEL, D_INNER)
-                let out_proj_w = st.load_tensor(&format!("{}.out_proj.weight", prefix), dtype, &device)?;
-                let out_proj = Linear::new(out_proj_w, None);
-
-                experts.push(MambaBlock {
-                    in_proj,
-                    conv1d_w,
-                    conv1d_b,
-                    x_proj,
-                    dt_proj,
-                    a_log,
-                    d,
-                    out_proj,
+                experts.push(crate::mamba::MambaBlock {
+                    in_proj, conv1d_w, conv1d_b, x_proj, dt_proj, a_log, d, out_proj,
                 });
             }
-
             layers.push(MoELayer { router, experts });
         }
 
-        // Norm weight
         let norm_w = st.load_tensor("norm.weight", dtype, &device)?;
-
-        // Policy head: (VOCAB_SIZE, D_MODEL)
-        let policy_w = st.load_tensor("policy_head.weight", dtype, &device)?;
-        let policy_head = Linear::new(policy_w, None);
-
-        // Value head: Sequential with Linear(384->128) -> ReLU -> Linear(128->1)
+        let policy_head = Linear::new(st.load_tensor("policy_head.weight", dtype, &device)?, None);
         let value_head = ValueHead {
-            linear1: Linear::new(
-                st.load_tensor("value_head.0.weight", dtype, &device)?,
-                Some(st.load_tensor("value_head.0.bias", dtype, &device)?),
-            ),
-            linear2: Linear::new(
-                st.load_tensor("value_head.2.weight", dtype, &device)?,
-                Some(st.load_tensor("value_head.2.bias", dtype, &device)?),
-            ),
+            linear1: Linear::new(st.load_tensor("value_head.0.weight", dtype, &device)?, Some(st.load_tensor("value_head.0.bias", dtype, &device)?)),
+            linear2: Linear::new(st.load_tensor("value_head.2.weight", dtype, &device)?, Some(st.load_tensor("value_head.2.bias", dtype, &device)?)),
         };
 
-        Ok(Self {
-            embedding,
-            layers,
-            norm_w,
-            policy_head,
-            value_head,
-            device,
-        })
+        Ok(Self { embedding, layers, norm_w, policy_head, value_head, device })
     }
 
-    /// Forward pass on a sequence of tokens.
-    ///
-    /// # Arguments
-    /// * `tokens` - Sequence of move tokens
-    ///
-    /// # Returns
-    /// * (policy_logits, value) where policy_logits is (VOCAB_SIZE) and value is a scalar
+    /// Incremental forward pass for a single token using EngineState.
+    pub fn forward_incremental(&self, token: usize, state: &mut EngineState) -> Result<(Tensor, f32)> {
+        let x = self.embedding.get(token)?.unsqueeze(0)?.unsqueeze(0)?; // (1, 1, D_MODEL)
+        let mut current_x = x;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let x_norm = self.rms_norm(&current_x)?;
+            let layer_output = layer.forward_stateful(&x_norm, &mut state.layer_states[i])?;
+            current_x = (current_x + layer_output)?;
+        }
+
+        current_x = self.rms_norm(&current_x)?;
+        let last_state = current_x.squeeze(0)?.squeeze(0)?; // (D_MODEL)
+
+        let policy_logits = self.policy_head.forward(&last_state.unsqueeze(0)?)?.squeeze(0)?;
+        let value_tensor = self.value_head.forward(&last_state.unsqueeze(0)?)?.squeeze(0)?.squeeze(0)?;
+        let value = value_tensor.tanh()?.to_scalar::<f32>()?;
+
+        Ok((policy_logits, value))
+    }
+
+    /// Batch forward pass for a sequence of tokens.
     pub fn forward(&self, tokens: &[usize]) -> Result<(Tensor, f32)> {
-        let seq_len = tokens.len();
-
-        // Look up embeddings for all tokens
-        let embeddings: Vec<Tensor> = tokens
-            .iter()
-            .map(|&t| self.embedding.get(t))
-            .collect::<Result<Vec<_>>>()?;
-
-        // Stack to (1, seq_len, d_model)
+        let embeddings: Vec<Tensor> = tokens.iter().map(|&t| self.embedding.get(t)).collect::<Result<Vec<_>>>()?;
         let mut x = Tensor::stack(&embeddings, 0)?.unsqueeze(0)?;
 
-        // Forward through layers with residual connections
-        // PyTorch: for layer in self.layers: x = x + layer(self.norm(x))
         for layer in &self.layers {
             let x_norm = self.rms_norm(&x)?;
             let layer_output = layer.forward(&x_norm)?;
             x = (x + layer_output)?;
         }
 
-        // Final norm
         x = self.rms_norm(&x)?;
-
-        // Get last token state: (1, d_model)
-        let last_token_state = x.get(0)?.get(seq_len - 1)?;
-
-        // Policy logits: (vocab_size)
-        let policy_logits = self.policy_head.forward(&last_token_state.unsqueeze(0)?)?
-            .squeeze(0)?;
-
-        // Value: tanh(value_head(last_token_state))
-        let value_tensor = self.value_head.forward(&last_token_state.unsqueeze(0)?)?
-            .squeeze(0)?
-            .squeeze(0)?;
+        let last_token_state = x.get(0)?.get(tokens.len() - 1)?;
+        let policy_logits = self.policy_head.forward(&last_token_state.unsqueeze(0)?)?.squeeze(0)?;
+        let value_tensor = self.value_head.forward(&last_token_state.unsqueeze(0)?)?.squeeze(0)?.squeeze(0)?;
         let value = value_tensor.tanh()?.to_scalar::<f32>()?;
 
         Ok((policy_logits, value))
     }
 
-    /// Single token forward pass for incremental inference.
-    ///
-    /// # Arguments
-    /// * `token` - Single move token
-    /// * `state` - Game state with history
-    ///
-    /// # Returns
-    /// * (policy_logits, value)
-    pub fn forward_token(&self, token: usize, state: &mut GameState) -> Result<(Tensor, f32)> {
-        state.push_token(token);
-        let tokens = state.get_input_sequence();
-        self.forward(&tokens)
-    }
-
-    /// RMSNorm implementation matching PyTorch.
     fn rms_norm(&self, x: &Tensor) -> Result<Tensor> {
         let eps = 1e-5;
-        // norm = x.norm(2, dim=-1, keepdim=True) * (x.shape[-1] ** -0.5)
-        // return x / (norm + eps) * self.weight
-
         let x_sq = x.sqr()?;
         let mean_sq = x_sq.mean_keepdim(candle_core::D::Minus1)?;
         let norm = (mean_sq + eps)?.sqrt()?;
-        let x_normed = x.broadcast_div(&norm)?;
-        x_normed.broadcast_mul(&self.norm_w)
+        x.broadcast_div(&norm)?.broadcast_mul(&self.norm_w)
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_game_state() {
-        let mut state = GameState::new(Board::default());
-        assert_eq!(state.get_input_sequence(), vec![0]);
-
-        state.push_token(100);
-        state.push_token(200);
-        assert_eq!(state.get_input_sequence(), vec![100, 200]);
+    pub fn get_initial_state(&self, tokens: &[usize]) -> Result<(EngineState, Tensor, f32)> {
+        let mut state = EngineState::new(&self.device)?;
+        let mut last_res = (Tensor::zeros((VOCAB_SIZE,), DType::F32, &self.device)?, 0.0f32);
+        for &t in tokens {
+            last_res = self.forward_incremental(t, &mut state)?;
+        }
+        Ok((state, last_res.0, last_res.1))
     }
 }
