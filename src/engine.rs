@@ -12,13 +12,18 @@ use chess::Board;
 pub const NUM_LAYERS: usize = 4;
 pub const VOCAB_SIZE: usize = 768; // 12 pieces * 64 squares
 
-/// Sequential value head: Linear(384->128) -> ReLU -> Linear(128->1)
+/// Sequential value head: `Linear(384->128)` -> `ReLU` -> `Linear(128->1)`
 pub struct ValueHead {
     pub linear1: Linear,
     pub linear2: Linear,
 }
 
 impl ValueHead {
+    /// Forward pass for the value head.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the linear layers fail.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = self.linear1.forward(x)?;
         let x = x.relu()?;
@@ -33,6 +38,11 @@ pub struct EngineState {
 }
 
 impl EngineState {
+    /// Creates a new `EngineState`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the layer states cannot be initialized.
     pub fn new(device: &Device) -> Result<Self> {
         let mut layer_states = Vec::with_capacity(NUM_LAYERS);
         for _ in 0..NUM_LAYERS {
@@ -59,6 +69,7 @@ pub struct GameState {
 }
 
 impl GameState {
+    #[must_use]
     pub fn new(board: Board) -> Self {
         Self {
             board,
@@ -74,6 +85,7 @@ impl GameState {
         }
     }
 
+    #[must_use]
     pub fn get_input_sequence(&self) -> Vec<usize> {
         if self.move_history.is_empty() {
             vec![0]
@@ -84,6 +96,11 @@ impl GameState {
 }
 
 impl Engine {
+    /// Creates a new `Engine` and loads weights from `model.safetensors`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model file is missing or corrupted.
     pub fn new() -> anyhow::Result<Self> {
         let device = if cfg!(feature = "cuda") {
             Device::new_cuda(0).unwrap_or(Device::Cpu)
@@ -108,34 +125,34 @@ impl Engine {
         let mut layers = Vec::with_capacity(NUM_LAYERS);
         for l in 0..NUM_LAYERS {
             let router_w =
-                st.load_tensor(&format!("layers.{}.skill_emb.weight", l), dtype, &device)?;
+                st.load_tensor(&format!("layers.{l}.skill_emb.weight"), dtype, &device)?;
             let router_b =
-                st.load_tensor(&format!("layers.{}.skill_emb.bias", l), dtype, &device)?;
+                st.load_tensor(&format!("layers.{l}.skill_emb.bias"), dtype, &device)?;
             let router = Linear::new(router_w, Some(router_b));
 
             let mut experts = Vec::with_capacity(NUM_EXPERTS);
             for e in 0..NUM_EXPERTS {
-                let prefix = format!("layers.{}.experts.{}", l, e);
+                let prefix = format!("layers.{l}.experts.{e}");
                 let in_proj = Linear::new(
-                    st.load_tensor(&format!("{}.in_proj.weight", prefix), dtype, &device)?,
+                    st.load_tensor(&format!("{prefix}.in_proj.weight"), dtype, &device)?,
                     None,
                 );
                 let conv1d_w =
-                    st.load_tensor(&format!("{}.conv1d.weight", prefix), dtype, &device)?;
+                    st.load_tensor(&format!("{prefix}.conv1d.weight"), dtype, &device)?;
                 let conv1d_b =
-                    st.load_tensor(&format!("{}.conv1d.bias", prefix), dtype, &device)?;
+                    st.load_tensor(&format!("{prefix}.conv1d.bias"), dtype, &device)?;
                 let x_proj = Linear::new(
-                    st.load_tensor(&format!("{}.x_proj.weight", prefix), dtype, &device)?,
+                    st.load_tensor(&format!("{prefix}.x_proj.weight"), dtype, &device)?,
                     None,
                 );
                 let dt_proj = Linear::new(
-                    st.load_tensor(&format!("{}.dt_proj.weight", prefix), dtype, &device)?,
-                    Some(st.load_tensor(&format!("{}.dt_proj.bias", prefix), dtype, &device)?),
+                    st.load_tensor(&format!("{prefix}.dt_proj.weight"), dtype, &device)?,
+                    Some(st.load_tensor(&format!("{prefix}.dt_proj.bias"), dtype, &device)?),
                 );
-                let a_log = st.load_tensor(&format!("{}.A_log", prefix), dtype, &device)?;
-                let d = st.load_tensor(&format!("{}.D", prefix), dtype, &device)?;
+                let a_log = st.load_tensor(&format!("{prefix}.A_log"), dtype, &device)?;
+                let d = st.load_tensor(&format!("{prefix}.D"), dtype, &device)?;
                 let out_proj = Linear::new(
-                    st.load_tensor(&format!("{}.out_proj.weight", prefix), dtype, &device)?,
+                    st.load_tensor(&format!("{prefix}.out_proj.weight"), dtype, &device)?,
                     None,
                 );
 
@@ -176,7 +193,11 @@ impl Engine {
         })
     }
 
-    /// Incremental forward pass for a single token using EngineState.
+    /// Incremental forward pass for a single token using `EngineState`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn forward_incremental(
         &self,
         token: usize,
@@ -209,6 +230,10 @@ impl Engine {
     }
 
     /// Batch forward pass for a sequence of tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn forward(&self, tokens: &[usize]) -> Result<(Tensor, f32)> {
         let embeddings: Vec<Tensor> = tokens
             .iter()
@@ -246,6 +271,11 @@ impl Engine {
         x.broadcast_div(&norm)?.broadcast_mul(&self.norm_w)
     }
 
+    /// Computes the initial engine state for a sequence of tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn get_initial_state(&self, tokens: &[usize]) -> Result<(EngineState, Tensor, f32)> {
         let mut state = EngineState::new(&self.device)?;
         let mut last_res = (

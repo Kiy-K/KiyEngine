@@ -16,9 +16,14 @@ impl From<u8> for TTFlag {
         match value {
             0 => TTFlag::EXACT,
             1 => TTFlag::LOWERBOUND,
-            2 => TTFlag::UPPERBOUND,
             _ => TTFlag::UPPERBOUND,
         }
+    }
+}
+
+impl From<TTFlag> for u8 {
+    fn from(value: TTFlag) -> Self {
+        value as u8
     }
 }
 
@@ -43,7 +48,8 @@ pub struct TranspositionTable {
 }
 
 impl TranspositionTable {
-    /// Creates a new TranspositionTable with a given size in Megabytes.
+    /// Creates a new `TranspositionTable` with a given size in Megabytes.
+    #[must_use]
     pub fn new(size_mb: usize) -> Self {
         let entry_size = std::mem::size_of::<PackedEntry>();
         let size = (size_mb * 1024 * 1024) / entry_size;
@@ -66,7 +72,9 @@ impl TranspositionTable {
     }
 
     /// Probes the TT for a given Zobrist key.
+    #[must_use]
     pub fn probe(&self, key: u64) -> Option<TTEntry> {
+        #[allow(clippy::cast_possible_truncation)]
         let index = (key % self.size as u64) as usize;
         let slot = &self.entries[index];
 
@@ -81,6 +89,7 @@ impl TranspositionTable {
 
     /// Stores a new entry in the TT using a lock-free replacement strategy.
     pub fn store(&self, entry: TTEntry) {
+        #[allow(clippy::cast_possible_truncation)]
         let index = (entry.key % self.size as u64) as usize;
         let slot = &self.entries[index];
 
@@ -92,41 +101,44 @@ impl TranspositionTable {
 
         if existing_data != 0 {
             let existing_depth = ((existing_data >> 32) & 0xFF) as u8;
-            let existing_age = (existing_data >> 48) as u64;
+            let existing_age = existing_data >> 48;
 
-            if entry.key != existing_key {
-                // Different position: replace if old or higher depth
-                if current_age == existing_age && entry.depth < existing_depth {
-                    return; // Keep existing deeper entry from current search
-                }
-            } else {
+            if entry.key == existing_key {
                 // Same position: only replace if new entry has higher or equal depth
                 if entry.depth < existing_depth {
                     return;
                 }
+            } else {
+                // Different position: replace if old or higher depth
+                if current_age == existing_age && entry.depth < existing_depth {
+                    return; // Keep existing deeper entry from current search
+                }
             }
         }
 
-        let data = self.pack(&entry, current_age as u16);
+        #[allow(clippy::cast_possible_truncation)]
+        let data = Self::pack(&entry, current_age as u16);
         slot.key.store(entry.key ^ data, Ordering::Release);
         slot.data.store(data, Ordering::Release);
     }
 
-    fn pack(&self, entry: &TTEntry, age: u16) -> u64 {
-        let s = (entry.score as i16) as u16 as u64; // bits 0..16
+    #[allow(clippy::many_single_char_names)]
+    fn pack(entry: &TTEntry, age: u16) -> u64 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let s = u64::from((entry.score as i16) as u16); // bits 0..16
         let m = match entry.best_move {
-            Some(mv) => Self::move_to_u16(mv) as u64,
+            Some(mv) => u64::from(Self::move_to_u16(mv)),
             None => 0,
         }; // bits 16..32
-        let d = entry.depth as u64; // bits 32..40
-        let f = (entry.flag as u8) as u64; // bits 40..48
-        let a = age as u64; // bits 48..64
+        let d = u64::from(entry.depth); // bits 32..40
+        let f = u64::from(u8::from(entry.flag)); // bits 40..48
+        let a = u64::from(age); // bits 48..64
 
         s | (m << 16) | (d << 32) | (f << 40) | (a << 48)
     }
 
     fn unpack(key: u64, data: u64) -> TTEntry {
-        let score = (data & 0xFFFF) as i16 as i32;
+        let score = i32::from((data & 0xFFFF) as i16);
         let mv_bits = ((data >> 16) & 0xFFFF) as u16;
         let best_move = if mv_bits == 0 {
             None
@@ -146,10 +158,9 @@ impl TranspositionTable {
     }
 
     fn move_to_u16(mv: ChessMove) -> u16 {
-        let src = mv.get_source().to_int() as u16;
-        let dst = mv.get_dest().to_int() as u16;
+        let src = u16::from(mv.get_source().to_int());
+        let dst = u16::from(mv.get_dest().to_int());
         let promo = match mv.get_promotion() {
-            None => 0,
             Some(Piece::Knight) => 1,
             Some(Piece::Bishop) => 2,
             Some(Piece::Rook) => 3,

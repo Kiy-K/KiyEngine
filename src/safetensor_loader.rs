@@ -28,9 +28,13 @@ pub struct SafeTensorFile {
 impl SafeTensorFile {
     /// Opens a safetensors file and parses its header.
     /// Handles large headers by reading the size prefix first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened, is too small, or has an invalid header.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path.as_ref())
-            .with_context(|| format!("Failed to open {:?}", path.as_ref()))?;
+            .with_context(|| format!("Failed to open {}", path.as_ref().display()))?;
 
         // Safety: We're only reading from the file, never modifying it
         let mmap = unsafe { Mmap::map(&file)? };
@@ -40,12 +44,12 @@ impl SafeTensorFile {
         }
 
         // Read 8-byte little-endian header size
+        #[allow(clippy::cast_possible_truncation)]
         let header_size = u64::from_le_bytes(mmap[0..8].try_into()?) as usize;
 
         if header_size > mmap.len() - 8 {
             bail!(
-                "Invalid header size: {} (file size: {})",
-                header_size,
+                "Invalid header size: {header_size} (file size: {})",
                 mmap.len()
             );
         }
@@ -71,32 +75,35 @@ impl SafeTensorFile {
 
             let tensor_info = value
                 .as_object()
-                .ok_or_else(|| anyhow!("Tensor {} info is not an object", key))?;
+                .ok_or_else(|| anyhow!("Tensor {key} info is not an object"))?;
 
             let dtype = tensor_info
                 .get("dtype")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("Missing dtype for tensor {}", key))?
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("Missing dtype for tensor {key}"))?
                 .to_string();
 
+            #[allow(clippy::cast_possible_truncation)]
             let shape: Vec<usize> = tensor_info
                 .get("shape")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| anyhow!("Missing shape for tensor {}", key))?
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| anyhow!("Missing shape for tensor {key}"))?
                 .iter()
                 .map(|v| v.as_u64().unwrap_or(0) as usize)
                 .collect();
 
             let offsets = tensor_info
                 .get("data_offsets")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| anyhow!("Missing data_offsets for tensor {}", key))?;
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| anyhow!("Missing data_offsets for tensor {key}"))?;
 
             if offsets.len() != 2 {
-                bail!("Invalid data_offsets for tensor {}", key);
+                bail!("Invalid data_offsets for tensor {key}");
             }
 
+            #[allow(clippy::cast_possible_truncation)]
             let start = offsets[0].as_u64().unwrap_or(0) as usize;
+            #[allow(clippy::cast_possible_truncation)]
             let end = offsets[1].as_u64().unwrap_or(0) as usize;
 
             tensors.insert(
@@ -119,21 +126,31 @@ impl SafeTensorFile {
     }
 
     /// Lists all tensor names in the file.
+    #[must_use]
     pub fn tensor_names(&self) -> Vec<&str> {
-        self.tensors.keys().map(|s| s.as_str()).collect()
+        self.tensors.keys().map(String::as_str).collect()
     }
 
     /// Gets information about a specific tensor.
+    #[must_use]
     pub fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
         self.tensors.get(name)
     }
 
     /// Loads a tensor by name, converting to the specified dtype.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tensor is not found, has an unsupported dtype, or if size mismatch occurs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bytes cannot be converted to the target type (unreachable if data is valid).
     pub fn load_tensor(&self, name: &str, dtype: DType, device: &Device) -> Result<Tensor> {
         let info = self
             .tensors
             .get(name)
-            .ok_or_else(|| anyhow!("Tensor '{}' not found in safetensors file", name))?;
+            .ok_or_else(|| anyhow!("Tensor '{name}' not found in safetensors file"))?;
 
         let (start, end) = info.data_offsets;
         let data = &self.mmap[self.data_start + start..self.data_start + end];
@@ -146,7 +163,7 @@ impl SafeTensorFile {
             "F64" => DType::F64,
             "I64" => bail!("I64 tensors not supported for neural network weights"),
             "I32" => bail!("I32 tensors not supported for neural network weights"),
-            other => bail!("Unsupported dtype: {}", other),
+            other => bail!("Unsupported dtype: {other}"),
         };
 
         // Calculate expected size
@@ -192,20 +209,24 @@ impl SafeTensorFile {
                     .collect();
                 Tensor::from_vec(bfloats, info.shape.as_slice(), device)?
             }
-            _ => bail!("Unsupported source dtype: {:?}", src_dtype),
+            _ => bail!("Unsupported source dtype: {src_dtype:?}"),
         };
 
         // Convert to target dtype if needed
-        if src_dtype != dtype {
+        if src_dtype == dtype {
+            Ok(tensor)
+        } else {
             tensor
                 .to_dtype(dtype)
-                .with_context(|| format!("Failed to convert tensor '{}' to {:?}", name, dtype))
-        } else {
-            Ok(tensor)
+                .with_context(|| format!("Failed to convert tensor '{name}' to {dtype:?}"))
         }
     }
 
     /// Loads a tensor with shape validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tensor is not found, has a shape mismatch, or if loading fails.
     pub fn load_tensor_with_shape(
         &self,
         name: &str,
@@ -216,7 +237,7 @@ impl SafeTensorFile {
         let info = self
             .tensors
             .get(name)
-            .ok_or_else(|| anyhow!("Tensor '{}' not found", name))?;
+            .ok_or_else(|| anyhow!("Tensor '{name}' not found"))?;
 
         if info.shape != expected_shape {
             bail!(
