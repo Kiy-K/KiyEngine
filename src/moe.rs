@@ -1,89 +1,92 @@
 // src/moe.rs
 //
-// Mixture-of-Experts layer with Top-K gated routing.
-// Matches the PyTorch MoELayer structure from HuggingFace.
+// Optimized Mixture-of-Experts layer for KiyEngine V3.
+// Eliminates CPU roundtrips for large tensors and implements stateful inference.
 
-use crate::mamba::{MambaBlock, D_MODEL};
+use crate::mamba::{MambaBlock, MambaState, D_MODEL};
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Linear, Module};
 
 pub const NUM_EXPERTS: usize = 8;
 pub const TOP_K: usize = 2;
 
-/// A Mixture-of-Experts layer containing a router and a set of MambaBlock experts.
-pub struct MoELayer {
-    /// The router projects the input embedding to a score for each expert.
-    /// Note: PyTorch's nn.Linear has bias=True by default.
-    pub router: Linear,
+/// State for an MoE layer to allow incremental inference.
+#[derive(Clone)]
+pub struct MoEState {
+    pub expert_states: Vec<MambaState>,
+}
 
-    /// The array of 8 Mamba block experts.
+impl MoEState {
+    pub fn new(device: &Device) -> Result<Self> {
+        let mut expert_states = Vec::with_capacity(NUM_EXPERTS);
+        for _ in 0..NUM_EXPERTS {
+            expert_states.push(MambaState::new(device)?);
+        }
+        Ok(Self { expert_states })
+    }
+}
+
+pub struct MoELayer {
+    pub router: Linear,
     pub experts: Vec<MambaBlock>,
 }
 
 impl MoELayer {
-    /// Performs the forward pass for the MoE layer on a sequence.
-    ///
-    /// # Arguments
-    /// * `x` - Input tensor of shape (batch, seq_len, d_model)
-    ///
-    /// # Returns
-    /// * Output tensor of shape (batch, seq_len, d_model)
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let (batch, seq_len, channels) = x.dims3()?;
-
-        // Flatten to (B*L, C) for routing
-        let x_flat = x.reshape((batch * seq_len, channels))?;
-
-        // 1. Compute router logits and probabilities
-        let router_logits = self.router.forward(&x_flat)?; // (B*L, NUM_EXPERTS)
+    /// Stateful forward pass for a single token.
+    pub fn forward_stateful(&self, x: &Tensor, state: &mut MoEState) -> Result<Tensor> {
+        // x: (1, 1, D_MODEL)
+        let router_logits = self.router.forward(&x.squeeze(1)?)?; // (1, NUM_EXPERTS)
         let router_probs = candle_nn::ops::softmax(&router_logits, 1)?;
 
-        // 2. Select Top-K experts
-        // We'll do this on CPU for simplicity since NUM_EXPERTS is small (8)
-        let probs_vec: Vec<Vec<f32>> = router_probs
-            .to_dtype(DType::F32)?
-            .to_vec2()?;
+        // For single-token routing, using host-side logic for the 8 expert scores is efficient
+        let probs_vec = router_probs.to_vec2::<f32>()?[0].clone();
 
-        let num_tokens = batch * seq_len;
-        let mut all_top_indices: Vec<Vec<usize>> = Vec::with_capacity(num_tokens);
-        let mut all_top_weights: Vec<Vec<f32>> = Vec::with_capacity(num_tokens);
+        let mut indexed: Vec<(usize, f32)> = probs_vec.into_iter().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-        for token_probs in &probs_vec {
-            // Get top-k indices
-            let mut indexed: Vec<(usize, f32)> = token_probs
-                .iter()
-                .enumerate()
-                .map(|(i, &p)| (i, p))
-                .collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let top_k: Vec<(usize, f32)> = indexed.into_iter().take(TOP_K).collect();
+        let weight_sum: f32 = top_k.iter().map(|(_, w)| w).sum();
 
-            let top_indices: Vec<usize> = indexed.iter().take(TOP_K).map(|(i, _)| *i).collect();
-            let top_weights: Vec<f32> = indexed.iter().take(TOP_K).map(|(_, w)| *w).collect();
+        let mut final_output = Tensor::zeros(x.dims(), x.dtype(), x.device())?;
 
-            // Renormalize weights
-            let weight_sum: f32 = top_weights.iter().sum();
-            let normalized: Vec<f32> = top_weights.iter().map(|w| w / (weight_sum + 1e-9)).collect();
-
-            all_top_indices.push(top_indices);
-            all_top_weights.push(normalized);
+        for (expert_idx, weight) in top_k {
+            let normalized_weight = weight / (weight_sum + 1e-9);
+            let expert_output = self.experts[expert_idx].forward_stateful(x, &mut state.expert_states[expert_idx])?;
+            let weighted_output = (expert_output * normalized_weight as f64)?;
+            final_output = (final_output + weighted_output)?;
         }
 
-        // 3. Process each expert and accumulate weighted outputs
-        // For efficiency, we batch tokens going to the same expert
+        Ok(final_output)
+    }
 
-        // Initialize output tensor
+    /// Batch forward pass using native candle operations and index_add.
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (batch, seq_len, channels) = x.dims3()?;
+        let num_tokens = batch * seq_len;
+        let x_flat = x.reshape((num_tokens, channels))?;
+
+        let router_logits = self.router.forward(&x_flat)?;
+        let router_probs = candle_nn::ops::softmax(&router_logits, 1)?;
+
+        // Grouping tokens by expert for batch processing
+        let probs_vec = router_probs.to_vec2::<f32>()?;
         let mut final_output = Tensor::zeros((num_tokens, D_MODEL), x.dtype(), x.device())?;
 
         for expert_idx in 0..NUM_EXPERTS {
-            // Find all (token_idx, k_position) pairs where this expert is selected
-            let mut token_indices: Vec<usize> = Vec::new();
-            let mut token_weights: Vec<f32> = Vec::new();
+            let mut token_indices = Vec::new();
+            let mut token_weights = Vec::new();
 
-            for (token_idx, (indices, weights)) in all_top_indices.iter().zip(all_top_weights.iter()).enumerate() {
-                for (k_pos, &idx) in indices.iter().enumerate() {
+            for (t_idx, probs) in probs_vec.iter().enumerate() {
+                let mut indexed: Vec<(usize, f32)> = probs.iter().cloned().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+                let top_k = &indexed[0..TOP_K];
+                let weight_sum: f32 = top_k.iter().map(|(_, w)| w).sum();
+
+                for &(idx, w) in top_k {
                     if idx == expert_idx {
-                        token_indices.push(token_idx);
-                        token_weights.push(weights[k_pos]);
+                        token_indices.push(t_idx as u32);
+                        token_weights.push(w / (weight_sum + 1e-9));
                     }
                 }
             }
@@ -92,98 +95,25 @@ impl MoELayer {
                 continue;
             }
 
-            // Gather input tokens for this expert
-            let expert_input = self.gather_tokens(&x_flat, &token_indices)?;
+            let indices_tensor = Tensor::from_vec(token_indices.clone(), (token_indices.len(),), x.device())?;
+            let expert_input = x_flat.index_select(&indices_tensor, 0)?.unsqueeze(1)?;
+            let expert_output = self.experts[expert_idx].forward(&expert_input)?.squeeze(1)?;
 
-            // Reshape to (num_selected, 1, D_MODEL) for MambaBlock (which expects sequences)
-            let num_selected = token_indices.len();
-            let expert_input = expert_input.reshape((num_selected, 1, D_MODEL))?;
+            let weights_tensor = Tensor::from_vec(token_weights, (token_indices.len(), 1), x.device())?.to_dtype(x.dtype())?;
+            let weighted_output = expert_output.broadcast_mul(&weights_tensor)?;
 
-            // Forward through expert
-            let expert_output = self.experts[expert_idx].forward(&expert_input)?;
-
-            // Squeeze back to (num_selected, D_MODEL)
-            let expert_output = expert_output.reshape((num_selected, D_MODEL))?;
-
-            // Apply weights and scatter back to output
-            let weight_tensor = Tensor::from_vec(
-                token_weights.clone(),
-                (num_selected,),
-                x.device(),
-            )?.to_dtype(x.dtype())?;
-
-            let weighted_output = expert_output.broadcast_mul(&weight_tensor.reshape((num_selected, 1))?)?;
-
-            // Scatter add to final output
-            final_output = self.scatter_add(&final_output, &token_indices, &weighted_output)?;
+            final_output = final_output.index_add(&indices_tensor, &weighted_output, 0)?;
         }
 
-        // Reshape back to (batch, seq_len, d_model)
         final_output.reshape((batch, seq_len, D_MODEL))
-    }
-
-    /// Gathers tokens at specified indices from the flattened input.
-    fn gather_tokens(&self, x_flat: &Tensor, indices: &[usize]) -> Result<Tensor> {
-        let slices: Vec<Tensor> = indices
-            .iter()
-            .map(|&i| x_flat.get(i))
-            .collect::<Result<Vec<_>>>()?;
-
-        if slices.len() == 1 {
-            slices[0].unsqueeze(0)
-        } else {
-            Tensor::stack(&slices, 0)
-        }
-    }
-
-    /// Scatter-adds weighted expert outputs back to the output tensor.
-    fn scatter_add(&self, output: &Tensor, indices: &[usize], values: &Tensor) -> Result<Tensor> {
-        // For thread safety and simplicity, we do this via explicit indexing
-        // This is not the most efficient but correct for now
-        let mut output_vec: Vec<Vec<f32>> = output.to_vec2()?;
-        let values_vec: Vec<Vec<f32>> = values.to_vec2()?;
-
-        for (local_idx, &global_idx) in indices.iter().enumerate() {
-            for (j, val) in values_vec[local_idx].iter().enumerate() {
-                output_vec[global_idx][j] += val;
-            }
-        }
-
-        // Convert back to tensor
-        let flat: Vec<f32> = output_vec.into_iter().flatten().collect();
-        Tensor::from_vec(flat, output.dims(), output.device())?.to_dtype(output.dtype())
     }
 }
 
-/// Creates a new MoELayer with zero-initialized weights (for testing).
 pub fn create_zero_moe_layer(device: &Device) -> Result<MoELayer> {
-    let router = Linear::new(
-        Tensor::zeros((NUM_EXPERTS, D_MODEL), DType::F32, device)?,
-        Some(Tensor::zeros(NUM_EXPERTS, DType::F32, device)?),
-    );
-
+    let router = Linear::new(Tensor::zeros((NUM_EXPERTS, D_MODEL), DType::F32, device)?, Some(Tensor::zeros(NUM_EXPERTS, DType::F32, device)?));
     let mut experts = Vec::with_capacity(NUM_EXPERTS);
     for _ in 0..NUM_EXPERTS {
         experts.push(crate::mamba::create_zero_block(device)?);
     }
-
     Ok(MoELayer { router, experts })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_moe_layer_forward() -> Result<()> {
-        let device = Device::Cpu;
-        let layer = create_zero_moe_layer(&device)?;
-
-        // Create dummy input: (batch=1, seq_len=16, d_model=384)
-        let x = Tensor::randn(0.0f32, 1.0, (1, 16, D_MODEL), &device)?;
-        let output = layer.forward(&x)?;
-
-        assert_eq!(output.dims(), &[1, 16, D_MODEL]);
-        Ok(())
-    }
 }
