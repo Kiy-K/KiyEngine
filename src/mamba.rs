@@ -51,10 +51,10 @@ impl MambaBlock {
         let z = xz.narrow(2, D_INNER, D_INNER)?; // (1, 1, D_INNER)
 
         // 2. Conv1D State Update
-        let next_conv_state = Tensor::cat(&[
-            state.conv_state.narrow(2, 1, D_CONV - 2)?,
-            x_inner.clone()
-        ], 2)?;
+        let next_conv_state = Tensor::cat(
+            &[state.conv_state.narrow(2, 1, D_CONV - 2)?, x_inner.clone()],
+            2,
+        )?;
         state.conv_state = next_conv_state.clone();
 
         // Depthwise Conv1D
@@ -134,11 +134,20 @@ impl MambaBlock {
 
 pub fn create_zero_block(device: &Device) -> Result<MambaBlock> {
     Ok(MambaBlock {
-        in_proj: Linear::new(Tensor::zeros((2 * D_INNER, D_MODEL), DType::F32, device)?, None),
+        in_proj: Linear::new(
+            Tensor::zeros((2 * D_INNER, D_MODEL), DType::F32, device)?,
+            None,
+        ),
         conv1d_w: Tensor::zeros((D_INNER, 1, D_CONV), DType::F32, device)?,
         conv1d_b: Tensor::zeros(D_INNER, DType::F32, device)?,
-        x_proj: Linear::new(Tensor::zeros((D_INNER + 2 * D_STATE, D_INNER), DType::F32, device)?, None),
-        dt_proj: Linear::new(Tensor::zeros((D_INNER, D_INNER), DType::F32, device)?, Some(Tensor::zeros(D_INNER, DType::F32, device)?)),
+        x_proj: Linear::new(
+            Tensor::zeros((D_INNER + 2 * D_STATE, D_INNER), DType::F32, device)?,
+            None,
+        ),
+        dt_proj: Linear::new(
+            Tensor::zeros((D_INNER, D_INNER), DType::F32, device)?,
+            Some(Tensor::zeros(D_INNER, DType::F32, device)?),
+        ),
         a_log: Tensor::zeros((D_INNER, D_STATE), DType::F32, device)?,
         d: Tensor::ones(D_INNER, DType::F32, device)?,
         out_proj: Linear::new(Tensor::zeros((D_MODEL, D_INNER), DType::F32, device)?, None),

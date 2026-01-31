@@ -52,11 +52,10 @@ impl SafeTensorFile {
 
         // Parse JSON header
         let header_bytes = &mmap[8..8 + header_size];
-        let header_str = std::str::from_utf8(header_bytes)
-            .context("Header is not valid UTF-8")?;
+        let header_str = std::str::from_utf8(header_bytes).context("Header is not valid UTF-8")?;
 
-        let header: serde_json::Value = serde_json::from_str(header_str)
-            .context("Failed to parse header JSON")?;
+        let header: serde_json::Value =
+            serde_json::from_str(header_str).context("Failed to parse header JSON")?;
 
         let header_obj = header
             .as_object()
@@ -131,7 +130,9 @@ impl SafeTensorFile {
 
     /// Loads a tensor by name, converting to the specified dtype.
     pub fn load_tensor(&self, name: &str, dtype: DType, device: &Device) -> Result<Tensor> {
-        let info = self.tensors.get(name)
+        let info = self
+            .tensors
+            .get(name)
             .ok_or_else(|| anyhow!("Tensor '{}' not found in safetensors file", name))?;
 
         let (start, end) = info.data_offsets;
@@ -196,7 +197,8 @@ impl SafeTensorFile {
 
         // Convert to target dtype if needed
         if src_dtype != dtype {
-            tensor.to_dtype(dtype)
+            tensor
+                .to_dtype(dtype)
                 .with_context(|| format!("Failed to convert tensor '{}' to {:?}", name, dtype))
         } else {
             Ok(tensor)
@@ -211,7 +213,9 @@ impl SafeTensorFile {
         dtype: DType,
         device: &Device,
     ) -> Result<Tensor> {
-        let info = self.tensors.get(name)
+        let info = self
+            .tensors
+            .get(name)
             .ok_or_else(|| anyhow!("Tensor '{}' not found", name))?;
 
         if info.shape != expected_shape {

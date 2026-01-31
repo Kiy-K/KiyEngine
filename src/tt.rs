@@ -1,7 +1,7 @@
 // src/tt.rs
 
+use chess::{ChessMove, Piece, Square};
 use std::sync::atomic::{AtomicU64, Ordering};
-use chess::{ChessMove, Square, Piece};
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -32,7 +32,7 @@ pub struct TTEntry {
 }
 
 struct PackedEntry {
-    key: AtomicU64,  // stores key ^ data for lock-less atomicity
+    key: AtomicU64, // stores key ^ data for lock-less atomicity
     data: AtomicU64,
 }
 
@@ -128,11 +128,21 @@ impl TranspositionTable {
     fn unpack(key: u64, data: u64) -> TTEntry {
         let score = (data & 0xFFFF) as i16 as i32;
         let mv_bits = ((data >> 16) & 0xFFFF) as u16;
-        let best_move = if mv_bits == 0 { None } else { Some(Self::u16_to_move(mv_bits)) };
+        let best_move = if mv_bits == 0 {
+            None
+        } else {
+            Some(Self::u16_to_move(mv_bits))
+        };
         let depth = ((data >> 32) & 0xFF) as u8;
         let flag = TTFlag::from(((data >> 40) & 0xFF) as u8);
 
-        TTEntry { key, best_move, score, depth, flag }
+        TTEntry {
+            key,
+            best_move,
+            score,
+            depth,
+            flag,
+        }
     }
 
     fn move_to_u16(mv: ChessMove) -> u16 {
@@ -163,7 +173,7 @@ impl TranspositionTable {
         ChessMove::new(
             unsafe { Square::new(src as u8) },
             unsafe { Square::new(dst as u8) },
-            promo_piece
+            promo_piece,
         )
     }
 

@@ -10,5 +10,5 @@ pub mod moe;
 pub mod safetensor_loader;
 pub mod search;
 pub mod tt;
-pub mod uci;
 pub mod tutor;
+pub mod uci;

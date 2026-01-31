@@ -4,15 +4,15 @@
 // Enhanced for multi-core scaling with Lazy SMP.
 
 use crate::engine::Engine;
-use crate::tutor::Tutor;
 use crate::search::{SearchHandler, TimeControl};
 use crate::tt::TranspositionTable;
+use crate::tutor::Tutor;
 use chess::{Board, ChessMove};
 use std::str::FromStr;
-use std::time::Instant;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 const TT_SIZE_MB: usize = 512;
 
@@ -119,7 +119,12 @@ impl UciHandler {
         let mut current_board = match parts.first() {
             Some(&"startpos") => Board::default(),
             Some(&"fen") => {
-                let fen_parts: Vec<&str> = parts.iter().skip(1).take_while(|&&p| p != "moves").copied().collect();
+                let fen_parts: Vec<&str> = parts
+                    .iter()
+                    .skip(1)
+                    .take_while(|&&p| p != "moves")
+                    .copied()
+                    .collect();
                 Board::from_str(&fen_parts.join(" ")).unwrap_or(Board::default())
             }
             _ => return,
@@ -142,19 +147,62 @@ impl UciHandler {
         let mut i = 0;
         while i < parts.len() {
             match parts[i] {
-                "wtime" => { if let Some(v) = parts.get(i+1).and_then(|s| s.parse().ok()) { tc.wtime = Some(v); } i += 2; }
-                "btime" => { if let Some(v) = parts.get(i+1).and_then(|s| s.parse().ok()) { tc.btime = Some(v); } i += 2; }
-                "winc" => { if let Some(v) = parts.get(i+1).and_then(|s| s.parse().ok()) { tc.winc = Some(v); } i += 2; }
-                "binc" => { if let Some(v) = parts.get(i+1).and_then(|s| s.parse().ok()) { tc.binc = Some(v); } i += 2; }
-                "movestogo" => { if let Some(v) = parts.get(i+1).and_then(|s| s.parse().ok()) { tc.movestogo = Some(v); } i += 2; }
-                "movetime" => { if let Some(v) = parts.get(i+1).and_then(|s| s.parse().ok()) { tc.movetime = Some(v); } i += 2; }
-                "depth" => { if let Some(v) = parts.get(i+1).and_then(|s| s.parse().ok()) { tc.depth = Some(v); } i += 2; }
-                "infinite" => { tc.infinite = true; i += 1; }
+                "wtime" => {
+                    if let Some(v) = parts.get(i + 1).and_then(|s| s.parse().ok()) {
+                        tc.wtime = Some(v);
+                    }
+                    i += 2;
+                }
+                "btime" => {
+                    if let Some(v) = parts.get(i + 1).and_then(|s| s.parse().ok()) {
+                        tc.btime = Some(v);
+                    }
+                    i += 2;
+                }
+                "winc" => {
+                    if let Some(v) = parts.get(i + 1).and_then(|s| s.parse().ok()) {
+                        tc.winc = Some(v);
+                    }
+                    i += 2;
+                }
+                "binc" => {
+                    if let Some(v) = parts.get(i + 1).and_then(|s| s.parse().ok()) {
+                        tc.binc = Some(v);
+                    }
+                    i += 2;
+                }
+                "movestogo" => {
+                    if let Some(v) = parts.get(i + 1).and_then(|s| s.parse().ok()) {
+                        tc.movestogo = Some(v);
+                    }
+                    i += 2;
+                }
+                "movetime" => {
+                    if let Some(v) = parts.get(i + 1).and_then(|s| s.parse().ok()) {
+                        tc.movetime = Some(v);
+                    }
+                    i += 2;
+                }
+                "depth" => {
+                    if let Some(v) = parts.get(i + 1).and_then(|s| s.parse().ok()) {
+                        tc.depth = Some(v);
+                    }
+                    i += 2;
+                }
+                "infinite" => {
+                    tc.infinite = true;
+                    i += 1;
+                }
                 _ => i += 1,
             }
         }
 
-        if tc.depth.is_none() && tc.wtime.is_none() && tc.btime.is_none() && tc.movetime.is_none() && !tc.infinite {
+        if tc.depth.is_none()
+            && tc.wtime.is_none()
+            && tc.btime.is_none()
+            && tc.movetime.is_none()
+            && !tc.infinite
+        {
             tc.depth = Some(8);
         }
 
@@ -178,7 +226,8 @@ impl UciHandler {
                 let stop_flag = Arc::clone(&stop_flag);
 
                 s.spawn(move || {
-                    let mut searcher = SearchHandler::new(&engine, &tutor, &tt, board, stop_flag, thread_id);
+                    let mut searcher =
+                        SearchHandler::new(&engine, &tutor, &tt, board, stop_flag, thread_id);
                     for &token in &move_history {
                         searcher.game_state.push_token(token);
                     }
@@ -214,8 +263,18 @@ impl UciHandler {
 
         for fen in &positions {
             let board = Board::from_str(fen).unwrap_or(Board::default());
-            let mut searcher = SearchHandler::new(&self.engine, &self.tutor, &self.tt, board, Arc::clone(&stop_flag), 0);
-            let tc = TimeControl { depth: Some(8), ..Default::default() };
+            let mut searcher = SearchHandler::new(
+                &self.engine,
+                &self.tutor,
+                &self.tt,
+                board,
+                Arc::clone(&stop_flag),
+                0,
+            );
+            let tc = TimeControl {
+                depth: Some(8),
+                ..Default::default()
+            };
             searcher.search_with_time(&tc);
             total_nodes += searcher.nodes_searched;
         }

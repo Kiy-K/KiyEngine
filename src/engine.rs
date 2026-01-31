@@ -107,24 +107,47 @@ impl Engine {
 
         let mut layers = Vec::with_capacity(NUM_LAYERS);
         for l in 0..NUM_LAYERS {
-            let router_w = st.load_tensor(&format!("layers.{}.skill_emb.weight", l), dtype, &device)?;
-            let router_b = st.load_tensor(&format!("layers.{}.skill_emb.bias", l), dtype, &device)?;
+            let router_w =
+                st.load_tensor(&format!("layers.{}.skill_emb.weight", l), dtype, &device)?;
+            let router_b =
+                st.load_tensor(&format!("layers.{}.skill_emb.bias", l), dtype, &device)?;
             let router = Linear::new(router_w, Some(router_b));
 
             let mut experts = Vec::with_capacity(NUM_EXPERTS);
             for e in 0..NUM_EXPERTS {
                 let prefix = format!("layers.{}.experts.{}", l, e);
-                let in_proj = Linear::new(st.load_tensor(&format!("{}.in_proj.weight", prefix), dtype, &device)?, None);
-                let conv1d_w = st.load_tensor(&format!("{}.conv1d.weight", prefix), dtype, &device)?;
-                let conv1d_b = st.load_tensor(&format!("{}.conv1d.bias", prefix), dtype, &device)?;
-                let x_proj = Linear::new(st.load_tensor(&format!("{}.x_proj.weight", prefix), dtype, &device)?, None);
-                let dt_proj = Linear::new(st.load_tensor(&format!("{}.dt_proj.weight", prefix), dtype, &device)?, Some(st.load_tensor(&format!("{}.dt_proj.bias", prefix), dtype, &device)?));
+                let in_proj = Linear::new(
+                    st.load_tensor(&format!("{}.in_proj.weight", prefix), dtype, &device)?,
+                    None,
+                );
+                let conv1d_w =
+                    st.load_tensor(&format!("{}.conv1d.weight", prefix), dtype, &device)?;
+                let conv1d_b =
+                    st.load_tensor(&format!("{}.conv1d.bias", prefix), dtype, &device)?;
+                let x_proj = Linear::new(
+                    st.load_tensor(&format!("{}.x_proj.weight", prefix), dtype, &device)?,
+                    None,
+                );
+                let dt_proj = Linear::new(
+                    st.load_tensor(&format!("{}.dt_proj.weight", prefix), dtype, &device)?,
+                    Some(st.load_tensor(&format!("{}.dt_proj.bias", prefix), dtype, &device)?),
+                );
                 let a_log = st.load_tensor(&format!("{}.A_log", prefix), dtype, &device)?;
                 let d = st.load_tensor(&format!("{}.D", prefix), dtype, &device)?;
-                let out_proj = Linear::new(st.load_tensor(&format!("{}.out_proj.weight", prefix), dtype, &device)?, None);
+                let out_proj = Linear::new(
+                    st.load_tensor(&format!("{}.out_proj.weight", prefix), dtype, &device)?,
+                    None,
+                );
 
                 experts.push(crate::mamba::MambaBlock {
-                    in_proj, conv1d_w, conv1d_b, x_proj, dt_proj, a_log, d, out_proj,
+                    in_proj,
+                    conv1d_w,
+                    conv1d_b,
+                    x_proj,
+                    dt_proj,
+                    a_log,
+                    d,
+                    out_proj,
                 });
             }
             layers.push(MoELayer { router, experts });
@@ -133,15 +156,32 @@ impl Engine {
         let norm_w = st.load_tensor("norm.weight", dtype, &device)?;
         let policy_head = Linear::new(st.load_tensor("policy_head.weight", dtype, &device)?, None);
         let value_head = ValueHead {
-            linear1: Linear::new(st.load_tensor("value_head.0.weight", dtype, &device)?, Some(st.load_tensor("value_head.0.bias", dtype, &device)?)),
-            linear2: Linear::new(st.load_tensor("value_head.2.weight", dtype, &device)?, Some(st.load_tensor("value_head.2.bias", dtype, &device)?)),
+            linear1: Linear::new(
+                st.load_tensor("value_head.0.weight", dtype, &device)?,
+                Some(st.load_tensor("value_head.0.bias", dtype, &device)?),
+            ),
+            linear2: Linear::new(
+                st.load_tensor("value_head.2.weight", dtype, &device)?,
+                Some(st.load_tensor("value_head.2.bias", dtype, &device)?),
+            ),
         };
 
-        Ok(Self { embedding, layers, norm_w, policy_head, value_head, device })
+        Ok(Self {
+            embedding,
+            layers,
+            norm_w,
+            policy_head,
+            value_head,
+            device,
+        })
     }
 
     /// Incremental forward pass for a single token using EngineState.
-    pub fn forward_incremental(&self, token: usize, state: &mut EngineState) -> Result<(Tensor, f32)> {
+    pub fn forward_incremental(
+        &self,
+        token: usize,
+        state: &mut EngineState,
+    ) -> Result<(Tensor, f32)> {
         let x = self.embedding.get(token)?.unsqueeze(0)?.unsqueeze(0)?; // (1, 1, D_MODEL)
         let mut current_x = x;
 
@@ -154,8 +194,15 @@ impl Engine {
         current_x = self.rms_norm(&current_x)?;
         let last_state = current_x.squeeze(0)?.squeeze(0)?; // (D_MODEL)
 
-        let policy_logits = self.policy_head.forward(&last_state.unsqueeze(0)?)?.squeeze(0)?;
-        let value_tensor = self.value_head.forward(&last_state.unsqueeze(0)?)?.squeeze(0)?.squeeze(0)?;
+        let policy_logits = self
+            .policy_head
+            .forward(&last_state.unsqueeze(0)?)?
+            .squeeze(0)?;
+        let value_tensor = self
+            .value_head
+            .forward(&last_state.unsqueeze(0)?)?
+            .squeeze(0)?
+            .squeeze(0)?;
         let value = value_tensor.tanh()?.to_scalar::<f32>()?;
 
         Ok((policy_logits, value))
@@ -163,7 +210,10 @@ impl Engine {
 
     /// Batch forward pass for a sequence of tokens.
     pub fn forward(&self, tokens: &[usize]) -> Result<(Tensor, f32)> {
-        let embeddings: Vec<Tensor> = tokens.iter().map(|&t| self.embedding.get(t)).collect::<Result<Vec<_>>>()?;
+        let embeddings: Vec<Tensor> = tokens
+            .iter()
+            .map(|&t| self.embedding.get(t))
+            .collect::<Result<Vec<_>>>()?;
         let mut x = Tensor::stack(&embeddings, 0)?.unsqueeze(0)?;
 
         for layer in &self.layers {
@@ -174,8 +224,15 @@ impl Engine {
 
         x = self.rms_norm(&x)?;
         let last_token_state = x.get(0)?.get(tokens.len() - 1)?;
-        let policy_logits = self.policy_head.forward(&last_token_state.unsqueeze(0)?)?.squeeze(0)?;
-        let value_tensor = self.value_head.forward(&last_token_state.unsqueeze(0)?)?.squeeze(0)?.squeeze(0)?;
+        let policy_logits = self
+            .policy_head
+            .forward(&last_token_state.unsqueeze(0)?)?
+            .squeeze(0)?;
+        let value_tensor = self
+            .value_head
+            .forward(&last_token_state.unsqueeze(0)?)?
+            .squeeze(0)?
+            .squeeze(0)?;
         let value = value_tensor.tanh()?.to_scalar::<f32>()?;
 
         Ok((policy_logits, value))
@@ -191,7 +248,10 @@ impl Engine {
 
     pub fn get_initial_state(&self, tokens: &[usize]) -> Result<(EngineState, Tensor, f32)> {
         let mut state = EngineState::new(&self.device)?;
-        let mut last_res = (Tensor::zeros((VOCAB_SIZE,), DType::F32, &self.device)?, 0.0f32);
+        let mut last_res = (
+            Tensor::zeros((VOCAB_SIZE,), DType::F32, &self.device)?,
+            0.0f32,
+        );
         for &t in tokens {
             last_res = self.forward_incremental(t, &mut state)?;
         }

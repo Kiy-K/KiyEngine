@@ -51,7 +51,8 @@ impl MoELayer {
 
         for (expert_idx, weight) in top_k {
             let normalized_weight = weight / (weight_sum + 1e-9);
-            let expert_output = self.experts[expert_idx].forward_stateful(x, &mut state.expert_states[expert_idx])?;
+            let expert_output = self.experts[expert_idx]
+                .forward_stateful(x, &mut state.expert_states[expert_idx])?;
             let weighted_output = (expert_output * normalized_weight as f64)?;
             final_output = (final_output + weighted_output)?;
         }
@@ -95,11 +96,16 @@ impl MoELayer {
                 continue;
             }
 
-            let indices_tensor = Tensor::from_vec(token_indices.clone(), (token_indices.len(),), x.device())?;
+            let indices_tensor =
+                Tensor::from_vec(token_indices.clone(), (token_indices.len(),), x.device())?;
             let expert_input = x_flat.index_select(&indices_tensor, 0)?.unsqueeze(1)?;
-            let expert_output = self.experts[expert_idx].forward(&expert_input)?.squeeze(1)?;
+            let expert_output = self.experts[expert_idx]
+                .forward(&expert_input)?
+                .squeeze(1)?;
 
-            let weights_tensor = Tensor::from_vec(token_weights, (token_indices.len(), 1), x.device())?.to_dtype(x.dtype())?;
+            let weights_tensor =
+                Tensor::from_vec(token_weights, (token_indices.len(), 1), x.device())?
+                    .to_dtype(x.dtype())?;
             let weighted_output = expert_output.broadcast_mul(&weights_tensor)?;
 
             final_output = final_output.index_add(&indices_tensor, &weighted_output, 0)?;
@@ -110,7 +116,10 @@ impl MoELayer {
 }
 
 pub fn create_zero_moe_layer(device: &Device) -> Result<MoELayer> {
-    let router = Linear::new(Tensor::zeros((NUM_EXPERTS, D_MODEL), DType::F32, device)?, Some(Tensor::zeros(NUM_EXPERTS, DType::F32, device)?));
+    let router = Linear::new(
+        Tensor::zeros((NUM_EXPERTS, D_MODEL), DType::F32, device)?,
+        Some(Tensor::zeros(NUM_EXPERTS, DType::F32, device)?),
+    );
     let mut experts = Vec::with_capacity(NUM_EXPERTS);
     for _ in 0..NUM_EXPERTS {
         experts.push(crate::mamba::create_zero_block(device)?);
