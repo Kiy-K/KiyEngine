@@ -79,12 +79,16 @@ impl MoELayer {
             expert_outputs.push(output);
 
             let mask_i = top_k_mask.narrow(1, i, 1)?;
-            state.expert_states[i].conv_state = mask_i.where_cond(&state.expert_states[i].conv_state, &old_conv)?;
-            state.expert_states[i].ssm_state = mask_i.where_cond(&state.expert_states[i].ssm_state, &old_ssm)?;
+            state.expert_states[i].conv_state =
+                mask_i.where_cond(&state.expert_states[i].conv_state, &old_conv)?;
+            state.expert_states[i].ssm_state =
+                mask_i.where_cond(&state.expert_states[i].ssm_state, &old_ssm)?;
         }
 
         let stacked = Tensor::stack(&expert_outputs, 0)?; // (8, 1, 1, D_MODEL)
-        let weights = normalized_weights.transpose(0, 1)?.reshape((NUM_EXPERTS, 1, 1, 1))?;
+        let weights = normalized_weights
+            .transpose(0, 1)?
+            .reshape((NUM_EXPERTS, 1, 1, 1))?;
 
         stacked.broadcast_mul(&weights)?.sum(0)?.squeeze(0)
     }
@@ -121,7 +125,8 @@ impl MoELayer {
         }
 
         let stacked = Tensor::stack(&expert_outputs, 0)?; // (8, B, T, D_MODEL)
-        let weights = normalized_weights.reshape((batch, seq_len, NUM_EXPERTS))?
+        let weights = normalized_weights
+            .reshape((batch, seq_len, NUM_EXPERTS))?
             .transpose(1, 2)? // (B, 8, T)
             .transpose(0, 1)? // (8, B, T)
             .unsqueeze(3)?; // (8, B, T, 1)

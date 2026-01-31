@@ -285,7 +285,11 @@ impl UciHandler {
         }
 
         let duration = start_time.elapsed();
-        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
         let nps = (total_nodes as f64 / duration.as_secs_f64()) as u64;
         println!("info string Benchmark NPS: {nps}");
     }

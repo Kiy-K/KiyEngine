@@ -126,8 +126,7 @@ impl Engine {
         for l in 0..NUM_LAYERS {
             let router_w =
                 st.load_tensor(&format!("layers.{l}.skill_emb.weight"), dtype, &device)?;
-            let router_b =
-                st.load_tensor(&format!("layers.{l}.skill_emb.bias"), dtype, &device)?;
+            let router_b = st.load_tensor(&format!("layers.{l}.skill_emb.bias"), dtype, &device)?;
             let router = Linear::new(router_w, Some(router_b));
 
             let mut experts = Vec::with_capacity(NUM_EXPERTS);
@@ -139,8 +138,7 @@ impl Engine {
                 );
                 let conv1d_w =
                     st.load_tensor(&format!("{prefix}.conv1d.weight"), dtype, &device)?;
-                let conv1d_b =
-                    st.load_tensor(&format!("{prefix}.conv1d.bias"), dtype, &device)?;
+                let conv1d_b = st.load_tensor(&format!("{prefix}.conv1d.bias"), dtype, &device)?;
                 let x_proj = Linear::new(
                     st.load_tensor(&format!("{prefix}.x_proj.weight"), dtype, &device)?,
                     None,
