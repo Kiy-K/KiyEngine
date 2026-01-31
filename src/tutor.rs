@@ -1,10 +1,8 @@
-// src/tutor.rs
+//! `PeSTO`'s material and piece-square table evaluation for `KiyEngine` V3.
+//! This module provides a high-speed static evaluation used for pruning
+//! and as a leaf-node evaluation component.
 
 use chess::{Board, Square};
-
-/// PeSTO's material and piece-square table evaluation for KiyEngine V3.
-/// This module provides a high-speed static evaluation used for pruning
-/// and as a leaf-node evaluation component.
 
 // Material values (Midgame, Endgame)
 pub const MG_VALUE: [i32; 6] = [82, 337, 365, 477, 1025, 0];
@@ -93,7 +91,14 @@ pub struct Tutor {
     eg_tables: [[i32; 64]; 12],
 }
 
+impl Default for Tutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Tutor {
+    #[must_use]
     pub fn new() -> Self {
         let mut mg_tables = [[0; 64]; 12];
         let mut eg_tables = [[0; 64]; 12];
@@ -131,22 +136,28 @@ impl Tutor {
     }
 
     /// Performs a high-speed static evaluation of the board.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the board state is inconsistent (missing color for a piece).
+    #[must_use]
     pub fn evaluate(&self, board: &Board) -> i32 {
         let mut mg = [0, 0];
         let mut eg = [0, 0];
         let mut game_phase = 0;
 
         for sq_idx in 0..64 {
+            #[allow(clippy::cast_possible_truncation)]
             let sq = unsafe { Square::new(sq_idx as u8) };
             if let Some(piece) = board.piece_on(sq) {
-                let color = board.color_on(sq).unwrap();
+                let color = board.color_on(sq).expect("Piece without color");
                 let c_idx = color as usize;
-                let p_idx = piece as usize;
-                let pc_idx = p_idx * 2 + c_idx;
+                let piece_idx = piece as usize;
+                let table_idx = piece_idx * 2 + c_idx;
 
-                mg[c_idx] += self.mg_tables[pc_idx][sq_idx];
-                eg[c_idx] += self.eg_tables[pc_idx][sq_idx];
-                game_phase += PHASE_INC[p_idx];
+                mg[c_idx] += self.mg_tables[table_idx][sq_idx];
+                eg[c_idx] += self.eg_tables[table_idx][sq_idx];
+                game_phase += PHASE_INC[piece_idx];
             }
         }
 

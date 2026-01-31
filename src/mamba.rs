@@ -20,6 +20,11 @@ pub struct MambaState {
 }
 
 impl MambaState {
+    /// Creates a new `MambaState`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tensors cannot be initialized.
     pub fn new(device: &Device) -> Result<Self> {
         Ok(Self {
             conv_state: Tensor::zeros((1, D_INNER, D_CONV - 1), DType::F32, device)?,
@@ -41,6 +46,11 @@ pub struct MambaBlock {
 
 impl MambaBlock {
     /// Full stateful forward pass for a single token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any of the operations fail.
+    #[allow(clippy::similar_names, clippy::many_single_char_names)]
     pub fn forward_stateful(&self, x: &Tensor, state: &mut MambaState) -> Result<Tensor> {
         // x shape: (1, 1, D_MODEL)
         let (_batch, _seq_len, _dim) = x.dims3()?;
@@ -97,6 +107,10 @@ impl MambaBlock {
     }
 
     /// Optimized batch forward pass using native candle operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any of the operations fail.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (_batch, seq_len, _) = x.dims3()?;
 
@@ -132,6 +146,11 @@ impl MambaBlock {
     }
 }
 
+/// Creates a new `MambaBlock` with zero weights.
+///
+/// # Errors
+///
+/// Returns an error if the block cannot be initialized.
 pub fn create_zero_block(device: &Device) -> Result<MambaBlock> {
     Ok(MambaBlock {
         in_proj: Linear::new(

@@ -10,13 +10,18 @@ use candle_nn::{Linear, Module};
 pub const NUM_EXPERTS: usize = 8;
 pub const TOP_K: usize = 2;
 
-/// State for an MoE layer to allow incremental inference.
+/// State for an `MoE` layer to allow incremental inference.
 #[derive(Clone)]
 pub struct MoEState {
     pub expert_states: Vec<MambaState>,
 }
 
 impl MoEState {
+    /// Creates a new `MoEState`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the expert states cannot be initialized.
     pub fn new(device: &Device) -> Result<Self> {
         let mut expert_states = Vec::with_capacity(NUM_EXPERTS);
         for _ in 0..NUM_EXPERTS {
@@ -33,34 +38,62 @@ pub struct MoELayer {
 
 impl MoELayer {
     /// Stateful forward pass for a single token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the router or experts fail.
+    ///
+    /// # Panics
+    ///
+    /// Panics if top-k indices are out of range for the experts.
     pub fn forward_stateful(&self, x: &Tensor, state: &mut MoEState) -> Result<Tensor> {
         // x: (1, 1, D_MODEL)
         let router_logits = self.router.forward(&x.squeeze(1)?)?; // (1, NUM_EXPERTS)
         let router_probs = candle_nn::ops::softmax(&router_logits, 1)?;
 
-        // For single-token routing, using host-side logic for the 8 expert scores is efficient
-        let probs_vec = router_probs.to_vec2::<f32>()?[0].clone();
+        // To eliminate host-device transfers and maintain top-k=2 routing, we use device-side masking.
+        // 1. Find top-1 mask
+        let max1 = router_probs.max_keepdim(1)?;
+        let mask1 = router_probs.ge(&max1)?;
 
-        let mut indexed: Vec<(usize, f32)> = probs_vec.into_iter().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // 2. Find top-2 by masking out top-1
+        let mask1_f = mask1.to_dtype(router_probs.dtype())?;
+        let masked_probs = router_probs.broadcast_mul(&mask1_f.ones_like()?.sub(&mask1_f)?)?;
+        let max2 = masked_probs.max_keepdim(1)?;
+        let mask2 = masked_probs.ge(&max2)?;
 
-        let top_k: Vec<(usize, f32)> = indexed.into_iter().take(TOP_K).collect();
-        let weight_sum: f32 = top_k.iter().map(|(_, w)| w).sum();
+        let top_k_mask = mask1.add(&mask2)?;
+        let top_k_mask_f = top_k_mask.to_dtype(router_probs.dtype())?;
+        let top_k_probs = router_probs.broadcast_mul(&top_k_mask_f)?;
+        let weight_sum = top_k_probs.sum_keepdim(1)?;
+        let normalized_weights = top_k_probs.broadcast_div(&(weight_sum + 1e-9)?)?;
 
-        let mut final_output = Tensor::zeros(x.dims(), x.dtype(), x.device())?;
+        // Execute all experts and combine on-device to avoid host-device synchronization.
+        // We only update the state of selected experts using device-side conditional updates.
+        let mut expert_outputs = Vec::with_capacity(NUM_EXPERTS);
+        for i in 0..NUM_EXPERTS {
+            let old_conv = state.expert_states[i].conv_state.clone();
+            let old_ssm = state.expert_states[i].ssm_state.clone();
 
-        for (expert_idx, weight) in top_k {
-            let normalized_weight = weight / (weight_sum + 1e-9);
-            let expert_output = self.experts[expert_idx]
-                .forward_stateful(x, &mut state.expert_states[expert_idx])?;
-            let weighted_output = (expert_output * normalized_weight as f64)?;
-            final_output = (final_output + weighted_output)?;
+            let output = self.experts[i].forward_stateful(x, &mut state.expert_states[i])?;
+            expert_outputs.push(output);
+
+            let mask_i = top_k_mask.narrow(1, i, 1)?;
+            state.expert_states[i].conv_state = mask_i.where_cond(&state.expert_states[i].conv_state, &old_conv)?;
+            state.expert_states[i].ssm_state = mask_i.where_cond(&state.expert_states[i].ssm_state, &old_ssm)?;
         }
 
-        Ok(final_output)
+        let stacked = Tensor::stack(&expert_outputs, 0)?; // (8, 1, 1, D_MODEL)
+        let weights = normalized_weights.transpose(0, 1)?.reshape((NUM_EXPERTS, 1, 1, 1))?;
+
+        stacked.broadcast_mul(&weights)?.sum(0)?.squeeze(0)
     }
 
-    /// Batch forward pass using native candle operations and index_add.
+    /// Batch forward pass using native candle operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the router or experts fail.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (batch, seq_len, channels) = x.dims3()?;
         let num_tokens = batch * seq_len;
@@ -69,52 +102,39 @@ impl MoELayer {
         let router_logits = self.router.forward(&x_flat)?;
         let router_probs = candle_nn::ops::softmax(&router_logits, 1)?;
 
-        // Grouping tokens by expert for batch processing
-        let probs_vec = router_probs.to_vec2::<f32>()?;
-        let mut final_output = Tensor::zeros((num_tokens, D_MODEL), x.dtype(), x.device())?;
+        // Device-side top-k=2 mask to eliminate host-device synchronization
+        let max1 = router_probs.max_keepdim(1)?;
+        let mask1 = router_probs.ge(&max1)?;
+        let mask1_f = mask1.to_dtype(router_probs.dtype())?;
+        let masked_probs = router_probs.broadcast_mul(&mask1_f.ones_like()?.sub(&mask1_f)?)?;
+        let max2 = masked_probs.max_keepdim(1)?;
+        let mask2 = masked_probs.ge(&max2)?;
 
-        for expert_idx in 0..NUM_EXPERTS {
-            let mut token_indices = Vec::new();
-            let mut token_weights = Vec::new();
+        let top_k_mask_f = mask1.add(&mask2)?.to_dtype(router_probs.dtype())?;
+        let top_k_probs = router_probs.broadcast_mul(&top_k_mask_f)?;
+        let weight_sum = top_k_probs.sum_keepdim(1)?;
+        let normalized_weights = top_k_probs.broadcast_div(&(weight_sum + 1e-9)?)?;
 
-            for (t_idx, probs) in probs_vec.iter().enumerate() {
-                let mut indexed: Vec<(usize, f32)> = probs.iter().cloned().enumerate().collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-                let top_k = &indexed[0..TOP_K];
-                let weight_sum: f32 = top_k.iter().map(|(_, w)| w).sum();
-
-                for &(idx, w) in top_k {
-                    if idx == expert_idx {
-                        token_indices.push(t_idx as u32);
-                        token_weights.push(w / (weight_sum + 1e-9));
-                    }
-                }
-            }
-
-            if token_indices.is_empty() {
-                continue;
-            }
-
-            let indices_tensor =
-                Tensor::from_vec(token_indices.clone(), (token_indices.len(),), x.device())?;
-            let expert_input = x_flat.index_select(&indices_tensor, 0)?.unsqueeze(1)?;
-            let expert_output = self.experts[expert_idx]
-                .forward(&expert_input)?
-                .squeeze(1)?;
-
-            let weights_tensor =
-                Tensor::from_vec(token_weights, (token_indices.len(), 1), x.device())?
-                    .to_dtype(x.dtype())?;
-            let weighted_output = expert_output.broadcast_mul(&weights_tensor)?;
-
-            final_output = final_output.index_add(&indices_tensor, &weighted_output, 0)?;
+        let mut expert_outputs = Vec::with_capacity(NUM_EXPERTS);
+        for i in 0..NUM_EXPERTS {
+            expert_outputs.push(self.experts[i].forward(x)?);
         }
 
-        final_output.reshape((batch, seq_len, D_MODEL))
+        let stacked = Tensor::stack(&expert_outputs, 0)?; // (8, B, T, D_MODEL)
+        let weights = normalized_weights.reshape((batch, seq_len, NUM_EXPERTS))?
+            .transpose(1, 2)? // (B, 8, T)
+            .transpose(0, 1)? // (8, B, T)
+            .unsqueeze(3)?; // (8, B, T, 1)
+
+        stacked.broadcast_mul(&weights)?.sum(0)
     }
 }
 
+/// Creates a new `MoELayer` with zero weights.
+///
+/// # Errors
+///
+/// Returns an error if the layer cannot be initialized.
 pub fn create_zero_moe_layer(device: &Device) -> Result<MoELayer> {
     let router = Linear::new(
         Tensor::zeros((NUM_EXPERTS, D_MODEL), DType::F32, device)?,

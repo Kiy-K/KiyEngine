@@ -27,6 +27,11 @@ pub struct UciHandler {
 }
 
 impl UciHandler {
+    /// Creates a new `UciHandler`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine cannot be initialized.
     pub fn new() -> anyhow::Result<Self> {
         let engine = Arc::new(Engine::new()?);
         let tutor = Arc::new(Tutor::new());
@@ -44,9 +49,9 @@ impl UciHandler {
     pub fn handle_command(&mut self, command: &str) {
         let parts: Vec<&str> = command.split_whitespace().collect();
         match parts.first() {
-            Some(&"uci") => self.handle_uci(),
+            Some(&"uci") => Self::handle_uci(),
             Some(&"debug") => self.handle_debug(&parts[1..]),
-            Some(&"isready") => self.handle_isready(),
+            Some(&"isready") => Self::handle_isready(),
             Some(&"setoption") => self.handle_setoption(&parts[1..]),
             Some(&"ucinewgame") => self.handle_new_game(),
             Some(&"position") => self.handle_position(&parts[1..]),
@@ -58,7 +63,7 @@ impl UciHandler {
         }
     }
 
-    fn handle_uci(&self) {
+    fn handle_uci() {
         println!("id name KiyEngine V3 Mamba-MoE");
         println!("id author Khoi");
         println!();
@@ -76,7 +81,7 @@ impl UciHandler {
         }
     }
 
-    fn handle_isready(&self) {
+    fn handle_isready() {
         println!("readyok");
     }
 
@@ -236,11 +241,11 @@ impl UciHandler {
 
                     if thread_id == 0 {
                         if let Some(mv) = best_move {
-                            println!("bestmove {}", mv);
+                            println!("bestmove {mv}");
                         } else {
                             let legal_moves = chess::MoveGen::new_legal(&board);
                             if let Some(mv) = legal_moves.into_iter().next() {
-                                println!("bestmove {}", mv);
+                                println!("bestmove {mv}");
                             }
                         }
                     }
@@ -280,12 +285,13 @@ impl UciHandler {
         }
 
         let duration = start_time.elapsed();
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let nps = (total_nodes as f64 / duration.as_secs_f64()) as u64;
-        println!("info string Benchmark NPS: {}", nps);
+        println!("info string Benchmark NPS: {nps}");
     }
 
     fn handle_eval(&self) {
         let eval = self.tutor.evaluate(&self.board);
-        println!("info string Static eval: {}cp", eval);
+        println!("info string Static eval: {eval}cp");
     }
 }

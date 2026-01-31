@@ -17,6 +17,7 @@ const INFINITY: i32 = 32_000;
 
 const OVERHEAD_MS: u64 = 50;
 
+#[must_use]
 pub fn move_to_token(mv: &ChessMove, board: &Board) -> usize {
     let piece = board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
     let piece_idx = mv
@@ -71,6 +72,11 @@ impl<'a> SearchHandler<'a> {
         self.search(tc.depth.unwrap_or(64))
     }
 
+    /// Performs an iterative deepening search.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine fails to provide an initial state.
     pub fn search(&mut self, max_depth: u8) -> (Option<ChessMove>, i32) {
         self.nodes_searched = 0;
         self.killers = [[None; 2]; 64];
@@ -109,6 +115,7 @@ impl<'a> SearchHandler<'a> {
             }
 
             if self.thread_id == 0 {
+                #[allow(clippy::cast_possible_truncation)]
                 let elapsed = self.start_time.elapsed().as_millis() as u64 + 1;
                 let nps = (self.nodes_searched * 1000) / elapsed;
                 println!(
@@ -136,10 +143,21 @@ impl<'a> SearchHandler<'a> {
 
     fn evaluate_hybrid(&self, board: &Board, ai_value: f32) -> i32 {
         let tutor_score = self.tutor.evaluate(board);
+        #[allow(clippy::cast_possible_truncation)]
         let ai_score = (ai_value * 600.0) as i32;
-        (0.7 * ai_score as f32 + 0.3 * tutor_score as f32) as i32
+        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+        let combined = 0.7 * ai_score as f32 + 0.3 * tutor_score as f32;
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            combined as i32
+        }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::needless_pass_by_value,
+        clippy::too_many_lines
+    )]
     fn negamax(
         &mut self,
         depth: u8,
@@ -150,7 +168,7 @@ impl<'a> SearchHandler<'a> {
         policy: Option<&Tensor>,
     ) -> i32 {
         // Periodic time check
-        if self.nodes_searched & 63 == 0 && self.should_stop() {
+        if self.nodes_searched.trailing_zeros() >= 6 && self.should_stop() {
             return 0;
         }
 
@@ -174,6 +192,7 @@ impl<'a> SearchHandler<'a> {
 
         let status = self.game_state.board.status();
         if status == chess::BoardStatus::Checkmate {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             return -MATE_SCORE + self.ply as i32;
         }
         if status == chess::BoardStatus::Stalemate {
@@ -193,7 +212,7 @@ impl<'a> SearchHandler<'a> {
         let in_check = *self.game_state.board.checkers() != EMPTY;
 
         if !in_check && self.ply > 0 {
-            if depth <= 2 && static_score + 150 + (50 * depth as i32) < alpha {
+            if depth <= 2 && static_score + 150 + (50 * i32::from(depth)) < alpha {
                 return static_score;
             }
 
@@ -247,7 +266,10 @@ impl<'a> SearchHandler<'a> {
                     if let Some(ref p) = policy_vec {
                         let token = move_to_token(&mv, &self.game_state.board);
                         if token < p.len() {
-                            score += (p[token] * 100_000.0) as i32;
+                            #[allow(clippy::cast_possible_truncation)]
+                            {
+                                score += (p[token] * 100_000.0) as i32;
+                            }
                         }
                     }
                 }
@@ -296,7 +318,10 @@ impl<'a> SearchHandler<'a> {
                     && !in_check
                     && board_backup.piece_on(mv.get_dest()).is_none()
                 {
-                    1 + (i / 8) as u8
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        1 + (i / 8) as u8
+                    }
                 } else {
                     0
                 };
@@ -408,6 +433,7 @@ impl<'a> SearchHandler<'a> {
     }
 }
 
+#[derive(Default)]
 pub struct TimeControl {
     pub wtime: Option<u64>,
     pub btime: Option<u64>,
@@ -419,22 +445,8 @@ pub struct TimeControl {
     pub depth: Option<u8>,
 }
 
-impl Default for TimeControl {
-    fn default() -> Self {
-        Self {
-            wtime: None,
-            btime: None,
-            winc: None,
-            binc: None,
-            movestogo: None,
-            movetime: None,
-            infinite: false,
-            depth: None,
-        }
-    }
-}
-
 impl TimeControl {
+    #[must_use]
     pub fn calculate_time(&self, is_white: bool) -> Duration {
         if self.infinite {
             return Duration::from_secs(3600);
@@ -446,7 +458,7 @@ impl TimeControl {
         let our_inc = if is_white { self.winc } else { self.binc };
         if let Some(time) = our_time {
             let inc = our_inc.unwrap_or(0);
-            let moves_left = self.movestogo.unwrap_or(30) as u64;
+            let moves_left = u64::from(self.movestogo.unwrap_or(30));
             let allocated = time / moves_left + inc - OVERHEAD_MS;
             Duration::from_millis(allocated.min(time / 2).max(100))
         } else {
