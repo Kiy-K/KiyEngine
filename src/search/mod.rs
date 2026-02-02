@@ -165,7 +165,7 @@ impl SearchWorker {
         self.nodes += 1;
 
         // Neural ordering & evaluation
-        let (policy_scores, score_val) = if depth >= 2 || ply <= 1 {
+        let (policy_scores, _score_val) = if depth >= 2 || ply <= 1 {
             match self.engine.forward(&self.move_history) {
                 Ok(res) => {
                     let logits = res.0.to_vec1::<f32>().ok();

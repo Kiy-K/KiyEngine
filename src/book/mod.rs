@@ -23,7 +23,6 @@ impl OpeningBook {
         let mut high = (file.metadata().ok()?.len() / 16) as i64 - 1;
 
         let mut best_move_raw = None;
-        let mut max_weight = 0;
 
         while low <= high {
             let mid = (low + high) / 2;
@@ -39,12 +38,8 @@ impl OpeningBook {
                 high = mid - 1;
             } else {
                 let move_raw = u16::from_be_bytes(buf[8..10].try_into().unwrap());
-                let weight = u16::from_be_bytes(buf[10..12].try_into().unwrap());
                 
-                if weight >= max_weight {
-                    max_weight = weight;
-                    best_move_raw = Some(move_raw);
-                }
+                best_move_raw = Some(move_raw);
                 break;
             }
         }
