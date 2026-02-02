@@ -1,6 +1,6 @@
 [package]
 name = "kiy_engine_v4_omega"
-version = "4.3.0"
+version = "4.3.1"
 edition = "2021"
 
 [dependencies]
@@ -11,6 +11,7 @@ anyhow = "1.0.95"
 safetensors = "0.7.0"
 memmap2 = "0.9.5"
 dashmap = "6.1.0"
+parking_lot = "0.12.3"
 
 [features]
 noise = []

@@ -28,25 +28,35 @@ pub struct TTEntry {
     pub best_move: Option<ChessMove>,
 }
 
+use parking_lot::RwLock;
+
 pub struct TranspositionTable {
-    table: DashMap<u64, TTEntry>,
+    table: RwLock<DashMap<u64, TTEntry>>,
 }
 
 impl TranspositionTable {
     pub fn new() -> Self {
-        // 32M entries * ~32 bytes = ~1GB
+        // Default 512MB: ~16M entries * ~32 bytes
         Self {
-            table: DashMap::with_capacity(32_000_000),
+            table: RwLock::new(DashMap::with_capacity(16_000_000)),
         }
     }
+
+    pub fn resize(&self, mb: usize) {
+        // Each entry is roughly 32 bytes.
+        let entries = (mb * 1024 * 1024) / 32;
+        let mut table = self.table.write();
+        *table = DashMap::with_capacity(entries);
+    }
+
     pub fn get(&self, hash: u64) -> Option<TTEntry> {
-        self.table.get(&hash).map(|r| r.clone())
+        self.table.read().get(&hash).map(|r| r.clone())
     }
     pub fn store(&self, entry: TTEntry) {
-        self.table.insert(entry.hash, entry);
+        self.table.read().insert(entry.hash, entry);
     }
     pub fn clear(&self) {
-        self.table.clear();
+        self.table.read().clear();
     }
 }
 
@@ -77,6 +87,7 @@ impl Searcher {
             let mut last_score = 0;
             let start_time = std::time::Instant::now();
 
+            // Iterative Deepening
             for depth in 1..=max_depth {
                 if worker.stop_flag.load(Ordering::Relaxed) {
                     break;
@@ -103,12 +114,17 @@ impl Searcher {
                     }
 
                     if score_res <= alpha {
-                        alpha -= 100;
+                        alpha = alpha.saturating_sub(100);
+                        if alpha < -INFINITY { alpha = -INFINITY; }
                     } else if score_res >= beta {
-                        beta += 100;
+                        beta = beta.saturating_add(100);
+                        if beta > INFINITY { beta = INFINITY; }
                     } else {
                         break;
                     }
+                    
+                    // Safety break if window explodes
+                    if alpha == -INFINITY && beta == INFINITY { break; }
                 }
 
                 if !worker.stop_flag.load(Ordering::Relaxed) {
@@ -181,7 +197,7 @@ impl SearchWorker {
 
         let in_check = self.board.checkers().popcnt() > 0;
         if in_check {
-            depth += 1;
+            depth += 1; // Check Extension
         }
 
         let hash = self.board.get_hash();
@@ -211,22 +227,17 @@ impl SearchWorker {
         }
         self.nodes += 1;
 
-        // Selective Neural Inference (Pv nodes or depth 2-4)
+        // Neural Inference at Pv nodes or high depth
         let is_pv = beta - alpha > 1;
         let mut policy = None;
-        if ply <= 4 && (is_pv || ply == 0) {
+        if ply <= 6 && (is_pv || ply == 0) {
             if let Ok(res) = self.engine.forward(&self.move_history) {
                 policy = res.0.to_vec1::<f32>().ok();
             }
         }
 
-        let tt_move = tt_entry.and_then(|e| e.best_move);
-        let moves = self.order_moves(
-            MoveGen::new_legal(&self.board),
-            policy.as_deref(),
-            ply,
-            tt_move,
-        );
+        let tt_move = tt_entry.as_ref().and_then(|e| e.best_move);
+        let moves = self.order_moves(MoveGen::new_legal(&self.board), policy.as_deref(), ply, tt_move);
 
         if moves.is_empty() {
             return if in_check {
@@ -243,8 +254,7 @@ impl SearchWorker {
         for (mv, policy_prob) in moves {
             let old_board = self.board;
             self.board = self.board.make_move_new(mv);
-            self.move_history
-                .push(MoveCodec::move_to_token(&mv) as usize);
+            self.move_history.push(MoveCodec::move_to_token(&mv) as usize);
 
             // Policy-Guided Extensions
             let mut extension = 0;
@@ -254,9 +264,8 @@ impl SearchWorker {
 
             let mut score;
             if moves_searched == 0 {
-                score = -self
-                    .alpha_beta(-beta, -alpha, depth - 1 + extension, ply + 1)
-                    .0;
+                // Principal Variation Search
+                score = -self.alpha_beta(-beta, -alpha, depth - 1 + extension, ply + 1).0;
             } else {
                 // LMR
                 let mut reduction = if depth >= 3
@@ -274,20 +283,15 @@ impl SearchWorker {
                 }
 
                 score = -self
-                    .alpha_beta(
-                        -alpha - 1,
-                        -alpha,
-                        depth.saturating_sub(1 + reduction),
-                        ply + 1,
-                    )
+                    .alpha_beta(-alpha - 1, -alpha, depth.saturating_sub(1 + reduction), ply + 1)
                     .0;
+                
                 if score > alpha && reduction > 0 {
                     score = -self.alpha_beta(-alpha - 1, -alpha, depth - 1, ply + 1).0;
                 }
+                
                 if score > alpha && score < beta {
-                    score = -self
-                        .alpha_beta(-beta, -alpha, depth - 1 + extension, ply + 1)
-                        .0;
+                    score = -self.alpha_beta(-beta, -alpha, depth - 1 + extension, ply + 1).0;
                 }
             }
 
@@ -351,8 +355,10 @@ impl SearchWorker {
         let moves = MoveGen::new_legal(&self.board);
 
         let mut moves_vec: Vec<(ChessMove, i32)> = if in_check {
+            // Full search in check for stability
             moves.map(|m| (m, self.mvv_lva(m))).collect()
         } else {
+            // Only captures
             moves
                 .filter(|m| self.board.piece_on(m.get_dest()).is_some())
                 .map(|m| (m, self.mvv_lva(m)))
@@ -388,26 +394,36 @@ impl SearchWorker {
             .map(|mv| {
                 let mut total_score = 0;
                 let mut p_score = 0;
+                
+                // 1. TT Move Priority
                 if Some(mv) == tt_move {
-                    total_score += 1000000;
+                    total_score += 10_000_000;
                 }
+                
+                // 2. Neural Policy (Top 3 Priority)
                 if let Some(p) = policy {
                     let tok = MoveCodec::move_to_token(&mv) as usize;
                     if tok < p.len() {
-                        p_score = (p[tok] * 10000.0) as i32;
+                        p_score = (p[tok] * 100_000.0) as i32;
                         total_score += p_score;
                     }
                 }
+                
+                // 3. Captures (MVV-LVA)
                 if self.board.piece_on(mv.get_dest()).is_some() {
-                    total_score += 100000 + self.mvv_lva(mv);
+                    total_score += 200_000 + self.mvv_lva(mv);
                 }
+                
+                // 4. Killers
                 if Some(mv) == self.killers[ply][0] {
-                    total_score += 50000;
+                    total_score += 100_000;
                 } else if Some(mv) == self.killers[ply][1] {
-                    total_score += 40000;
+                    total_score += 90_000;
                 }
-                total_score +=
-                    self.history[side][mv.get_source().to_index()][mv.get_dest().to_index()];
+                
+                // 5. History
+                total_score += self.history[side][mv.get_source().to_index()][mv.get_dest().to_index()];
+                
                 (mv, p_score, total_score)
             })
             .collect();

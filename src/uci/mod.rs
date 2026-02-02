@@ -123,8 +123,9 @@ impl UciHandler {
         let parts: Vec<&str> = command.split_whitespace().collect();
         match parts.get(0).copied() {
             Some("uci") => {
-                println!("id name KiyEngine V4.3.0 Omega");
+                println!("id name KiyEngine V4.3.1 Omega");
                 println!("id author Khoi");
+                println!("option name Hash type spin default 512 min 1 max 65536");
                 println!("uciok");
             }
             Some("isready") => {
@@ -143,6 +144,13 @@ impl UciHandler {
             }
             Some("stop") => {
                 self.stop_flag.store(true, Ordering::SeqCst);
+            }
+            Some("setoption") => {
+                if parts.len() >= 5 && parts[1] == "name" && parts[2] == "Hash" && parts[3] == "value" {
+                    if let Ok(mb) = parts[4].parse() {
+                        self.tt.resize(mb);
+                    }
+                }
             }
             Some("quit") => {
                 std::process::exit(0);

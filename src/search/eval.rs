@@ -1,6 +1,6 @@
 // src/search/eval.rs
 
-use chess::{Board, Color, Piece, Square};
+use chess::{Board, Color, Piece, Square, BitBoard};
 
 pub const EVAL_PAWN: i32 = 100;
 pub const EVAL_KNIGHT: i32 = 320;
@@ -9,7 +9,6 @@ pub const EVAL_ROOK: i32 = 500;
 pub const EVAL_QUEEN: i32 = 900;
 pub const EVAL_KING: i32 = 20000;
 
-// Simple PSQT for optimization (oriented for White)
 const PAWN_PST: [i32; 64] = [
     0, 0, 0, 0, 0, 0, 0, 0, 50, 50, 50, 50, 50, 50, 50, 50, 10, 10, 20, 30, 30, 20, 10, 10, 5, 5,
     10, 25, 25, 10, 5, 5, 0, 0, 0, 20, 20, 0, 0, 0, 5, -5, -10, 0, 0, -10, -5, 5, 5, 10, 10, -20,
@@ -70,11 +69,51 @@ pub fn evaluate(board: &Board) -> i32 {
         }
     }
 
+    score += king_safety(board, Color::White);
+    score -= king_safety(board, Color::Black);
+
     if board.side_to_move() == Color::White {
         score
     } else {
         -score
     }
+}
+
+fn king_safety(board: &Board, color: Color) -> i32 {
+    let king_sq = board.king_square(color);
+    let mut safety_score = 0;
+    
+    let enemy_color = !color;
+    let attackers = board.color_combined(enemy_color);
+    let king_zone = get_king_zone(king_sq);
+    
+    let attackers_bb = king_zone & attackers;
+    let attackers_count = attackers_bb.popcnt() as i32;
+    safety_score -= attackers_count * 15;
+    
+    if board.checkers().popcnt() > 0 && board.side_to_move() == color {
+        safety_score -= 50;
+    }
+    
+    safety_score
+}
+
+fn get_king_zone(sq: Square) -> BitBoard {
+    // Generate 3x3 zone manually
+    let mut mask = 0u64;
+    let r = sq.get_rank().to_index() as i32;
+    let f = sq.get_file().to_index() as i32;
+    
+    for dr in -1..=1 {
+        for df in -1..=1 {
+            let nr = r + dr;
+            let nf = f + df;
+            if nr >= 0 && nr < 8 && nf >= 0 && nf < 8 {
+                mask |= 1 << (nr * 8 + nf);
+            }
+        }
+    }
+    BitBoard::new(mask)
 }
 
 fn get_pst_idx(sq: Square, color: Color) -> usize {

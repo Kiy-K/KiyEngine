@@ -39,7 +39,11 @@ impl BitLinear {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = rms_norm(x, &self.rms_norm_weight, self.eps)?;
-        x.broadcast_matmul(&self.weight_t)
+        // Strictly ternary weights (-1, 0, 1).
+        // In a real optimized BitNet kernel, we would use addition/subtraction.
+        // Here we use matmul but ensure the weights are quantized.
+        let weights = self.weight_t.clamp(-1.0, 1.0)?.round()?;
+        x.broadcast_matmul(&weights)
     }
 }
 
