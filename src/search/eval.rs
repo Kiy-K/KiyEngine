@@ -9,6 +9,10 @@ pub const EVAL_ROOK: i32 = 500;
 pub const EVAL_QUEEN: i32 = 900;
 pub const EVAL_KING: i32 = 20000;
 
+// opening values to discourage early sacrifices
+pub const OPENING_KNIGHT: i32 = 450; 
+pub const OPENING_BISHOP: i32 = 460;
+
 const PAWN_PST: [i32; 64] = [
     0, 0, 0, 0, 0, 0, 0, 0, 50, 50, 50, 50, 50, 50, 50, 50, 10, 10, 20, 30, 30, 20, 10, 10, 5, 5,
     10, 25, 25, 10, 5, 5, 0, 0, 0, 20, 20, 0, 0, 0, 5, -5, -10, 0, 0, -10, -5, 5, 5, 10, 10, -20,
@@ -46,8 +50,11 @@ const KING_PST: [i32; 64] = [
     10, 30, 20,
 ];
 
-pub fn evaluate(board: &Board) -> i32 {
+pub fn evaluate(board: &Board, ply: usize) -> i32 {
     let mut score = 0;
+
+    // Opening phase: first 10 moves (roughly)
+    let is_opening = ply <= 20;
 
     for sq in *board.combined() {
         let piece = board.piece_on(sq).unwrap();
@@ -55,8 +62,14 @@ pub fn evaluate(board: &Board) -> i32 {
 
         let val = match piece {
             Piece::Pawn => EVAL_PAWN + PAWN_PST[get_pst_idx(sq, color)],
-            Piece::Knight => EVAL_KNIGHT + KNIGHT_PST[get_pst_idx(sq, color)],
-            Piece::Bishop => EVAL_BISHOP + BISHOP_PST[get_pst_idx(sq, color)],
+            Piece::Knight => {
+                let base = if is_opening { OPENING_KNIGHT } else { EVAL_KNIGHT };
+                base + KNIGHT_PST[get_pst_idx(sq, color)]
+            },
+            Piece::Bishop => {
+                let base = if is_opening { OPENING_BISHOP } else { EVAL_BISHOP };
+                base + BISHOP_PST[get_pst_idx(sq, color)]
+            },
             Piece::Rook => EVAL_ROOK + ROOK_PST[get_pst_idx(sq, color)],
             Piece::Queen => EVAL_QUEEN + QUEEN_PST[get_pst_idx(sq, color)],
             Piece::King => EVAL_KING + KING_PST[get_pst_idx(sq, color)],
@@ -89,17 +102,18 @@ fn king_safety(board: &Board, color: Color) -> i32 {
     
     let attackers_bb = king_zone & attackers;
     let attackers_count = attackers_bb.popcnt() as i32;
-    safety_score -= attackers_count * 15;
+    // Penalty from 40 to 60 per piece for V4.3.2
+    safety_score -= attackers_count * 60;
     
+    // Check penalty from 150 to 250
     if board.checkers().popcnt() > 0 && board.side_to_move() == color {
-        safety_score -= 50;
+        safety_score -= 250;
     }
     
     safety_score
 }
 
 fn get_king_zone(sq: Square) -> BitBoard {
-    // Generate 3x3 zone manually
     let mut mask = 0u64;
     let r = sq.get_rank().to_index() as i32;
     let f = sq.get_file().to_index() as i32;

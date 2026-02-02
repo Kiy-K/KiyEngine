@@ -123,7 +123,7 @@ impl UciHandler {
         let parts: Vec<&str> = command.split_whitespace().collect();
         match parts.get(0).copied() {
             Some("uci") => {
-                println!("id name KiyEngine V4.3.1 Omega");
+                println!("id name KiyEngine V4.3.2 Omega");
                 println!("id author Khoi");
                 println!("option name Hash type spin default 512 min 1 max 65536");
                 println!("uciok");

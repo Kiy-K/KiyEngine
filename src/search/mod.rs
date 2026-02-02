@@ -223,7 +223,7 @@ impl SearchWorker {
         }
 
         if depth == 0 {
-            return (self.quiescence(alpha, beta), None);
+            return (self.quiescence(alpha, beta, ply), None);
         }
         self.nodes += 1;
 
@@ -286,6 +286,14 @@ impl SearchWorker {
                     .alpha_beta(-alpha - 1, -alpha, depth.saturating_sub(1 + reduction), ply + 1)
                     .0;
                 
+                // Discourage minor piece sacrifices in the opening (ply <= 20)
+                if ply <= 20 && score > alpha && self.board.piece_on(mv.get_dest()).is_none() {
+                    let piece = old_board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
+                    if piece == Piece::Knight || piece == Piece::Bishop {
+                        // Penalty if non-capture sacrifice
+                        score -= 50;
+                    }
+                }
                 if score > alpha && reduction > 0 {
                     score = -self.alpha_beta(-alpha - 1, -alpha, depth - 1, ply + 1).0;
                 }
@@ -341,9 +349,9 @@ impl SearchWorker {
         (best_score, best_move)
     }
 
-    fn quiescence(&mut self, mut alpha: i32, beta: i32) -> i32 {
+    fn quiescence(&mut self, mut alpha: i32, beta: i32, ply: usize) -> i32 {
         self.nodes += 1;
-        let stand_pat = eval::evaluate(&self.board);
+        let stand_pat = eval::evaluate(&self.board, ply);
         if stand_pat >= beta {
             return stand_pat;
         }
@@ -370,7 +378,7 @@ impl SearchWorker {
         for (mv, _) in moves_vec {
             let old_board = self.board;
             self.board = self.board.make_move_new(mv);
-            let score = -self.quiescence(-beta, -alpha);
+            let score = -self.quiescence(-beta, -alpha, ply + 1);
             self.board = old_board;
             if score >= beta {
                 return score;
