@@ -4,7 +4,7 @@ pub mod eval;
 
 use crate::engine::Engine;
 use crate::uci::MoveCodec;
-use chess::{Board, ChessMove, Color, MoveGen, Piece};
+use chess::{Board, ChessMove, MoveGen, Piece};
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};

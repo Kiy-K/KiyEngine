@@ -1,8 +1,6 @@
-use candle_core::Device;
 use kiy_engine_v4_omega::engine::Engine;
 
 fn main() -> anyhow::Result<()> {
-    let device = Device::Cpu;
     println!("Loading engine...");
     let engine = Engine::new()?;
     println!("Engine loaded.");
