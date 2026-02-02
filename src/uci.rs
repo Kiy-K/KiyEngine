@@ -2,17 +2,17 @@
 
 use crate::engine::Engine;
 use crate::search::{Searcher, TranspositionTable};
+use crate::book::OpeningBook;
 use chess::{Board, ChessMove, MoveGen, Square};
 use std::io::{self, BufRead};
 use std::str::FromStr;
 use std::sync::{Arc, mpsc};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-/// MoveCodec handles conversion between UCI strings, ChessMoves, and Model Tokens.
 pub struct MoveCodec;
 
 impl MoveCodec {
-    /// Encodes a move to a token ID for the model.
     pub fn move_to_token(mv: &ChessMove) -> u32 {
         let from = mv.get_source().to_int();
         let to = mv.get_dest().to_int();
@@ -32,7 +32,6 @@ impl MoveCodec {
         }
     }
 
-    /// Decodes a token ID from the model to a ChessMove.
     pub fn token_to_move(token: u32, board: &Board) -> Option<ChessMove> {
         if token < 4096 {
             let from_idx = token / 64;
@@ -76,6 +75,7 @@ impl MoveCodec {
 pub struct UciHandler {
     searcher: Searcher,
     tt: Arc<TranspositionTable>,
+    book: OpeningBook,
     board: Board,
     move_history: Vec<usize>,
     stop_flag: Arc<AtomicBool>,
@@ -87,9 +87,9 @@ impl UciHandler {
         let engine = Arc::new(Engine::new()?);
         let tt = Arc::new(TranspositionTable::new());
         let searcher = Searcher::new(Arc::clone(&engine), Arc::clone(&tt));
+        let book = OpeningBook::open("book.bin");
         let (tx, rx) = mpsc::channel();
         
-        // Output thread for bestmove messages
         std::thread::spawn(move || {
             while let Ok(msg) = rx.recv() {
                 println!("{}", msg);
@@ -99,6 +99,7 @@ impl UciHandler {
         Ok(Self {
             searcher,
             tt,
+            book,
             board: Board::default(),
             move_history: Vec::new(),
             stop_flag: Arc::new(AtomicBool::new(false)),
@@ -183,13 +184,39 @@ impl UciHandler {
     fn handle_go(&mut self, parts: &[&str]) {
         self.stop_flag.store(false, Ordering::SeqCst);
         
-        let mut depth = 25; // Default depth for the scout
-        if let Some(d_idx) = parts.iter().position(|&p| p == "depth") {
-            if let Some(d_str) = parts.get(d_idx + 1) {
-                if let Ok(d) = d_str.parse() {
-                    depth = d;
-                }
+        if let Some(mv) = self.book.get_move(&self.board) {
+            let _ = self.tx_move.send(format!("bestmove {}", mv));
+            return;
+        }
+
+        let mut wtime: Option<u64> = None;
+        let mut btime: Option<u64> = None;
+        let mut winc: u64 = 0;
+        let mut binc: u64 = 0;
+        let mut depth = 25;
+
+        for i in 0..parts.len() {
+            match parts[i] {
+                "wtime" => wtime = parts.get(i + 1).and_then(|s| s.parse().ok()),
+                "btime" => btime = parts.get(i + 1).and_then(|s| s.parse().ok()),
+                "winc" => winc = parts.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0),
+                "binc" => binc = parts.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0),
+                "depth" => depth = parts.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(25),
+                _ => {}
             }
+        }
+
+        let my_time = if self.board.side_to_move() == chess::Color::White { wtime } else { btime };
+        let my_inc = if self.board.side_to_move() == chess::Color::White { winc } else { binc };
+
+        if let Some(ms) = my_time {
+            let think_time = ms / 20 + my_inc / 2;
+            let stop_flag = Arc::clone(&self.stop_flag);
+            
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(think_time));
+                stop_flag.store(true, Ordering::SeqCst);
+            });
         }
 
         self.searcher.search_async(
