@@ -18,16 +18,18 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact_name: kiy_engine_linux
-            asset_name: kiy_engine_v3_linux.tar.gz
-            binary_name: kiy_engine_v3
+            asset_name: kiy_engine_v4_omega_linux.tar.gz
+            binary_name: kiy_engine_v4_omega
           - os: windows-latest
             artifact_name: kiy_engine_windows
-            asset_name: kiy_engine_v3_windows.exe
-            binary_name: kiy_engine_v3.exe
+            asset_name: kiy_engine_v4_omega_windows.exe
+            binary_name: kiy_engine_v4_omega.exe
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -73,8 +75,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            kiy_engine_v3_linux.tar.gz
-            kiy_engine_v3_windows.exe
+            kiy_engine_v4_omega_linux.tar.gz
+            kiy_engine_v4_omega_windows.exe
           name: KiyEngine Release ${{ github.ref_name }}
           draft: false
           prerelease: false

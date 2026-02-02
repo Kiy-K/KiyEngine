@@ -183,7 +183,7 @@ impl UciHandler {
     fn handle_go(&mut self, parts: &[&str]) {
         self.stop_flag.store(false, Ordering::SeqCst);
         
-        let mut depth = 8; // Default depth for the scout
+        let mut depth = 25; // Default depth for the scout
         if let Some(d_idx) = parts.iter().position(|&p| p == "depth") {
             if let Some(d_str) = parts.get(d_idx + 1) {
                 if let Ok(d) = d_str.parse() {

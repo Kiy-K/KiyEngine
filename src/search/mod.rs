@@ -33,7 +33,7 @@ pub struct TranspositionTable {
 impl TranspositionTable {
     pub fn new() -> Self {
         Self {
-            table: DashMap::with_capacity(100_000),
+            table: DashMap::with_capacity(16_000_000),
         }
     }
 
