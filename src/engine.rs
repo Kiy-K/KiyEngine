@@ -1,75 +1,110 @@
 // src/engine.rs
-//
-// The main KiyEngine V3 model combining Mamba-MoE architecture.
-// Loads weights from HuggingFace safetensors format.
 
-use crate::mamba::MambaBlock;
-use crate::moe::{MoELayer, NUM_EXPERTS};
-use crate::safetensor_loader::SafeTensorFile;
-use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{Linear, Module};
-use chess::Board;
+use candle_core::{DType, Device, Result, Tensor, D};
+use candle_nn::{Embedding, Linear, Module, VarBuilder};
+use std::fs::File;
+use memmap2::Mmap;
 
+pub const VOCAB_SIZE: usize = 4608;
+pub const CONTEXT_LENGTH: usize = 32;
+pub const D_MODEL: usize = 1024;
 pub const NUM_LAYERS: usize = 4;
-pub const VOCAB_SIZE: usize = 768; // 12 pieces * 64 squares
 
-/// Sequential value head: Linear(384->128) -> ReLU -> Linear(128->1)
+/// Standard RMSNorm implementation.
+fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+    let x_sq = x.sqr()?;
+    let mean_sq = x_sq.mean_keepdim(D::Minus1)?;
+    let norm = (mean_sq + eps)?.sqrt()?;
+    let x_normed = x.broadcast_div(&norm)?;
+    x_normed.broadcast_mul(weight)
+}
+
+/// Custom BitLinear mirroring PyTorch QAT behavior.
+pub struct BitLinear {
+    pub weight_t: Tensor, // Pre-transposed for performance
+    pub rms_norm_weight: Tensor,
+    pub eps: f64,
+}
+
+impl BitLinear {
+    pub fn load(
+        prefix: &str,
+        vb: &VarBuilder,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> Result<Self> {
+        let weight = vb.get((out_dim, in_dim), &format!("{}.weight", prefix))?;
+        let weight_t = weight.t()?.contiguous()?;
+        let rms_norm_weight = vb.get((in_dim,), &format!("{}.norm.weight", prefix))?;
+        
+        Ok(Self {
+            weight_t,
+            rms_norm_weight,
+            eps: 1e-5,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = rms_norm(x, &self.rms_norm_weight, self.eps)?;
+        x.broadcast_matmul(&self.weight_t)
+    }
+}
+
 pub struct ValueHead {
-    pub linear1: Linear, // value_head.0
-    pub linear2: Linear, // value_head.2
+    pub norm_weight: Tensor,
+    pub linear1: Linear,
+    pub linear2: Linear,
 }
 
 impl ValueHead {
+    pub fn load(vb: &VarBuilder) -> Result<Self> {
+        let norm_weight = vb.get((D_MODEL,), "value_head.0.weight")?;
+        let linear1_w = vb.get((512, D_MODEL), "value_head.1.weight")?;
+        let linear2_w = vb.get((1, 512), "value_head.3.weight")?;
+        
+        Ok(Self { 
+            norm_weight,
+            linear1: Linear::new(linear1_w, None),
+            linear2: Linear::new(linear2_w, None),
+        })
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.linear1.forward(x)?;
+        let x = rms_norm(x, &self.norm_weight, 1e-5)?;
+        let x = self.linear1.forward(&x)?;
         let x = x.relu()?;
         self.linear2.forward(&x)
     }
 }
 
-/// Represents the full MoE-Mamba model using Candle.
+pub struct PolicyHead {
+    pub norm_weight: Tensor,
+    pub linear: Linear,
+}
+
+impl PolicyHead {
+    pub fn load(vb: &VarBuilder) -> Result<Self> {
+        let norm_weight = vb.get((D_MODEL,), "policy_head.0.weight")?;
+        let linear_w = vb.get((VOCAB_SIZE, D_MODEL), "policy_head.1.weight")?;
+        Ok(Self {
+            norm_weight,
+            linear: Linear::new(linear_w, None),
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = rms_norm(x, &self.norm_weight, 1e-5)?;
+        self.linear.forward(&x)
+    }
+}
+
 pub struct Engine {
-    pub embedding: Tensor, // Shape: (VOCAB_SIZE, D_MODEL) - note: singular "embedding"
-    pub layers: Vec<MoELayer>,
-    pub norm_w: Tensor, // Shape: (D_MODEL) - RMSNorm weight
-    pub policy_head: Linear,
+    pub embedding: Embedding,
+    pub pos_embed: Tensor,
+    pub layers: Vec<BitLinear>,
+    pub policy_head: PolicyHead,
     pub value_head: ValueHead,
     pub device: Device,
-}
-
-/// Represents the game state for search.
-/// Simplified version without Mamba state tracking.
-#[derive(Clone)]
-pub struct GameState {
-    pub board: Board,
-    pub move_history: Vec<usize>, // Token history for the model
-}
-
-impl GameState {
-    pub fn new(board: Board) -> Self {
-        Self {
-            board,
-            move_history: Vec::new(),
-        }
-    }
-
-    /// Adds a move token to the history.
-    pub fn push_token(&mut self, token: usize) {
-        self.move_history.push(token);
-        // Keep only the last 64 tokens (model's max sequence length)
-        if self.move_history.len() > 64 {
-            self.move_history.remove(0);
-        }
-    }
-
-    /// Gets the input sequence for the model (padded to at least 1 token).
-    pub fn get_input_sequence(&self) -> Vec<usize> {
-        if self.move_history.is_empty() {
-            vec![0] // Start token or padding
-        } else {
-            self.move_history.clone()
-        }
-    }
 }
 
 impl Engine {
@@ -79,207 +114,67 @@ impl Engine {
         } else {
             Device::Cpu
         };
-
-        if std::path::Path::new("model.safetensors").exists() {
-            println!("Loading model from model.safetensors...");
-            Self::load_from_safetensors("model.safetensors", device)
-        } else {
-            anyhow::bail!(
-                "model.safetensors not found. Random initialization not supported in this version."
-            )
-        }
+        Self::load_from_safetensors("model.safetensors", device)
     }
 
-    fn load_from_safetensors(path: &str, device: Device) -> anyhow::Result<Self> {
-        let st = SafeTensorFile::open(path)?;
-        let dtype = DType::F32;
+    pub fn load_from_safetensors(model_path: &str, device: Device) -> anyhow::Result<Self> {
+        let file = File::open(model_path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let tensors = candle_core::safetensors::load_buffer(&mmap, &device)?;
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
 
-        // Load embedding (note: singular, not "embeddings")
-        let embedding = st.load_tensor("embedding.weight", dtype, &device)?;
+        let embed_w = vb.get((VOCAB_SIZE, D_MODEL), "embed.weight")?;
+        let embedding = Embedding::new(embed_w, D_MODEL);
+        
+        let pos_embed = vb.get((1, CONTEXT_LENGTH, D_MODEL), "pos_embed")?;
 
-        // Load layers
         let mut layers = Vec::with_capacity(NUM_LAYERS);
-        for l in 0..NUM_LAYERS {
-            // Router (with bias)
-            // Router (with bias) - user specified mapping to skill_emb
-            let router_w =
-                st.load_tensor(&format!("layers.{}.skill_emb.weight", l), dtype, &device)?;
-            let router_b =
-                st.load_tensor(&format!("layers.{}.skill_emb.bias", l), dtype, &device)?;
-            let router = Linear::new(router_w, Some(router_b));
-
-            // Experts
-            let mut experts = Vec::with_capacity(NUM_EXPERTS);
-            for e in 0..NUM_EXPERTS {
-                let prefix = format!("layers.{}.experts.{}", l, e);
-
-                // in_proj: (2*D_INNER, D_MODEL)
-                let in_proj_w =
-                    st.load_tensor(&format!("{}.in_proj.weight", prefix), dtype, &device)?;
-                let in_proj = Linear::new(in_proj_w, None);
-
-                // conv1d: weight (D_INNER, 1, D_CONV), bias (D_INNER)
-                let conv1d_w =
-                    st.load_tensor(&format!("{}.conv1d.weight", prefix), dtype, &device)?;
-                let conv1d_b =
-                    st.load_tensor(&format!("{}.conv1d.bias", prefix), dtype, &device)?;
-
-                // x_proj: (D_INNER + 2*D_STATE, D_INNER) - kept for weight compatibility
-                let x_proj_w =
-                    st.load_tensor(&format!("{}.x_proj.weight", prefix), dtype, &device)?;
-                let x_proj = Linear::new(x_proj_w, None);
-
-                // dt_proj: weight (D_INNER, D_INNER), bias (D_INNER)
-                let dt_proj_w =
-                    st.load_tensor(&format!("{}.dt_proj.weight", prefix), dtype, &device)?;
-                let dt_proj_b =
-                    st.load_tensor(&format!("{}.dt_proj.bias", prefix), dtype, &device)?;
-                let dt_proj = Linear::new(dt_proj_w, Some(dt_proj_b));
-
-                // A_log: (D_INNER, D_STATE) - kept for weight compatibility
-                let a_log = st.load_tensor(&format!("{}.A_log", prefix), dtype, &device)?;
-
-                // D: (D_INNER) - used for gating
-                let d = st.load_tensor(&format!("{}.D", prefix), dtype, &device)?;
-
-                // out_proj: (D_MODEL, D_INNER)
-                let out_proj_w =
-                    st.load_tensor(&format!("{}.out_proj.weight", prefix), dtype, &device)?;
-                let out_proj = Linear::new(out_proj_w, None);
-
-                experts.push(MambaBlock {
-                    in_proj,
-                    conv1d_w,
-                    conv1d_b,
-                    x_proj,
-                    dt_proj,
-                    a_log,
-                    d,
-                    out_proj,
-                });
-            }
-
-            layers.push(MoELayer { router, experts });
+        for i in 0..NUM_LAYERS {
+            layers.push(BitLinear::load(&format!("layers.{}.linear", i), &vb, D_MODEL, D_MODEL)?);
         }
 
-        // Norm weight
-        let norm_w = st.load_tensor("norm.weight", dtype, &device)?;
-
-        // Policy head: (VOCAB_SIZE, D_MODEL)
-        let policy_w = st.load_tensor("policy_head.weight", dtype, &device)?;
-        let policy_head = Linear::new(policy_w, None);
-
-        // Value head: Sequential with Linear(384->128) -> ReLU -> Linear(128->1)
-        let value_head = ValueHead {
-            linear1: Linear::new(
-                st.load_tensor("value_head.0.weight", dtype, &device)?,
-                Some(st.load_tensor("value_head.0.bias", dtype, &device)?),
-            ),
-            linear2: Linear::new(
-                st.load_tensor("value_head.2.weight", dtype, &device)?,
-                Some(st.load_tensor("value_head.2.bias", dtype, &device)?),
-            ),
-        };
+        let policy_head = PolicyHead::load(&vb)?;
+        let value_head = ValueHead::load(&vb)?;
 
         Ok(Self {
             embedding,
+            pos_embed,
             layers,
-            norm_w,
             policy_head,
             value_head,
             device,
         })
     }
 
-    /// Forward pass on a sequence of tokens.
-    ///
-    /// # Arguments
-    /// * `tokens` - Sequence of move tokens
-    ///
-    /// # Returns
-    /// * (policy_logits, value) where policy_logits is (VOCAB_SIZE) and value is a scalar
     pub fn forward(&self, tokens: &[usize]) -> Result<(Tensor, f32)> {
         let seq_len = tokens.len();
+        if seq_len == 0 {
+            return Err(candle_core::Error::Msg("Empty tokens".to_string()));
+        }
+        
+        let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+        let tokens_tensor = Tensor::new(tokens_u32.as_slice(), &self.device)?.unsqueeze(0)?;
+        let mut x = self.embedding.forward(&tokens_tensor)?;
+        
+        let pos_slice = self.pos_embed.narrow(1, 0, seq_len)?;
+        x = x.broadcast_add(&pos_slice)?;
 
-        // Look up embeddings for all tokens
-        let embeddings: Vec<Tensor> = tokens
-            .iter()
-            .map(|&t| self.embedding.get(t))
-            .collect::<Result<Vec<_>>>()?;
-
-        // Stack to (1, seq_len, d_model)
-        let mut x = Tensor::stack(&embeddings, 0)?.unsqueeze(0)?;
-
-        // Forward through layers with residual connections
-        // PyTorch: for layer in self.layers: x = x + layer(self.norm(x))
         for layer in &self.layers {
-            let x_norm = self.rms_norm(&x)?;
-            let layer_output = layer.forward(&x_norm)?;
-            x = (x + layer_output)?;
+            let layer_out = layer.forward(&x)?;
+            x = (x + layer_out)?;
         }
 
-        // Final norm
-        x = self.rms_norm(&x)?;
+        let last_token_x = x.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
+        let policy_logits = self.policy_head.forward(&last_token_x)?.squeeze(0)?;
+        let value_out = self.value_head.forward(&last_token_x)?.squeeze(0)?.squeeze(0)?;
+        let eval_score = value_out.tanh()?.to_scalar::<f32>()?;
 
-        // Get last token state: (1, d_model)
-        let last_token_state = x.get(0)?.get(seq_len - 1)?;
-
-        // Policy logits: (vocab_size)
-        let policy_logits = self
-            .policy_head
-            .forward(&last_token_state.unsqueeze(0)?)?
-            .squeeze(0)?;
-
-        // Value: tanh(value_head(last_token_state))
-        let value_tensor = self
-            .value_head
-            .forward(&last_token_state.unsqueeze(0)?)?
-            .squeeze(0)?
-            .squeeze(0)?;
-        let value = value_tensor.tanh()?.to_scalar::<f32>()?;
-
-        Ok((policy_logits, value))
+        Ok((policy_logits, eval_score))
     }
 
-    /// Single token forward pass for incremental inference.
-    ///
-    /// # Arguments
-    /// * `token` - Single move token
-    /// * `state` - Game state with history
-    ///
-    /// # Returns
-    /// * (policy_logits, value)
-    pub fn forward_token(&self, token: usize, state: &mut GameState) -> Result<(Tensor, f32)> {
-        state.push_token(token);
-        let tokens = state.get_input_sequence();
-        self.forward(&tokens)
-    }
-
-    /// RMSNorm implementation matching PyTorch.
-    fn rms_norm(&self, x: &Tensor) -> Result<Tensor> {
-        let eps = 1e-5;
-        // norm = x.norm(2, dim=-1, keepdim=True) * (x.shape[-1] ** -0.5)
-        // return x / (norm + eps) * self.weight
-
-        let x_sq = x.sqr()?;
-        let mean_sq = x_sq.mean_keepdim(candle_core::D::Minus1)?;
-        let norm = (mean_sq + eps)?.sqrt()?;
-        let x_normed = x.broadcast_div(&norm)?;
-        x_normed.broadcast_mul(&self.norm_w)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_game_state() {
-        let mut state = GameState::new(Board::default());
-        assert_eq!(state.get_input_sequence(), vec![0]);
-
-        state.push_token(100);
-        state.push_token(200);
-        assert_eq!(state.get_input_sequence(), vec![100, 200]);
+    pub fn predict(&self, tokens: &[usize]) -> Result<(u32, f32)> {
+        let (logits, eval) = self.forward(tokens)?;
+        let best_move_id = logits.argmax(0)?.to_scalar::<u32>()?;
+        Ok((best_move_id, eval))
     }
 }
