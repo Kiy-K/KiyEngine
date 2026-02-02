@@ -114,7 +114,7 @@ impl Engine {
         } else {
             Device::Cpu
         };
-        Self::load_from_safetensors("model.safetensors", device)
+        Self::load_from_safetensors("kiyengine_v4.safetensors", device)
     }
 
     pub fn load_from_safetensors(model_path: &str, device: Device) -> anyhow::Result<Self> {

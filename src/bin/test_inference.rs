@@ -4,7 +4,7 @@ use candle_core::Device;
 fn main() -> anyhow::Result<()> {
     let device = Device::Cpu;
     println!("Loading engine...");
-    let engine = Engine::load_from_safetensors("model.safetensors", device)?;
+    let engine = Engine::new()?;
     println!("Engine loaded.");
 
     let test_cases = vec![
