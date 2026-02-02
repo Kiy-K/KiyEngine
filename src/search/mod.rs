@@ -63,7 +63,7 @@ impl Searcher {
     pub fn search_async(
         &self,
         board: Board,
-        move_history: Vec<usize>,
+        _move_history: Vec<usize>,
         max_depth: u8,
         stop_flag: Arc<AtomicBool>,
         tx: mpsc::Sender<String>,
@@ -72,17 +72,10 @@ impl Searcher {
         let tt = Arc::clone(&self.tt);
 
         std::thread::spawn(move || {
-            let mut worker = SearchWorker::new(engine, tt, board, move_history, stop_flag);
+            let mut worker = SearchWorker::new(engine, tt, board, _move_history, stop_flag);
             let mut best_move = None;
             let mut last_score = 0;
             let start_time = std::time::Instant::now();
-
-            // Neural at Root
-            let (root_policy, _root_eval) = match worker.engine.forward(&worker.move_history) {
-                Ok(res) => (res.0.to_vec1::<f32>().ok(), Some((res.1 * 1000.0) as i32)),
-                Err(_) => (None, None),
-            };
-            worker.root_policy = root_policy;
 
             for depth in 1..=max_depth {
                 if worker.stop_flag.load(Ordering::Relaxed) {
@@ -153,7 +146,6 @@ pub struct SearchWorker {
     pub nodes: u64,
     killers: [[Option<ChessMove>; 2]; 128],
     history: [[[i32; 64]; 64]; 2],
-    root_policy: Option<Vec<f32>>,
 }
 
 impl SearchWorker {
@@ -173,7 +165,6 @@ impl SearchWorker {
             nodes: 0,
             killers: [[None; 2]; 128],
             history: [[[0; 64]; 64]; 2],
-            root_policy: None,
         }
     }
 
@@ -191,7 +182,7 @@ impl SearchWorker {
         let in_check = self.board.checkers().popcnt() > 0;
         if in_check {
             depth += 1;
-        } // Check Extension
+        }
 
         let hash = self.board.get_hash();
         let tt_entry = self.tt.get(hash);
@@ -220,14 +211,19 @@ impl SearchWorker {
         }
         self.nodes += 1;
 
+        // Selective Neural Inference (Pv nodes or depth 2-4)
+        let is_pv = beta - alpha > 1;
+        let mut policy = None;
+        if ply <= 4 && (is_pv || ply == 0) {
+            if let Ok(res) = self.engine.forward(&self.move_history) {
+                policy = res.0.to_vec1::<f32>().ok();
+            }
+        }
+
         let tt_move = tt_entry.and_then(|e| e.best_move);
         let moves = self.order_moves(
             MoveGen::new_legal(&self.board),
-            if ply == 0 {
-                self.root_policy.as_deref()
-            } else {
-                None
-            },
+            policy.as_deref(),
             ply,
             tt_move,
         );
@@ -244,18 +240,26 @@ impl SearchWorker {
         let mut best_score = -INFINITY;
         let mut moves_searched = 0;
 
-        for (mv, _) in moves {
+        for (mv, policy_prob) in moves {
             let old_board = self.board;
             self.board = self.board.make_move_new(mv);
             self.move_history
                 .push(MoveCodec::move_to_token(&mv) as usize);
 
+            // Policy-Guided Extensions
+            let mut extension = 0;
+            if policy_prob > 5000 {
+                extension = 1;
+            }
+
             let mut score;
             if moves_searched == 0 {
-                score = -self.alpha_beta(-beta, -alpha, depth - 1, ply + 1).0;
+                score = -self
+                    .alpha_beta(-beta, -alpha, depth - 1 + extension, ply + 1)
+                    .0;
             } else {
                 // LMR
-                let reduction = if depth >= 3
+                let mut reduction = if depth >= 3
                     && moves_searched > 4
                     && self.board.piece_on(mv.get_dest()).is_none()
                     && !in_check
@@ -265,14 +269,25 @@ impl SearchWorker {
                     0
                 };
 
+                if policy_prob < 100 && reduction > 0 {
+                    reduction += 1;
+                }
+
                 score = -self
-                    .alpha_beta(-alpha - 1, -alpha, depth - 1 - reduction, ply + 1)
+                    .alpha_beta(
+                        -alpha - 1,
+                        -alpha,
+                        depth.saturating_sub(1 + reduction),
+                        ply + 1,
+                    )
                     .0;
                 if score > alpha && reduction > 0 {
                     score = -self.alpha_beta(-alpha - 1, -alpha, depth - 1, ply + 1).0;
                 }
                 if score > alpha && score < beta {
-                    score = -self.alpha_beta(-beta, -alpha, depth - 1, ply + 1).0;
+                    score = -self
+                        .alpha_beta(-beta, -alpha, depth - 1 + extension, ply + 1)
+                        .0;
                 }
             }
 
@@ -291,8 +306,8 @@ impl SearchWorker {
                     if self.board.piece_on(mv.get_dest()).is_none() {
                         self.killers[ply][1] = self.killers[ply][0];
                         self.killers[ply][0] = Some(mv);
-                        self.history[self.board.side_to_move() as usize]
-                            [mv.get_source().to_index()][mv.get_dest().to_index()] +=
+                        let side = self.board.side_to_move() as usize;
+                        self.history[side][mv.get_source().to_index()][mv.get_dest().to_index()] +=
                             (depth as i32) * (depth as i32);
                     }
                     self.tt.store(TTEntry {
@@ -369,32 +384,36 @@ impl SearchWorker {
         tt_move: Option<ChessMove>,
     ) -> Vec<(ChessMove, i32)> {
         let side = self.board.side_to_move() as usize;
-        let mut ordered: Vec<_> = moves
+        let mut full_ordered: Vec<(ChessMove, i32, i32)> = moves
             .map(|mv| {
-                let mut score = 0;
+                let mut total_score = 0;
+                let mut p_score = 0;
                 if Some(mv) == tt_move {
-                    score += 1000000;
+                    total_score += 1000000;
                 }
                 if let Some(p) = policy {
                     let tok = MoveCodec::move_to_token(&mv) as usize;
                     if tok < p.len() {
-                        score += (p[tok] * 10000.0) as i32;
+                        p_score = (p[tok] * 10000.0) as i32;
+                        total_score += p_score;
                     }
                 }
                 if self.board.piece_on(mv.get_dest()).is_some() {
-                    score += 100000 + self.mvv_lva(mv);
+                    total_score += 100000 + self.mvv_lva(mv);
                 }
                 if Some(mv) == self.killers[ply][0] {
-                    score += 50000;
+                    total_score += 50000;
                 } else if Some(mv) == self.killers[ply][1] {
-                    score += 40000;
+                    total_score += 40000;
                 }
-                score += self.history[side][mv.get_source().to_index()][mv.get_dest().to_index()];
-                (mv, score)
+                total_score +=
+                    self.history[side][mv.get_source().to_index()][mv.get_dest().to_index()];
+                (mv, p_score, total_score)
             })
             .collect();
-        ordered.sort_by(|a, b| b.1.cmp(&a.1));
-        ordered
+
+        full_ordered.sort_by(|a, b| b.2.cmp(&a.2));
+        full_ordered.into_iter().map(|(mv, p, _)| (mv, p)).collect()
     }
 
     fn mvv_lva(&self, mv: ChessMove) -> i32 {
