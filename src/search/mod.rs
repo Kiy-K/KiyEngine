@@ -1,5 +1,7 @@
 // src/search/mod.rs
 
+pub mod eval;
+
 use crate::engine::Engine;
 use crate::uci::MoveCodec;
 use chess::{Board, ChessMove, MoveGen, Piece, Color};
@@ -11,11 +13,7 @@ const MATE_SCORE: i32 = 30000;
 const INFINITY: i32 = 32000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TTFlag {
-    Exact,
-    LowerBound,
-    UpperBound,
-}
+pub enum TTFlag { Exact, LowerBound, UpperBound }
 
 #[derive(Clone, Debug)]
 pub struct TTEntry {
@@ -32,19 +30,14 @@ pub struct TranspositionTable {
 
 impl TranspositionTable {
     pub fn new() -> Self {
-        Self {
-            table: DashMap::with_capacity(16_000_000),
-        }
+        Self { table: DashMap::with_capacity(16_000_000) }
     }
-
     pub fn get(&self, hash: u64) -> Option<TTEntry> {
         self.table.get(&hash).map(|r| r.clone())
     }
-
     pub fn store(&self, entry: TTEntry) {
         self.table.insert(entry.hash, entry);
     }
-
     pub fn clear(&self) {
         self.table.clear();
     }
@@ -76,10 +69,15 @@ impl Searcher {
             let mut best_move = None;
             let start_time = std::time::Instant::now();
             
+            // Neural at Root
+            let (root_policy, _root_eval) = match worker.engine.forward(&worker.move_history) {
+                Ok(res) => (res.0.to_vec1::<f32>().ok(), Some((res.1 * 1000.0) as i32)),
+                Err(_) => (None, None),
+            };
+            worker.root_policy = root_policy;
+
             for depth in 1..=max_depth {
-                if worker.stop_flag.load(Ordering::Relaxed) {
-                    break;
-                }
+                if worker.stop_flag.load(Ordering::Relaxed) { break; }
                 
                 let (score, mv) = worker.alpha_beta(-INFINITY, INFINITY, depth, 0);
                 
@@ -88,7 +86,7 @@ impl Searcher {
                         best_move = Some(m);
                         let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
                         let nps = (worker.nodes as f64 / elapsed) as u64;
-                        println!("info depth {} score cp {} nodes {} nps {}", depth, score, worker.nodes, nps);
+                        println!("info depth {} score cp {} nodes {} nps {} pv {}", depth, score, worker.nodes, nps, m);
                     }
                 }
             }
@@ -97,9 +95,7 @@ impl Searcher {
                 let _ = tx.send(format!("bestmove {}", mv));
             } else {
                 let mut moves = MoveGen::new_legal(&board);
-                if let Some(mv) = moves.next() {
-                    let _ = tx.send(format!("bestmove {}", mv));
-                }
+                if let Some(mv) = moves.next() { let _ = tx.send(format!("bestmove {}", mv)); }
             }
         });
     }
@@ -113,35 +109,20 @@ pub struct SearchWorker {
     stop_flag: Arc<AtomicBool>,
     pub nodes: u64,
     killers: [[Option<ChessMove>; 2]; 128],
+    history: [[[i32; 64]; 64]; 2],
+    root_policy: Option<Vec<f32>>,
 }
 
 impl SearchWorker {
-    pub fn new(
-        engine: Arc<Engine>,
-        tt: Arc<TranspositionTable>,
-        board: Board,
-        move_history: Vec<usize>,
-        stop_flag: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            engine,
-            tt,
-            board,
-            move_history,
-            stop_flag,
-            nodes: 0,
-            killers: [[None; 2]; 128],
-        }
+    pub fn new(engine: Arc<Engine>, tt: Arc<TranspositionTable>, board: Board, move_history: Vec<usize>, stop_flag: Arc<AtomicBool>) -> Self {
+        Self { engine, tt, board, move_history, stop_flag, nodes: 0, killers: [[None; 2]; 128], history: [[[0; 64]; 64]; 2], root_policy: None }
     }
 
     fn alpha_beta(&mut self, mut alpha: i32, mut beta: i32, depth: u8, ply: usize) -> (i32, Option<ChessMove>) {
-        if self.stop_flag.load(Ordering::Relaxed) {
-            return (0, None);
-        }
+        if self.stop_flag.load(Ordering::Relaxed) { return (0, None); }
 
         let hash = self.board.get_hash();
         let tt_entry = self.tt.get(hash);
-        
         if let Some(ref entry) = tt_entry {
             if entry.depth >= depth {
                 match entry.flag {
@@ -158,56 +139,29 @@ impl SearchWorker {
             }
         }
 
-        if depth == 0 {
-            return (self.quiescence(alpha, beta), None);
-        }
-
+        if depth == 0 { return (self.quiescence(alpha, beta), None); }
         self.nodes += 1;
 
-        // Neural ordering & evaluation
-        let (policy_scores, _score_val) = if depth >= 2 || ply <= 1 {
-            match self.engine.forward(&self.move_history) {
-                Ok(res) => {
-                    let logits = res.0.to_vec1::<f32>().ok();
-                    let val = (res.1 * 1000.0) as i32;
-                    let val = if self.board.side_to_move() == Color::White { val } else { -val };
-                    (logits, Some(val))
-                },
-                Err(_) => (None, None),
-            }
-        } else {
-            (None, None)
-        };
-
-        let moves = self.order_moves(MoveGen::new_legal(&self.board), policy_scores.as_deref(), ply);
-        
+        let moves = self.order_moves(MoveGen::new_legal(&self.board), if ply == 0 { self.root_policy.as_deref() } else { None }, ply, tt_entry.and_then(|e| e.best_move));
         if moves.is_empty() {
-            if self.board.checkers().popcnt() > 0 {
-                return (-MATE_SCORE + ply as i32, None);
-            } else {
-                return (0, None);
-            }
+            return if self.board.checkers().popcnt() > 0 { (-MATE_SCORE + ply as i32, None) } else { (0, None) };
         }
 
         let mut best_move = None;
         let mut best_score = -INFINITY;
         let mut found_pv = false;
+        let side = self.board.side_to_move();
 
         for (mv, _) in moves {
             let old_board = self.board;
             self.board = self.board.make_move_new(mv);
-            let token = MoveCodec::move_to_token(&mv);
-            self.move_history.push(token as usize);
+            self.move_history.push(MoveCodec::move_to_token(&mv) as usize);
 
             let score = if !found_pv {
                 -self.alpha_beta(-beta, -alpha, depth - 1, ply + 1).0
             } else {
                 let s = -self.alpha_beta(-alpha - 1, -alpha, depth - 1, ply + 1).0;
-                if s > alpha && s < beta {
-                    -self.alpha_beta(-beta, -alpha, depth - 1, ply + 1).0
-                } else {
-                    s
-                }
+                if s > alpha && s < beta { -self.alpha_beta(-beta, -alpha, depth - 1, ply + 1).0 } else { s }
             };
 
             self.move_history.pop();
@@ -225,121 +179,70 @@ impl SearchWorker {
                     if self.board.piece_on(mv.get_dest()).is_none() {
                         self.killers[ply][1] = self.killers[ply][0];
                         self.killers[ply][0] = Some(mv);
+                        self.history[side as usize][mv.get_source().to_index()][mv.get_dest().to_index()] += (depth as i32) * (depth as i32);
                     }
-                    
-                    self.tt.store(TTEntry {
-                        hash,
-                        depth,
-                        score: best_score,
-                        flag: TTFlag::LowerBound,
-                        best_move: Some(mv),
-                    });
+                    self.tt.store(TTEntry { hash, depth, score: best_score, flag: TTFlag::LowerBound, best_move: Some(mv) });
                     return (best_score, Some(mv));
                 }
             }
         }
 
-        let flag = if best_score <= alpha {
-            TTFlag::UpperBound
-        } else {
-            TTFlag::Exact
-        };
-
-        self.tt.store(TTEntry {
-            hash,
-            depth,
-            score: best_score,
-            flag,
-            best_move,
-        });
-
+        let flag = if best_score <= alpha { TTFlag::UpperBound } else { TTFlag::Exact };
+        self.tt.store(TTEntry { hash, depth, score: best_score, flag, best_move });
         (best_score, best_move)
     }
 
     fn quiescence(&mut self, mut alpha: i32, beta: i32) -> i32 {
         self.nodes += 1;
-        let stand_pat = self.evaluate();
+        let stand_pat = eval::evaluate(&self.board);
         if stand_pat >= beta { return stand_pat; }
         if stand_pat > alpha { alpha = stand_pat; }
 
+        let in_check = self.board.checkers().popcnt() > 0;
         let moves = MoveGen::new_legal(&self.board);
-        let mut captures: Vec<(ChessMove, i32)> = moves
-            .filter(|m| self.board.piece_on(m.get_dest()).is_some())
-            .map(|m| (m, self.mvv_lva(m)))
-            .collect();
         
-        captures.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut moves_vec: Vec<(ChessMove, i32)> = if in_check {
+            moves.map(|m| (m, self.mvv_lva(m))).collect()
+        } else {
+            moves.filter(|m| self.board.piece_on(m.get_dest()).is_some()).map(|m| (m, self.mvv_lva(m))).collect()
+        };
+        
+        moves_vec.sort_by(|a, b| b.1.cmp(&a.1));
 
-        for (mv, _) in captures {
+        for (mv, _) in moves_vec {
             let old_board = self.board;
             self.board = self.board.make_move_new(mv);
             let score = -self.quiescence(-beta, -alpha);
             self.board = old_board;
-
             if score >= beta { return score; }
             if score > alpha { alpha = score; }
         }
-
         alpha
     }
 
-    fn evaluate(&self) -> i32 {
-        // Use Brain for static evaluation
-        match self.engine.forward(&self.move_history) {
-            Ok((_, val)) => {
-                let score = (val * 1000.0) as i32;
-                if self.board.side_to_move() == Color::White {
-                    score
-                } else {
-                    -score
-                }
-            },
-            Err(_) => 0,
-        }
-    }
-
-    fn order_moves(&self, moves: MoveGen, policy_scores: Option<&[f32]>, ply: usize) -> Vec<(ChessMove, i32)> {
-        let mut ordered_moves: Vec<(ChessMove, i32)> = moves.map(|mv| {
+    fn order_moves(&self, moves: MoveGen, policy: Option<&[f32]>, ply: usize, tt_move: Option<ChessMove>) -> Vec<(ChessMove, i32)> {
+        let side = self.board.side_to_move() as usize;
+        let mut ordered: Vec<_> = moves.map(|mv| {
             let mut score = 0;
-
-            if let Some(policy) = policy_scores {
-                let token = MoveCodec::move_to_token(&mv);
-                if (token as usize) < policy.len() {
-                    score += (policy[token as usize] * 1000.0) as i32;
-                }
+            if Some(mv) == tt_move { score += 100000; }
+            if let Some(p) = policy {
+                let tok = MoveCodec::move_to_token(&mv) as usize;
+                if tok < p.len() { score += (p[tok] * 10000.0) as i32; }
             }
-
-            if self.board.piece_on(mv.get_dest()).is_some() {
-                score += 2000 + self.mvv_lva(mv);
-            }
-
-            if Some(mv) == self.killers[ply][0] {
-                score += 1500;
-            } else if Some(mv) == self.killers[ply][1] {
-                score += 1000;
-            }
-
+            if self.board.piece_on(mv.get_dest()).is_some() { score += 20000 + self.mvv_lva(mv); }
+            if Some(mv) == self.killers[ply][0] { score += 15000; } else if Some(mv) == self.killers[ply][1] { score += 10000; }
+            score += self.history[side][mv.get_source().to_index()][mv.get_dest().to_index()] / 100;
             (mv, score)
         }).collect();
-
-        ordered_moves.sort_by(|a, b| b.1.cmp(&a.1));
-        ordered_moves
+        ordered.sort_by(|a, b| b.1.cmp(&a.1));
+        ordered
     }
 
     fn mvv_lva(&self, mv: ChessMove) -> i32 {
         let attacker = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
         let victim = self.board.piece_on(mv.get_dest()).unwrap_or(Piece::Pawn);
-        
-        let victim_val = match victim {
-            Piece::Pawn => 10, Piece::Knight => 30, Piece::Bishop => 30,
-            Piece::Rook => 50, Piece::Queen => 90, Piece::King => 100,
-        };
-        
-        let attacker_val = match attacker {
-            Piece::Pawn => 1, Piece::Knight => 3, Piece::Bishop => 3,
-            Piece::Rook => 5, Piece::Queen => 9, Piece::King => 10,
-        };
-
-        victim_val - attacker_val
+        let v_val = match victim { Piece::Pawn => 10, Piece::Knight => 30, Piece::Bishop => 30, Piece::Rook => 50, Piece::Queen => 90, Piece::King => 100 };
+        let a_val = match attacker { Piece::Pawn => 1, Piece::Knight => 3, Piece::Bishop => 3, Piece::Rook => 5, Piece::Queen => 9, Piece::King => 10 };
+        v_val - a_val
     }
 }

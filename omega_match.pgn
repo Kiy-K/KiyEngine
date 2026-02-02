@@ -1,0 +1,115 @@
+[Event "?"]
+[Site "?"]
+[Date "2026.02.02"]
+[Round "1"]
+[White "KiyEngine_V4_Omega"]
+[Black "Stockfish"]
+[Result "0-1"]
+[ECO "A00"]
+[GameDuration "00:01:02"]
+[GameEndTime "2026-02-02T17:31:50.221 +07"]
+[GameStartTime "2026-02-02T17:30:48.163 +07"]
+[Opening "Mieses Opening"]
+[PlyCount "2"]
+[Termination "time forfeit"]
+[TimeControl "40/60"]
+
+1. d3 {-1.45/4 60s} d5 {+0.22/20 1.9s, White loses on time} 0-1
+
+[Event "?"]
+[Site "?"]
+[Date "2026.02.02"]
+[Round "1"]
+[White "KiyEngine_V4_Omega"]
+[Black "Stockfish"]
+[Result "0-1"]
+[ECO "A00"]
+[GameDuration "00:00:17"]
+[GameEndTime "2026-02-02T17:52:16.432 +07"]
+[GameStartTime "2026-02-02T17:51:58.970 +07"]
+[Opening "Anderssen's Opening"]
+[PlyCount "10"]
+[TimeControl "40/60"]
+
+1. a3 {-0.51/2 3.0s} e5 {+0.09/23 1.6s} 2. f4 {-1.19/2 2.9s}
+exf4 {+1.45/19 0.67s} 3. Nc3 {-1.19/2 2.7s} Qh4+ {+4.85/19 0.79s}
+4. g3 {+2.66/3 2.6s} fxg3 {+4.98/21 0.75s} 5. Nb1 {0.00/2 2.5s}
+g2# {+M1/245 0.010s, Black mates} 0-1
+
+[Event "?"]
+[Site "?"]
+[Date "2026.02.02"]
+[Round "1"]
+[White "Stockfish"]
+[Black "KiyEngine_V4_Omega"]
+[Result "1-0"]
+[ECO "B06"]
+[GameDuration "00:00:48"]
+[GameEndTime "2026-02-02T17:53:05.153 +07"]
+[GameStartTime "2026-02-02T17:52:16.433 +07"]
+[Opening "Robatsch (Modern) defense"]
+[PlyCount "33"]
+[TimeControl "40/60"]
+
+1. e4 {+0.46/23 1.6s} g6 {-8.53/2 3.0s} 2. d4 {+0.73/21 1.7s} e5 {-8.53/2 2.9s}
+3. dxe5 {+1.96/17 0.44s} Bb4+ {-8.26/2 2.7s} 4. Bd2 {+2.77/21 1.3s}
+Bxd2+ {-4.50/2 2.6s} 5. Qxd2 {+2.70/21 1.1s} g5 {-8.34/2 2.4s}
+6. Nc3 {+4.02/19 0.73s} Na6 {-8.57/2 2.3s} 7. Bxa6 {+4.75/19 0.74s}
+bxa6 {-8.57/2 2.2s} 8. O-O-O {+4.82/22 0.80s} Rb8 {-8.57/2 2.1s}
+9. h4 {+5.06/19 0.85s} Rb7 {+1.79/1 2.0s} 10. hxg5 {+5.67/21 0.99s}
+Qxg5 {-8.57/2 1.9s} 11. Qxg5 {+10.89/21 0.85s} d6 {0.00/1 1.8s}
+12. Qg7 {+13.28/21 1.0s} Ne7 {+1.19/1 1.7s} 13. Qxh8+ {+38.76/21 1.1s}
+Ng8 {-8.57/2 1.6s} 14. Qxg8+ {+M9/76 0.89s} Kd7 {-8.57/2 1.5s}
+15. Qxf7+ {+M7/122 0.90s} Kd8 {-8.82/2 1.5s} 16. Rxh7 {+M3/245 0.032s}
+Bf5 {-299.98/4 1.4s} 17. Rh8# {+M1/245 0.008s, White mates} 1-0
+
+[Event "?"]
+[Site "?"]
+[Date "2026.02.02"]
+[Round "2"]
+[White "KiyEngine_V4_Omega"]
+[Black "Stockfish"]
+[Result "0-1"]
+[ECO "A00"]
+[GameDuration "00:00:33"]
+[GameEndTime "2026-02-02T17:53:39.017 +07"]
+[GameStartTime "2026-02-02T17:53:05.154 +07"]
+[Opening "Anderssen's Opening"]
+[PlyCount "20"]
+[TimeControl "40/60"]
+
+1. a3 {-0.51/2 3.0s} e5 {+0.09/23 1.6s} 2. f4 {-1.19/2 2.9s}
+exf4 {+1.45/19 0.68s} 3. Nc3 {-1.19/2 2.7s} Qh4+ {+4.85/19 0.79s}
+4. g3 {+2.66/3 2.6s} fxg3 {+4.98/21 0.79s} 5. Bg2 {0.00/2 2.5s}
+gxh2+ {+4.88/21 1.3s} 6. Kf1 {-1.56/2 2.3s} hxg1=Q+ {+4.94/19 0.94s}
+7. Rxg1 {-1.56/2 2.2s} Nf6 {+5.64/22 2.1s} 8. Bxb7 {+8.18/1 2.1s}
+Bxb7 {+8.82/20 0.78s} 9. Nb1 {+8.16/1 2.0s} Ne4 {+M19/48 0.74s}
+10. Rxg7 {-0.51/2 1.9s} Qf2# {+M1/245 0.012s, Black mates} 0-1
+
+[Event "?"]
+[Site "?"]
+[Date "2026.02.02"]
+[Round "2"]
+[White "Stockfish"]
+[Black "KiyEngine_V4_Omega"]
+[Result "1-0"]
+[ECO "B06"]
+[GameDuration "00:00:48"]
+[GameEndTime "2026-02-02T17:54:27.707 +07"]
+[GameStartTime "2026-02-02T17:53:39.017 +07"]
+[Opening "Robatsch (Modern) defense"]
+[PlyCount "33"]
+[TimeControl "40/60"]
+
+1. e4 {+0.46/23 1.5s} g6 {-8.53/2 3.0s} 2. d4 {+0.73/21 1.7s} e5 {-8.53/2 2.9s}
+3. dxe5 {+1.96/17 0.48s} Bb4+ {-8.26/2 2.7s} 4. Bd2 {+2.77/21 1.3s}
+Bxd2+ {-4.50/2 2.6s} 5. Qxd2 {+2.70/21 1.1s} g5 {-8.34/2 2.4s}
+6. Nc3 {+4.02/19 0.76s} Na6 {-8.57/2 2.3s} 7. Bxa6 {+4.75/19 0.76s}
+bxa6 {-8.57/2 2.2s} 8. O-O-O {+4.82/22 0.79s} Rb8 {-8.57/2 2.1s}
+9. h4 {+5.06/19 0.82s} Rb7 {+1.79/1 2.0s} 10. hxg5 {+5.67/21 1.0s}
+Qxg5 {-8.57/2 1.9s} 11. Qxg5 {+10.89/21 0.85s} d6 {0.00/1 1.8s}
+12. Qg7 {+13.28/21 1.0s} Ne7 {+1.19/1 1.7s} 13. Qxh8+ {+40.35/20 0.98s}
+Ng8 {-8.57/2 1.6s} 14. Qxg8+ {+M9/77 0.90s} Kd7 {-8.57/2 1.5s}
+15. Qxf7+ {+M7/127 0.92s} Kd8 {-8.82/2 1.5s} 16. Rxh7 {+M3/245 0.021s}
+Bf5 {-299.98/4 1.4s} 17. Rh8# {+M1/245 0.018s, White mates} 1-0
+

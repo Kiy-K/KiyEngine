@@ -1,4 +1,4 @@
-// src/uci.rs
+// src/uci/mod.rs
 
 use crate::engine::Engine;
 use crate::search::{Searcher, TranspositionTable};
@@ -121,7 +121,7 @@ impl UciHandler {
         let parts: Vec<&str> = command.split_whitespace().collect();
         match parts.get(0).copied() {
             Some("uci") => {
-                println!("id name KiyEngine V4 Omega");
+                println!("id name KiyEngine V4.1.2 Omega");
                 println!("id author Khoi");
                 println!("uciok");
             }
@@ -210,7 +210,7 @@ impl UciHandler {
         let my_inc = if self.board.side_to_move() == chess::Color::White { winc } else { binc };
 
         if let Some(ms) = my_time {
-            let think_time = ms / 20 + my_inc / 2;
+            let think_time = ms / 25 + my_inc / 2; // Slightly more conservative time management
             let stop_flag = Arc::clone(&self.stop_flag);
             
             std::thread::spawn(move || {
