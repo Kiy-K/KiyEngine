@@ -1,5 +1,5 @@
-use kiy_engine_v4_omega::engine::Engine;
 use candle_core::Device;
+use kiy_engine_v4_omega::engine::Engine;
 
 fn main() -> anyhow::Result<()> {
     let device = Device::Cpu;
@@ -7,11 +7,7 @@ fn main() -> anyhow::Result<()> {
     let engine = Engine::new()?;
     println!("Engine loaded.");
 
-    let test_cases = vec![
-        vec![0],
-        vec![100, 200, 300],
-        vec![10, 20, 30, 40, 50],
-    ];
+    let test_cases = vec![vec![0], vec![100, 200, 300], vec![10, 20, 30, 40, 50]];
 
     for tokens in test_cases {
         println!("\n--- Testing sequence: {:?} ---", tokens);
@@ -20,6 +16,6 @@ fn main() -> anyhow::Result<()> {
         println!("Best Move ID: {}", best_move_id);
         println!("Evaluation Score: {:.4}", eval);
     }
-    
+
     Ok(())
 }

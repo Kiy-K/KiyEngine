@@ -2,8 +2,8 @@
 
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{Embedding, Linear, Module, VarBuilder};
-use std::fs::File;
 use memmap2::Mmap;
+use std::fs::File;
 
 pub const VOCAB_SIZE: usize = 4608;
 pub const CONTEXT_LENGTH: usize = 32;
@@ -30,7 +30,11 @@ impl BitLinear {
         // Pre-quantize/clamp might happen here, but for now we follow the trained weights.
         let weight_t = weight.t()?.contiguous()?;
         let rms_norm_weight = vb.get((in_dim,), &format!("{}.norm.weight", prefix))?;
-        Ok(Self { weight_t, rms_norm_weight, eps: 1e-5 })
+        Ok(Self {
+            weight_t,
+            rms_norm_weight,
+            eps: 1e-5,
+        })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -50,7 +54,7 @@ impl ValueHead {
         let norm_weight = vb.get((D_MODEL,), "value_head.0.weight")?;
         let linear1_w = vb.get((512, D_MODEL), "value_head.1.weight")?;
         let linear2_w = vb.get((1, 512), "value_head.3.weight")?;
-        Ok(Self { 
+        Ok(Self {
             norm_weight,
             linear1: Linear::new(linear1_w, None),
             linear2: Linear::new(linear2_w, None),
@@ -74,7 +78,10 @@ impl PolicyHead {
     pub fn load(vb: &VarBuilder) -> Result<Self> {
         let norm_weight = vb.get((D_MODEL,), "policy_head.0.weight")?;
         let linear_w = vb.get((VOCAB_SIZE, D_MODEL), "policy_head.1.weight")?;
-        Ok(Self { norm_weight, linear: Linear::new(linear_w, None) })
+        Ok(Self {
+            norm_weight,
+            linear: Linear::new(linear_w, None),
+        })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -114,27 +121,41 @@ impl Engine {
 
         let mut layers = Vec::with_capacity(NUM_LAYERS);
         for i in 0..NUM_LAYERS {
-            layers.push(BitLinear::load(&format!("layers.{}.linear", i), &vb, D_MODEL, D_MODEL)?);
+            layers.push(BitLinear::load(
+                &format!("layers.{}.linear", i),
+                &vb,
+                D_MODEL,
+                D_MODEL,
+            )?);
         }
 
         let policy_head = PolicyHead::load(&vb)?;
         let value_head = ValueHead::load(&vb)?;
 
-        Ok(Self { embedding, pos_embed, layers, policy_head, value_head, device })
+        Ok(Self {
+            embedding,
+            pos_embed,
+            layers,
+            policy_head,
+            value_head,
+            device,
+        })
     }
 
     pub fn forward(&self, tokens: &[usize]) -> Result<(Tensor, f32)> {
         let seq_len = tokens.len();
-        if seq_len == 0 { return Err(candle_core::Error::Msg("Empty tokens".to_string())); }
-        
+        if seq_len == 0 {
+            return Err(candle_core::Error::Msg("Empty tokens".to_string()));
+        }
+
         // Take at most CONTEXT_LENGTH tokens
         let take_len = seq_len.min(CONTEXT_LENGTH);
         let tokens_slice = &tokens[seq_len - take_len..];
-        
+
         let tokens_u32: Vec<u32> = tokens_slice.iter().map(|&t| t as u32).collect();
         let tokens_tensor = Tensor::new(tokens_u32.as_slice(), &self.device)?.unsqueeze(0)?;
         let mut x = self.embedding.forward(&tokens_tensor)?;
-        
+
         let pos_slice = self.pos_embed.narrow(1, 0, take_len)?;
         x = x.broadcast_add(&pos_slice)?;
 
@@ -145,7 +166,11 @@ impl Engine {
 
         let last_token_x = x.narrow(1, take_len - 1, 1)?.squeeze(1)?;
         let policy_logits = self.policy_head.forward(&last_token_x)?.squeeze(0)?;
-        let value_out = self.value_head.forward(&last_token_x)?.squeeze(0)?.squeeze(0)?;
+        let value_out = self
+            .value_head
+            .forward(&last_token_x)?
+            .squeeze(0)?
+            .squeeze(0)?;
         let eval_score = value_out.tanh()?.to_scalar::<f32>()?;
 
         Ok((policy_logits, eval_score))

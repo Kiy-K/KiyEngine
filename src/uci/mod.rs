@@ -1,13 +1,13 @@
 // src/uci/mod.rs
 
+use crate::book::OpeningBook;
 use crate::engine::Engine;
 use crate::search::{Searcher, TranspositionTable};
-use crate::book::OpeningBook;
 use chess::{Board, ChessMove, MoveGen, Square};
 use std::io::{self, BufRead};
 use std::str::FromStr;
-use std::sync::{Arc, mpsc};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 pub struct MoveCodec;
@@ -17,7 +17,7 @@ impl MoveCodec {
         let from = mv.get_source().to_int();
         let to = mv.get_dest().to_int();
         let base_token = (from as u32 * 64) + to as u32;
-        
+
         if let Some(promo) = mv.get_promotion() {
             let piece_idx = match promo {
                 chess::Piece::Knight => 0,
@@ -38,7 +38,7 @@ impl MoveCodec {
             let to_idx = token % 64;
             let from = unsafe { Square::new(from_idx as u8) };
             let to = unsafe { Square::new(to_idx as u8) };
-            
+
             let mv = ChessMove::new(from, to, None);
             if board.legal(mv) {
                 return Some(mv);
@@ -52,7 +52,7 @@ impl MoveCodec {
             let piece_idx = promo_part / 64;
             let to_idx = promo_part % 64;
             let to = unsafe { Square::new(to_idx as u8) };
-            
+
             let piece = match piece_idx {
                 0 => chess::Piece::Knight,
                 1 => chess::Piece::Bishop,
@@ -60,7 +60,7 @@ impl MoveCodec {
                 3 => chess::Piece::Queen,
                 _ => chess::Piece::Queen,
             };
-            
+
             let move_gen = MoveGen::new_legal(board);
             for mv in move_gen {
                 if mv.get_dest() == to && mv.get_promotion() == Some(piece) {
@@ -89,13 +89,13 @@ impl UciHandler {
         let searcher = Searcher::new(Arc::clone(&engine), Arc::clone(&tt));
         let book = OpeningBook::open("book.bin");
         let (tx, rx) = mpsc::channel();
-        
+
         std::thread::spawn(move || {
             while let Ok(msg) = rx.recv() {
                 println!("{}", msg);
             }
         });
-        
+
         Ok(Self {
             searcher,
             tt,
@@ -112,7 +112,9 @@ impl UciHandler {
         for line in stdin.lock().lines() {
             let Ok(cmd) = line else { break };
             let cmd = cmd.trim();
-            if cmd.is_empty() { continue; }
+            if cmd.is_empty() {
+                continue;
+            }
             self.handle_command(cmd);
         }
     }
@@ -152,7 +154,7 @@ impl UciHandler {
     fn handle_position(&mut self, parts: &[&str]) {
         self.move_history.clear();
         let mut i = 0;
-        
+
         if parts.get(0) == Some(&"startpos") {
             self.board = Board::default();
             i = 1;
@@ -183,7 +185,7 @@ impl UciHandler {
 
     fn handle_go(&mut self, parts: &[&str]) {
         self.stop_flag.store(false, Ordering::SeqCst);
-        
+
         if let Some(mv) = self.book.get_move(&self.board) {
             let _ = self.tx_move.send(format!("bestmove {}", mv));
             return;
@@ -206,13 +208,21 @@ impl UciHandler {
             }
         }
 
-        let my_time = if self.board.side_to_move() == chess::Color::White { wtime } else { btime };
-        let my_inc = if self.board.side_to_move() == chess::Color::White { winc } else { binc };
+        let my_time = if self.board.side_to_move() == chess::Color::White {
+            wtime
+        } else {
+            btime
+        };
+        let my_inc = if self.board.side_to_move() == chess::Color::White {
+            winc
+        } else {
+            binc
+        };
 
         if let Some(ms) = my_time {
             let think_time = ms / 25 + my_inc / 2; // Slightly more conservative time management
             let stop_flag = Arc::clone(&self.stop_flag);
-            
+
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(think_time));
                 stop_flag.store(true, Ordering::SeqCst);
