@@ -1,4 +1,5 @@
 # ♟️ KiyEngine V4.3.1 Omega
+[![Build and Release](https://github.com/Kiy-K/KiyEngine/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/Kiy-K/KiyEngine/actions/workflows/release.yml)
 
 **KiyEngine V4.3.1 Omega** (codenamed *Tactical Monster*) is a high-performance, open-source UCI chess engine written in Rust. It features a state-of-the-art **BitNet Transformer** architecture for evaluation and a highly optimized tactical search engine.
 
