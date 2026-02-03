@@ -1,32 +1,34 @@
-# ♟️ KiyEngine V4.3.1 Omega
+# ♟️ KiyEngine V4.4.2 Titan
 [![Build and Release](https://github.com/Kiy-K/KiyEngine/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/Kiy-K/KiyEngine/actions/workflows/release.yml)
 
-**KiyEngine V4.3.1 Omega** (codenamed *Tactical Monster*) is a high-performance, open-source UCI chess engine written in Rust. It features a state-of-the-art **BitNet Transformer** architecture for evaluation and a highly optimized tactical search engine.
+**KiyEngine V4.4.2 Titan** is a high-performance, open-source UCI chess engine written in Rust. It features a **BitNet 1.58-bit Transformer** architecture for evaluation and a highly optimized tactical search engine with AVX-512 acceleration and Lazy SMP.
 
 ---
 
-## 🌟 Key Features
+## 🌟 Key Features (V4.4.2)
 
 ### 1. 🧠 BitNet 1.58-bit Architecture
-The engine utilizes a pure Transformer model with **BitNet Linear** layers.
-- **Strictly Ternary Weights**: Weights are constrained to `{-1, 0, 1}` following the 1.58-bit discrete format.
-- **Discrete Math Optimization**: The inference core is optimized for addition and subtraction, maximizing efficiency on modern CPUs.
+The engine utilizes a Transformer model with **BitNet Linear** layers.
+- **Strictly Ternary Weights**: Weights are quantized to strict `{-1.0, 0.0, 1.0}` following the 1.58-bit discrete format.
+- **SIMD-Optimized Inference**: AVX-512/AVX2 kernels perform ternary GEMM using pure addition/subtraction masks, maximizing CPU efficiency.
 
-### 2. 🔍 Tactical Search Overhaul
-- **Deep Quiescence Search (QS)**: Explores all captures *and* checks until a stable position is reached, eliminating the horizon effect in critical tactical lines.
-- **Principal Variation Search (PVS)**: Refined PVS with **Aspiration Windows** to focus search power on the most promising moves.
-- **Iterative Deepening**: Dynamically explores depths 1 to 25+, ensuring the best move is found within time limits.
+### 2. 🔍 Tactical Search with Lazy SMP
+- **Deep Quiescence Search (QS)**: Explores all captures *and* checks until a stable position is reached, reducing the horizon effect in critical tactical lines.
+- **Principal Variation Search (PVS)**: PVS with **aspiration windows** to focus search power on the most promising moves.
+- **Lazy SMP**: Multiple threads share a cache-friendly bucketed Transposition Table, with the main thread searching full depth and helpers feeding TT.
 
-### 3. 🎯 Neural-Heuristic Move Ordering
+### 3. 🎯 Neural-Heuristic Move Ordering (Anti-a2a3)
 A sophisticated hybrid ordering system:
 1. **TT Move**: Best move from the Transposition Table.
-2. **Top-3 AI Moves**: Highest probability moves from the Omega brain's policy head.
+2. **Policy-Guided Moves**: Highest probability moves from the BitNet policy head (scaled down in the opening to avoid overconfidence in side moves).
 3. **MVV-LVA**: Most Valuable Victim - Least Valuable Attacker for captures.
 4. **Killer & History Heuristics**: Pruning non-tactical paths based on search history.
+5. **Opening Centralization Bonus**: Early moves towards `d4/e4/d5/e5` are slightly favored in ordering to encourage central play.
 
 ### 4. ⚖️ Advanced Evaluation
-- **Centipawn Mapping**: Neural value head output is scaled to Centipawns (x1000).
-- **King Safety Heuristic**: Detects and penalizes vulnerabilities around the king's zone to ensure defensive stability.
+- **Classical + Neural Hybrid**: A classical bitboard evaluation (material, PST, pawn structure) is combined with BitNet-guided search.
+- **Enhanced King Safety**: Detects attackers in the king zone, rewards pawn shields, and penalizes open files near the king.
+- **Pawn Structure**: Penalizes doubled/isolated pawns, rewards passed pawns more as they advance.
 
 ---
 
@@ -55,6 +57,8 @@ KiyEngine is a standard UCI engine and can be used with any chess GUI (e.g., Are
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `Hash` | spin | 512 | Transposition Table size in Megabytes (MB). |
+| `Threads` | spin | 1 | Number of search threads (Lazy SMP). |
+| `Move Overhead` | spin | 30 | Time buffer in milliseconds to avoid flagging in network/GUI latency. |
 
 ### Example UCI Commands
 ```uci
