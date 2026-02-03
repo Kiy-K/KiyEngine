@@ -19,7 +19,7 @@ fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
 }
 
 pub struct BitLinear {
-    pub weight_ternary: Vec<f32>, // Pre-quantized {-1, 0, 1}
+    pub weight_ternary: Vec<f32>, // Pre-quantized strict {-1.0, 0.0, 1.0}
     pub in_dim: usize,
     pub out_dim: usize,
     pub rms_norm_weight: Tensor,
@@ -29,9 +29,22 @@ pub struct BitLinear {
 impl BitLinear {
     pub fn load(prefix: &str, vb: &VarBuilder, in_dim: usize, out_dim: usize) -> Result<Self> {
         let weight = vb.get((out_dim, in_dim), &format!("{}.weight", prefix))?;
-        // Pre-quantize and convert to flat Vec for SIMD optimization
-        let weight_ternary = weight.clamp(-1.0, 1.0)?.round()?.to_vec2::<f32>()?
-            .into_iter().flatten().collect();
+        // Pre-quantize to strict ternary {-1.0, 0.0, 1.0} for BitNet.
+        // This avoids small residual floats and makes SIMD masks exact.
+        let raw = weight.to_vec2::<f32>()?;
+        let mut weight_ternary = Vec::with_capacity(out_dim * in_dim);
+        for row in raw {
+            for w in row {
+                let q = if w > 0.0 {
+                    1.0
+                } else if w < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                };
+                weight_ternary.push(q);
+            }
+        }
             
         let rms_norm_weight = vb.get((in_dim,), &format!("{}.norm.weight", prefix))?;
         Ok(Self {

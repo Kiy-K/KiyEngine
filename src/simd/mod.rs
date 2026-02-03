@@ -6,7 +6,7 @@ use std::arch::x86_64::*;
 
 /// BitNet Ternary Gemm optimized for AVX-512.
 /// Calculates: output = input * weights_t
-/// where weights_t are expected to be {-1, 0, 1}.
+/// where weights_t are strict {-1.0, 0.0, 1.0}.
 /// This implementation uses SIMD to parallelize the addition/subtraction.
 pub fn bitnet_ternary_gemm_avx512(input: &[f32], weights_t: &[f32], output: &mut [f32], in_dim: usize, out_dim: usize) {
     #[cfg(target_feature = "avx512f")]
@@ -21,10 +21,12 @@ pub fn bitnet_ternary_gemm_avx512(input: &[f32], weights_t: &[f32], output: &mut
                 let x_vec = _mm512_loadu_ps(input.as_ptr().add(j));
                 let w_vec = _mm512_loadu_ps(weights_t.as_ptr().add(row_offset + j));
                 
-                // BitNet optimization: ternary weights {-1, 0, 1}
-                // We use masks to determine where to add or subtract
-                let pos_mask = _mm512_cmp_ps_mask(w_vec, _mm512_set1_ps(0.5), _CMP_GT_OQ);
-                let neg_mask = _mm512_cmp_ps_mask(w_vec, _mm512_set1_ps(-0.5), _CMP_LT_OQ);
+                // BitNet optimization: ternary weights {-1.0, 0.0, 1.0}.
+                // We use masks to determine where to add or subtract.
+                // Thanks to strict quantization in BitLinear::load, we can
+                // compare against 0.0 instead of using loose thresholds.
+                let pos_mask = _mm512_cmp_ps_mask(w_vec, _mm512_set1_ps(0.0), _CMP_GT_OQ);
+                let neg_mask = _mm512_cmp_ps_mask(w_vec, _mm512_set1_ps(0.0), _CMP_LT_OQ);
                 
                 // Add where W > 0.5 (W=1)
                 sum_vec = _mm512_mask_add_ps(sum_vec, pos_mask, sum_vec, x_vec);
@@ -40,9 +42,9 @@ pub fn bitnet_ternary_gemm_avx512(input: &[f32], weights_t: &[f32], output: &mut
             // Tail cleanup
             while j < in_dim {
                 let w = weights_t[row_offset + j];
-                if w > 0.5 {
+                if w > 0.0 {
                     output[i] += input[j];
-                } else if w < -0.5 {
+                } else if w < 0.0 {
                     output[i] -= input[j];
                 }
                 j += 1;
@@ -83,10 +85,11 @@ pub fn bitnet_ternary_gemm_avx2(input: &[f32], weights_t: &[f32], output: &mut [
                 let x_vec = _mm256_loadu_ps(input.as_ptr().add(j));
                 let w_vec = _mm256_loadu_ps(weights_t.as_ptr().add(row_offset + j));
                 
-                // AVX2 doesn't have direct mask add/sub like AVX-512
-                // We calculate masks as floats and multiply
-                let pos_mask = _mm256_cmp_ps(w_vec, _mm256_set1_ps(0.5), _CMP_GT_OQ);
-                let neg_mask = _mm256_cmp_ps(w_vec, _mm256_set1_ps(-0.5), _CMP_LT_OQ);
+                // AVX2 doesn't have direct mask add/sub like AVX-512.
+                // We calculate masks as floats and multiply. With strictly
+                // quantized weights, comparing to 0.0 is sufficient.
+                let pos_mask = _mm256_cmp_ps(w_vec, _mm256_set1_ps(0.0), _CMP_GT_OQ);
+                let neg_mask = _mm256_cmp_ps(w_vec, _mm256_set1_ps(0.0), _CMP_LT_OQ);
                 
                 let added = _mm256_and_ps(x_vec, pos_mask);
                 let subbed = _mm256_and_ps(x_vec, neg_mask);
@@ -105,9 +108,9 @@ pub fn bitnet_ternary_gemm_avx2(input: &[f32], weights_t: &[f32], output: &mut [
             // Tail cleanup
             while j < in_dim {
                 let w = weights_t[row_offset + j];
-                if w > 0.5 {
+                if w > 0.0 {
                     output[i] += input[j];
-                } else if w < -0.5 {
+                } else if w < 0.0 {
                     output[i] -= input[j];
                 }
                 j += 1;

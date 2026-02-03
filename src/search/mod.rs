@@ -4,8 +4,7 @@ pub mod eval;
 
 use crate::engine::Engine;
 use crate::uci::MoveCodec;
-use chess::{Board, ChessMove, MoveGen, Piece};
-use dashmap::DashMap;
+use chess::{Board, ChessMove, MoveGen, Piece, Square};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
@@ -19,7 +18,7 @@ pub enum TTFlag {
     UpperBound,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Copy)]
 pub struct TTEntry {
     pub hash: u64,
     pub depth: u8,
@@ -28,35 +27,97 @@ pub struct TTEntry {
     pub best_move: Option<ChessMove>,
 }
 
-use parking_lot::RwLock;
+const TT_BUCKET_SIZE: usize = 4;
+
+#[derive(Clone, Debug)]
+struct TTBucket {
+    entries: [Option<TTEntry>; TT_BUCKET_SIZE],
+}
+
+impl TTBucket {
+    fn new() -> Self {
+        Self {
+            entries: [None, None, None, None],
+        }
+    }
+}
+
+use parking_lot::Mutex;
 
 pub struct TranspositionTable {
-    table: RwLock<DashMap<u64, TTEntry>>,
+    buckets: Vec<Mutex<TTBucket>>,
 }
 
 impl TranspositionTable {
     pub fn new() -> Self {
-        // Default 512MB: ~16M entries * ~32 bytes
-        Self {
-            table: RwLock::new(DashMap::with_capacity(16_000_000)),
-        }
+        // Default 512MB: ~16M entries * ~32 bytes, bucketed
+        let default_entries = 16_000_000usize;
+        let buckets = (default_entries / TT_BUCKET_SIZE).max(1);
+        let buckets = (0..buckets).map(|_| Mutex::new(TTBucket::new())).collect();
+        Self { buckets }
     }
 
     pub fn resize(&self, mb: usize) {
-        // Each entry is roughly 32 bytes.
-        let entries = (mb * 1024 * 1024) / 32;
-        let mut table = self.table.write();
-        *table = DashMap::with_capacity(entries);
+        // For now we keep the fixed bucket count (cache-friendly layout)
+        // and interpret resize as "clear all entries". This avoids unsafe
+        // interior mutation of the buckets vector while still respecting
+        // the user's intent to flush the TT when changing Hash size.
+        let _ = mb; // unused, kept for API compatibility
+        self.clear();
     }
 
     pub fn get(&self, hash: u64) -> Option<TTEntry> {
-        self.table.read().get(&hash).map(|r| r.clone())
+        let len = self.buckets.len();
+        if len == 0 {
+            return None;
+        }
+        let idx = (hash as usize) % len;
+        let bucket = self.buckets[idx].lock();
+        for entry in bucket.entries.iter() {
+            if let Some(e) = entry {
+                if e.hash == hash {
+                    return Some(*e);
+                }
+            }
+        }
+        None
     }
     pub fn store(&self, entry: TTEntry) {
-        self.table.read().insert(entry.hash, entry);
+        let len = self.buckets.len();
+        if len == 0 {
+            return;
+        }
+        let idx = (entry.hash as usize) % len;
+        let mut bucket = self.buckets[idx].lock();
+
+        // Try to replace an empty slot first.
+        for slot in bucket.entries.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(entry);
+                return;
+            }
+        }
+
+        // Otherwise replace the entry with the lowest depth (shallowest).
+        let mut replace_idx = 0;
+        let mut lowest_depth = u8::MAX;
+        for (i, slot) in bucket.entries.iter().enumerate() {
+            if let Some(e) = slot {
+                if e.depth < lowest_depth {
+                    lowest_depth = e.depth;
+                    replace_idx = i;
+                }
+            }
+        }
+        bucket.entries[replace_idx] = Some(entry);
     }
     pub fn clear(&self) {
-        self.table.read().clear();
+        for bucket in &self.buckets {
+            let mut b = bucket.lock();
+            for slot in b.entries.iter_mut() {
+                *slot = None;
+            }
+        }
     }
 }
 
@@ -101,7 +162,15 @@ impl Searcher {
         let is_white = board.side_to_move() == chess::Color::White;
 
         std::thread::spawn(move || {
-            let time_manager = Arc::new(TimeManager::new(wtime, btime, winc, binc, movestogo, move_overhead, is_white));
+            let time_manager = Arc::new(TimeManager::new(
+                wtime,
+                btime,
+                winc,
+                binc,
+                movestogo,
+                move_overhead,
+                is_white,
+            ));
             let mut handles = vec![];
             
             for i in 0..num_threads {
@@ -120,7 +189,17 @@ impl Searcher {
                     let mut last_score = 0;
                     let start_time = std::time::Instant::now();
 
-                    for depth in 1..=max_depth {
+                    // Lazy SMP depth adjustment:
+                    // - Main thread searches full depth.
+                    // - Helper threads search slightly reduced max depth to
+                    //   feed TT quickly with reasonably good information.
+                    let local_max_depth = if is_main {
+                        max_depth
+                    } else {
+                        max_depth.saturating_sub(1)
+                    };
+
+                    for depth in 1..=local_max_depth {
                         if worker.stop_flag.load(Ordering::Relaxed) || tm_clone.should_stop() {
                             break;
                         }
@@ -438,11 +517,14 @@ impl SearchWorker {
                     total_score += 10_000_000;
                 }
                 
-                // 2. Neural Policy (Top 3 Priority)
+                // 2. Neural Policy (scaled down in early game)
                 if let Some(p) = policy {
                     let tok = MoveCodec::move_to_token(&mv) as usize;
                     if tok < p.len() {
-                        p_score = (p[tok] * 100_000.0) as i32;
+                        // In the opening phase we trust policy less to avoid
+                        // over-valuing quiet/side moves like a3, h3, etc.
+                        let scale = if ply < 20 { 25_000.0 } else { 100_000.0 };
+                        p_score = (p[tok] * scale) as i32;
                         total_score += p_score;
                     }
                 }
@@ -461,6 +543,21 @@ impl SearchWorker {
                 
                 // 5. History
                 total_score += self.history[side][mv.get_source().to_index()][mv.get_dest().to_index()];
+
+                // 6. Opening centralization bonus in move ordering:
+                // Prefer moves that move pieces towards central squares
+                // in the first ~10 plies.
+                if ply < 20 {
+                    let dest = mv.get_dest();
+                    let to_center = matches!(
+                        dest,
+                        Square::D4 | Square::E4 | Square::D5 | Square::E5
+                    );
+                    if to_center {
+                        // Small bonus to prefer centralizing moves in ordering.
+                        total_score += 5_000;
+                    }
+                }
                 
                 (mv, p_score, total_score)
             })
