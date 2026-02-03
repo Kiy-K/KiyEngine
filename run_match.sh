@@ -2,10 +2,10 @@
 set -e
 
 # Configuration
-ENGINE_BIN="./target/release/kiy_engine_v4_omega"
+ENGINE_BIN="/home/khoi/Workspace/KiyEngine/target/release/kiy_engine_v4_omega"
 CUTECHESS="/home/khoi/cutechess/build/cutechess-cli"
 STOCKFISH="/usr/games/stockfish"
-MODEL_FILE="kiyengine_v4.safetensors"
+MODEL_FILE="/home/khoi/Workspace/KiyEngine/kiyengine_v4_omega_158.safetensors"
 TC="40/60" # Blitz: 60 seconds for 40 moves
 GAMES=2
 

@@ -19,7 +19,9 @@ fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
 }
 
 pub struct BitLinear {
-    pub weight_t: Tensor,
+    pub weight_ternary: Vec<f32>, // Pre-quantized {-1, 0, 1}
+    pub in_dim: usize,
+    pub out_dim: usize,
     pub rms_norm_weight: Tensor,
     pub eps: f64,
 }
@@ -27,11 +29,15 @@ pub struct BitLinear {
 impl BitLinear {
     pub fn load(prefix: &str, vb: &VarBuilder, in_dim: usize, out_dim: usize) -> Result<Self> {
         let weight = vb.get((out_dim, in_dim), &format!("{}.weight", prefix))?;
-        // Pre-quantize/clamp might happen here, but for now we follow the trained weights.
-        let weight_t = weight.t()?.contiguous()?;
+        // Pre-quantize and convert to flat Vec for SIMD optimization
+        let weight_ternary = weight.clamp(-1.0, 1.0)?.round()?.to_vec2::<f32>()?
+            .into_iter().flatten().collect();
+            
         let rms_norm_weight = vb.get((in_dim,), &format!("{}.norm.weight", prefix))?;
         Ok(Self {
-            weight_t,
+            weight_ternary,
+            in_dim,
+            out_dim,
             rms_norm_weight,
             eps: 1e-5,
         })
@@ -39,11 +45,41 @@ impl BitLinear {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = rms_norm(x, &self.rms_norm_weight, self.eps)?;
-        // Strictly ternary weights (-1, 0, 1).
-        // In a real optimized BitNet kernel, we would use addition/subtraction.
-        // Here we use matmul but ensure the weights are quantized.
-        let weights = self.weight_t.clamp(-1.0, 1.0)?.round()?;
-        x.broadcast_matmul(&weights)
+        
+        let device = x.device();
+        if device.is_cpu() {
+            // Use custom SIMD kernels for CPU
+            let x_flat = x.flatten_all()?.to_vec1::<f32>()?;
+            let mut output = vec![0.0f32; self.out_dim];
+            
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx512f") {
+                    crate::simd::bitnet_ternary_gemm_avx512(&x_flat, &self.weight_ternary, &mut output, self.in_dim, self.out_dim);
+                } else if is_x86_feature_detected!("avx2") {
+                    crate::simd::bitnet_ternary_gemm_avx2(&x_flat, &self.weight_ternary, &mut output, self.in_dim, self.out_dim);
+                } else {
+                    // Optimized scalar fallback
+                    for i in 0..self.out_dim {
+                        let mut sum = 0.0;
+                        let row_offset = i * self.in_dim;
+                        for j in 0..self.in_dim {
+                            let w = self.weight_ternary[row_offset + j];
+                            if w > 0.5 { sum += x_flat[j]; }
+                            else if w < -0.5 { sum -= x_flat[j]; }
+                        }
+                        output[i] += sum;
+                    }
+                }
+            }
+            
+            Tensor::from_vec(output, (1, self.out_dim), device)
+        } else {
+            // Fallback for CUDA/Other devices (use standard MatMul)
+            // Note: In a production V4.4, we would also have a CUDA kernel for this.
+            let weights_tensor = Tensor::from_vec(self.weight_ternary.clone(), (self.out_dim, self.in_dim), device)?.t()?;
+            x.broadcast_matmul(&weights_tensor)
+        }
     }
 }
 

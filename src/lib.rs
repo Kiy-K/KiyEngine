@@ -5,4 +5,5 @@
 pub mod book;
 pub mod engine;
 pub mod search;
+pub mod simd;
 pub mod uci;

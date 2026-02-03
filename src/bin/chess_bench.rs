@@ -37,11 +37,12 @@ fn main() -> anyhow::Result<()> {
 
         let board = Board::from_str(fen).map_err(|e| anyhow::anyhow!("FEN error: {:?}", e))?;
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel();
-
+        let (tx, rx) = mpsc::channel::<String>();
+        
         let start = Instant::now();
         // Lower depth for bench to stay responsive
-        searcher.search_async(board, vec![], 3, Arc::clone(&stop_flag), tx);
+        // Pass 0 for all time params as we want depth-limited bench
+        searcher.search_async(board, vec![], 3, 0, 0, 0, 0, 0, Arc::clone(&stop_flag), tx);
 
         match rx.recv_timeout(Duration::from_secs(30)) {
             Ok(msg) => {

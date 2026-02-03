@@ -8,7 +8,6 @@ use std::io::{self, BufRead};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
 
 pub struct MoveCodec;
 
@@ -123,9 +122,11 @@ impl UciHandler {
         let parts: Vec<&str> = command.split_whitespace().collect();
         match parts.get(0).copied() {
             Some("uci") => {
-                println!("id name KiyEngine V4.3.2 Omega");
+                println!("id name KiyEngine V4.4.1 Titan");
                 println!("id author Khoi");
                 println!("option name Hash type spin default 512 min 1 max 65536");
+                println!("option name Threads type spin default 1 min 1 max 256");
+                println!("option name Move Overhead type spin default 30 min 0 max 5000");
                 println!("uciok");
             }
             Some("isready") => {
@@ -149,6 +150,14 @@ impl UciHandler {
                 if parts.len() >= 5 && parts[1] == "name" && parts[2] == "Hash" && parts[3] == "value" {
                     if let Ok(mb) = parts[4].parse() {
                         self.tt.resize(mb);
+                    }
+                } else if parts.len() >= 5 && parts[1] == "name" && parts[2] == "Threads" && parts[3] == "value" {
+                    if let Ok(num) = parts[4].parse() {
+                        self.searcher.threads = num;
+                    }
+                } else if parts.len() >= 5 && parts[1] == "name" && parts[2] == "Move Overhead" && parts[3] == "value" {
+                    if let Ok(ov) = parts[4].parse() {
+                        self.searcher.move_overhead = ov;
                     }
                 }
             }
@@ -199,48 +208,34 @@ impl UciHandler {
             return;
         }
 
-        let mut wtime: Option<u64> = None;
-        let mut btime: Option<u64> = None;
-        let mut winc: u64 = 0;
-        let mut binc: u64 = 0;
+        let mut wtime = 0;
+        let mut btime = 0;
+        let mut winc = 0;
+        let mut binc = 0;
+        let mut movestogo = 0;
         let mut depth = 25;
 
         for i in 0..parts.len() {
             match parts[i] {
-                "wtime" => wtime = parts.get(i + 1).and_then(|s| s.parse().ok()),
-                "btime" => btime = parts.get(i + 1).and_then(|s| s.parse().ok()),
+                "wtime" => wtime = parts.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0),
+                "btime" => btime = parts.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0),
                 "winc" => winc = parts.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0),
                 "binc" => binc = parts.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0),
+                "movestogo" => movestogo = parts.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0),
                 "depth" => depth = parts.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(25),
                 _ => {}
             }
-        }
-
-        let my_time = if self.board.side_to_move() == chess::Color::White {
-            wtime
-        } else {
-            btime
-        };
-        let my_inc = if self.board.side_to_move() == chess::Color::White {
-            winc
-        } else {
-            binc
-        };
-
-        if let Some(ms) = my_time {
-            let think_time = ms / 25 + my_inc / 2; // Slightly more conservative time management
-            let stop_flag = Arc::clone(&self.stop_flag);
-
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(think_time));
-                stop_flag.store(true, Ordering::SeqCst);
-            });
         }
 
         self.searcher.search_async(
             self.board,
             self.move_history.clone(),
             depth,
+            wtime,
+            btime,
+            winc,
+            binc,
+            movestogo,
             Arc::clone(&self.stop_flag),
             self.tx_move.clone(),
         );

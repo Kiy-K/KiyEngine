@@ -60,94 +60,124 @@ impl TranspositionTable {
     }
 }
 
+pub mod time;
+
+use self::time::TimeManager;
+
 pub struct Searcher {
     engine: Arc<Engine>,
     tt: Arc<TranspositionTable>,
+    pub threads: usize,
+    pub move_overhead: u32,
 }
 
 impl Searcher {
     pub fn new(engine: Arc<Engine>, tt: Arc<TranspositionTable>) -> Self {
-        Self { engine, tt }
+        Self { 
+            engine, 
+            tt, 
+            threads: 1,
+            move_overhead: 30, // Default 30ms
+        }
     }
 
     pub fn search_async(
         &self,
         board: Board,
-        _move_history: Vec<usize>,
+        move_history: Vec<usize>,
         max_depth: u8,
+        wtime: u32,
+        btime: u32,
+        winc: u32,
+        binc: u32,
+        movestogo: u32,
         stop_flag: Arc<AtomicBool>,
         tx: mpsc::Sender<String>,
     ) {
         let engine = Arc::clone(&self.engine);
         let tt = Arc::clone(&self.tt);
+        let num_threads = self.threads;
+        let move_overhead = self.move_overhead;
+        let is_white = board.side_to_move() == chess::Color::White;
 
         std::thread::spawn(move || {
-            let mut worker = SearchWorker::new(engine, tt, board, _move_history, stop_flag);
-            let mut best_move = None;
-            let mut last_score = 0;
-            let start_time = std::time::Instant::now();
+            let time_manager = Arc::new(TimeManager::new(wtime, btime, winc, binc, movestogo, move_overhead, is_white));
+            let mut handles = vec![];
+            
+            for i in 0..num_threads {
+                let engine_clone = Arc::clone(&engine);
+                let tt_clone = Arc::clone(&tt);
+                let board_clone = board;
+                let history_clone = move_history.clone();
+                let stop_clone = Arc::clone(&stop_flag);
+                let tm_clone = Arc::clone(&time_manager);
+                let tx_clone = if i == 0 { Some(tx.clone()) } else { None };
+                let is_main = i == 0;
 
-            // Iterative Deepening
-            for depth in 1..=max_depth {
-                if worker.stop_flag.load(Ordering::Relaxed) {
-                    break;
-                }
+                handles.push(std::thread::spawn(move || {
+                    let mut worker = SearchWorker::new(engine_clone, tt_clone, board_clone, history_clone, stop_clone);
+                    let mut best_move = None;
+                    let mut last_score = 0;
+                    let start_time = std::time::Instant::now();
 
-                // Aspiration Windows
-                let mut alpha = -INFINITY;
-                let mut beta = INFINITY;
-                if depth > 3 {
-                    alpha = last_score - 30;
-                    beta = last_score + 30;
-                }
+                    for depth in 1..=max_depth {
+                        if worker.stop_flag.load(Ordering::Relaxed) || tm_clone.should_stop() {
+                            break;
+                        }
 
-                let mut score_res;
-                let mut mv_res;
+                        // Lazy SMP: Helpers might start with a offset or slightly different depth
+                        // but for standard lazy smp we just let them compete in the TT.
+                        
+                        let mut alpha = -INFINITY;
+                        let mut beta = INFINITY;
+                        if depth > 3 {
+                            alpha = last_score - 30;
+                            beta = last_score + 30;
+                        }
 
-                loop {
-                    let (s, m) = worker.alpha_beta(alpha, beta, depth, 0);
-                    score_res = s;
-                    mv_res = m;
+                        loop {
+                            let (score, mv) = worker.alpha_beta(alpha, beta, depth, 0);
+                            
+                            if worker.stop_flag.load(Ordering::Relaxed) || tm_clone.should_stop() {
+                                break;
+                            }
 
-                    if worker.stop_flag.load(Ordering::Relaxed) {
-                        break;
+                            if score <= alpha {
+                                alpha = alpha.saturating_sub(100);
+                            } else if score >= beta {
+                                beta = beta.saturating_add(100);
+                            } else {
+                                if is_main {
+                                    best_move = mv;
+                                    last_score = score;
+                                    let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
+                                    let nps = (worker.nodes as f64 / elapsed) as u64;
+                                    println!(
+                                        "info depth {} score cp {} nodes {} nps {} pv {}",
+                                        depth, score, worker.nodes, nps, mv.unwrap()
+                                    );
+                                }
+                                break;
+                            }
+                            if alpha == -INFINITY && beta == INFINITY { break; }
+                        }
                     }
 
-                    if score_res <= alpha {
-                        alpha = alpha.saturating_sub(100);
-                        if alpha < -INFINITY { alpha = -INFINITY; }
-                    } else if score_res >= beta {
-                        beta = beta.saturating_add(100);
-                        if beta > INFINITY { beta = INFINITY; }
-                    } else {
-                        break;
+                    if is_main {
+                        if let Some(mv) = best_move {
+                            let _ = tx_clone.unwrap().send(format!("bestmove {}", mv));
+                        } else {
+                            let mut moves = MoveGen::new_legal(&board_clone);
+                            if let Some(mv) = moves.next() {
+                                let _ = tx_clone.unwrap().send(format!("bestmove {}", mv));
+                            }
+                        }
                     }
-                    
-                    // Safety break if window explodes
-                    if alpha == -INFINITY && beta == INFINITY { break; }
-                }
-
-                if !worker.stop_flag.load(Ordering::Relaxed) {
-                    if let Some(m) = mv_res {
-                        best_move = Some(m);
-                        last_score = score_res;
-                        let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
-                        let nps = (worker.nodes as f64 / elapsed) as u64;
-                        println!(
-                            "info depth {} score cp {} nodes {} nps {} pv {}",
-                            depth, score_res, worker.nodes, nps, m
-                        );
-                    }
-                }
+                }));
             }
 
-            if let Some(mv) = best_move {
-                let _ = tx.send(format!("bestmove {}", mv));
-            } else {
-                let mut moves = MoveGen::new_legal(&board);
-                if let Some(mv) = moves.next() {
-                    let _ = tx.send(format!("bestmove {}", mv));
-                }
+            for handle in handles {
+                let _ = handle.join();
             }
         });
     }
