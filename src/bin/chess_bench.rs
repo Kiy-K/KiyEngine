@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 fn main() -> anyhow::Result<()> {
     let engine = Arc::new(Engine::new()?);
-    let tt = Arc::new(TranspositionTable::new());
+    let tt = Arc::new(TranspositionTable::new(512));
     let searcher = Searcher::new(Arc::clone(&engine), Arc::clone(&tt));
 
     let test_positions = vec![
@@ -38,7 +38,7 @@ fn main() -> anyhow::Result<()> {
         let board = Board::from_str(fen).map_err(|e| anyhow::anyhow!("FEN error: {:?}", e))?;
         let stop_flag = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel::<String>();
-        
+
         let start = Instant::now();
         // Lower depth for bench to stay responsive
         // Pass 0 for all time params as we want depth-limited bench

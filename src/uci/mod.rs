@@ -84,7 +84,7 @@ pub struct UciHandler {
 impl UciHandler {
     pub fn new() -> anyhow::Result<Self> {
         let engine = Arc::new(Engine::new()?);
-        let tt = Arc::new(TranspositionTable::new());
+        let tt = Arc::new(TranspositionTable::new(512));
         let searcher = Searcher::new(Arc::clone(&engine), Arc::clone(&tt));
         let book = OpeningBook::open("book.bin");
         let (tx, rx) = mpsc::channel();
@@ -147,15 +147,27 @@ impl UciHandler {
                 self.stop_flag.store(true, Ordering::SeqCst);
             }
             Some("setoption") => {
-                if parts.len() >= 5 && parts[1] == "name" && parts[2] == "Hash" && parts[3] == "value" {
+                if parts.len() >= 5
+                    && parts[1] == "name"
+                    && parts[2] == "Hash"
+                    && parts[3] == "value"
+                {
                     if let Ok(mb) = parts[4].parse() {
                         self.tt.resize(mb);
                     }
-                } else if parts.len() >= 5 && parts[1] == "name" && parts[2] == "Threads" && parts[3] == "value" {
+                } else if parts.len() >= 5
+                    && parts[1] == "name"
+                    && parts[2] == "Threads"
+                    && parts[3] == "value"
+                {
                     if let Ok(num) = parts[4].parse() {
                         self.searcher.threads = num;
                     }
-                } else if parts.len() >= 5 && parts[1] == "name" && parts[2] == "Move Overhead" && parts[3] == "value" {
+                } else if parts.len() >= 5
+                    && parts[1] == "name"
+                    && parts[2] == "Move Overhead"
+                    && parts[3] == "value"
+                {
                     if let Ok(ov) = parts[4].parse() {
                         self.searcher.move_overhead = ov;
                     }
@@ -186,58 +198,3 @@ impl UciHandler {
             if let Ok(b) = Board::from_str(&fen) {
                 self.board = b;
             }
-        }
-
-        if parts.get(i) == Some(&"moves") {
-            i += 1;
-            for move_str in &parts[i..] {
-                if let Ok(mv) = ChessMove::from_str(move_str) {
-                    let token = MoveCodec::move_to_token(&mv);
-                    self.move_history.push(token as usize);
-                    self.board = self.board.make_move_new(mv);
-                }
-            }
-        }
-    }
-
-    fn handle_go(&mut self, parts: &[&str]) {
-        self.stop_flag.store(false, Ordering::SeqCst);
-
-        if let Some(mv) = self.book.get_move(&self.board) {
-            let _ = self.tx_move.send(format!("bestmove {}", mv));
-            return;
-        }
-
-        let mut wtime = 0;
-        let mut btime = 0;
-        let mut winc = 0;
-        let mut binc = 0;
-        let mut movestogo = 0;
-        let mut depth = 25;
-
-        for i in 0..parts.len() {
-            match parts[i] {
-                "wtime" => wtime = parts.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0),
-                "btime" => btime = parts.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0),
-                "winc" => winc = parts.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0),
-                "binc" => binc = parts.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0),
-                "movestogo" => movestogo = parts.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0),
-                "depth" => depth = parts.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(25),
-                _ => {}
-            }
-        }
-
-        self.searcher.search_async(
-            self.board,
-            self.move_history.clone(),
-            depth,
-            wtime,
-            btime,
-            winc,
-            binc,
-            movestogo,
-            Arc::clone(&self.stop_flag),
-            self.tx_move.clone(),
-        );
-    }
-}
