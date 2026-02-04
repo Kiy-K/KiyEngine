@@ -1,67 +1,52 @@
-# ♟️ KiyEngine V4.4.2 Titan
+# KiyEngine v4.4.5
 [![Build and Release](https://github.com/Kiy-K/KiyEngine/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/Kiy-K/KiyEngine/actions/workflows/release.yml)
 
-**KiyEngine V4.4.2 Titan** is a high-performance, open-source UCI chess engine written in Rust. It features a **BitNet 1.58-bit Transformer** architecture for evaluation and a highly optimized tactical search engine with AVX-512 acceleration and Lazy SMP.
+KiyEngine is a high-performance, open-source UCI chess engine written in Rust. It features a BitNet 1.58-bit Transformer architecture for evaluation and a highly optimized tactical search engine with Lazy SMP.
 
 ---
 
-## 🌟 Key Features (V4.4.2)
+## Release v4.4.3
+This patch release addresses a correctness issue and improves robustness in the search subsystem, as well as cleaning up and testing the transposition table implementation.
 
-### 1. 🧠 BitNet 1.58-bit Architecture
-The engine utilizes a Transformer model with **BitNet Linear** layers.
-- **Strictly Ternary Weights**: Weights are quantized to strict `{-1.0, 0.0, 1.0}` following the 1.58-bit discrete format.
-- **SIMD-Optimized Inference**: AVX-512/AVX2 kernels perform ternary GEMM using pure addition/subtraction masks, maximizing CPU efficiency.
-
-### 2. 🔍 Tactical Search with Lazy SMP
-- **Deep Quiescence Search (QS)**: Explores all captures *and* checks until a stable position is reached, reducing the horizon effect in critical tactical lines.
-- **Principal Variation Search (PVS)**: PVS with **aspiration windows** to focus search power on the most promising moves.
-- **Lazy SMP**: Multiple threads share a cache-friendly bucketed Transposition Table, with the main thread searching full depth and helpers feeding TT.
-
-### 3. 🎯 Neural-Heuristic Move Ordering (Anti-a2a3)
-A sophisticated hybrid ordering system:
-1. **TT Move**: Best move from the Transposition Table.
-2. **Policy-Guided Moves**: Highest probability moves from the BitNet policy head (scaled down in the opening to avoid overconfidence in side moves).
-3. **MVV-LVA**: Most Valuable Victim - Least Valuable Attacker for captures.
-4. **Killer & History Heuristics**: Pruning non-tactical paths based on search history.
-5. **Opening Centralization Bonus**: Early moves towards `d4/e4/d5/e5` are slightly favored in ordering to encourage central play.
-
-### 4. ⚖️ Advanced Evaluation
-- **Classical + Neural Hybrid**: A classical bitboard evaluation (material, PST, pawn structure) is combined with BitNet-guided search.
-- **Enhanced King Safety**: Detects attackers in the king zone, rewards pawn shields, and penalizes open files near the king.
-- **Pawn Structure**: Penalizes doubled/isolated pawns, rewards passed pawns more as they advance.
+Notable changes in v4.4.3:
+- Fix duplicated logic in Quiescence Search (QS) that could cause incorrect recursion and unstable behavior in tactical lines.
+- Guard Transposition Table sizing to ensure at least one bucket and avoid mask underflow for small Hash settings.
+- Add unit tests for `TranspositionTable::new` and `TranspositionTable::clear`.
+- Remove unused imports and constants to reduce warnings and improve maintainability.
 
 ---
 
-## 🛠️ Installation & Build
+## Key Features
+- BitNet-based evaluation with a transformer architecture for improved positional assessments.
+- Efficient tactical search with Quiescence Search, Principal Variation Search, and aspiration windows.
+- Lazy SMP support where helper threads populate the Transposition Table while a main thread searches full depth.
+- Hybrid move ordering that combines TT moves, policy suggestions, MVV-LVA captures, killer/history heuristics, and simple opening bonuses.
 
-Build requires the [Rust toolchain](https://rustup.rs/).
+---
+
+## Installation & Build
+Build requires the Rust toolchain (rustup).
 
 ```bash
-# Clone the repository
 git clone https://github.com/Kiy-K/KiyEngine.git
 cd KiyEngine
-
-# Build the optimized release binary
 cargo build --release
 ```
 
-The binary will be available at `./target/release/kiy_engine_v4_omega`.
+The release binary is available at `./target/release/kiy_engine_v4_omega`.
 
 ---
 
-## 🎮 UCI Usage Guide
+## UCI Usage
+KiyEngine implements the UCI protocol and can be used with any UCI-compatible GUI.
 
-KiyEngine is a standard UCI engine and can be used with any chess GUI (e.g., Arena, Fritz, or Banksia).
+Configuration options:
+- `Hash` (spin) — default: 512 MB — Transposition Table size in megabytes.
+- `Threads` (spin) — default: 1 — Number of search threads.
+- `Move Overhead` (spin) — default: 30 ms — Time buffer to account for latency.
 
-### Configuration Options
-| Option | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `Hash` | spin | 512 | Transposition Table size in Megabytes (MB). |
-| `Threads` | spin | 1 | Number of search threads (Lazy SMP). |
-| `Move Overhead` | spin | 30 | Time buffer in milliseconds to avoid flagging in network/GUI latency. |
-
-### Example UCI Commands
-```uci
+Example:
+```
 uci
 setoption name Hash value 1024
 isready
@@ -71,16 +56,14 @@ go depth 25
 
 ---
 
-## 🔧 Troubleshooting
-
-- **Weights Missing**: Ensure `kiyengine_v4.safetensors` is in the same directory as the executable.
-- **Slow Search**: Always ensure you are running the `release` build. Debug builds are significantly slower.
-- **Memory Usage**: If you encounter crashes on low-memory systems, reduce the `Hash` value using the UCI option.
+## Troubleshooting
+- If weights are missing, place `kiyengine_v4.safetensors` in the executable directory.
+- Use the `release` build for best performance.
+- Reduce `Hash` if you encounter out-of-memory issues.
 
 ---
 
-## 📄 License
+## License
+KiyEngine is licensed under the Apache License 2.0. See `LICENSE` for details.
 
-KiyEngine is licensed under the **Apache License 2.0**. See the [LICENSE](LICENSE) file for details.
-
-Copyright © 2026 Khoi.
+© 2026 Khoi
