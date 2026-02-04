@@ -1,14 +1,14 @@
-# KiyEngine v4.4.3
+# KiyEngine v4.4.4
 [![Build and Release](https://github.com/Kiy-K/KiyEngine/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/Kiy-K/KiyEngine/actions/workflows/release.yml)
 
 KiyEngine is a high-performance, open-source UCI chess engine written in Rust. It features a BitNet 1.58-bit Transformer architecture for evaluation and a highly optimized tactical search engine with Lazy SMP.
 
 ---
 
-## Release v4.4.3
+## Release v4.4.4
 This patch release addresses a correctness issue and improves robustness in the search subsystem, as well as cleaning up and testing the transposition table implementation.
 
-Notable changes in v4.4.3:
+Notable changes in v4.4.4:
 - Fix duplicated logic in Quiescence Search (QS) that could cause incorrect recursion and unstable behavior in tactical lines.
 - Guard Transposition Table sizing to ensure at least one bucket and avoid mask underflow for small Hash settings.
 - Add unit tests for `TranspositionTable::new` and `TranspositionTable::clear`.
