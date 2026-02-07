@@ -668,17 +668,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
-name = "kiy_engine_v4_omega"
-version = "4.4.2"
+name = "kiy_engine_v5_alpha"
+version = "5.0.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "candle-core",
  "candle-nn",
  "chess",
  "dashmap",
+ "half",
  "memmap2",
  "parking_lot",
+ "rayon",
  "safetensors 0.7.0",
+ "serde_json",
 ]
 
 [[package]]

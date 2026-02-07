@@ -52,8 +52,14 @@ impl OpeningBook {
         let from_idx = ((m >> 6) & 0x3F) as u8;
         let promo_idx = ((m >> 12) & 0x7) as u8;
 
-        let from = unsafe { Square::new(from_idx) };
-        let to = unsafe { Square::new(to_idx) };
+        let from = unsafe {
+            // SAFETY: from_idx is masked with 0x3F so it's always 0-63
+            Square::new(from_idx)
+        };
+        let to = unsafe {
+            // SAFETY: to_idx is masked with 0x3F so it's always 0-63
+            Square::new(to_idx)
+        };
 
         let promo = match promo_idx {
             1 => Some(Piece::Knight),

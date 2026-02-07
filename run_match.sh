@@ -2,14 +2,14 @@
 set -e
 
 # Configuration
-ENGINE_BIN="/home/khoi/Workspace/KiyEngine/target/release/kiy_engine_v4_omega"
+ENGINE_BIN="/home/khoi/Workspace/KiyEngine/target/release/kiy_engine_v5_alpha"
 CUTECHESS="/home/khoi/cutechess/build/cutechess-cli"
 STOCKFISH="/usr/games/stockfish"
-MODEL_FILE="/home/khoi/Workspace/KiyEngine/kiyengine_v4.safetensors"
+MODEL_FILE="/home/khoi/Workspace/KiyEngine/kiyengine.gguf"
 TC="40/60" # Blitz: 60 seconds for 40 moves
 GAMES=2
 
-echo "=== KiyEngine V4 Omega Match Script ==="
+echo "=== KiyEngine V5 Match Script ==="
 
 # 1. Check if model exists
 if [ ! -f "$MODEL_FILE" ]; then
@@ -18,16 +18,16 @@ if [ ! -f "$MODEL_FILE" ]; then
 fi
 
 # 2. Build Engine
-echo "🦀 Building KiyEngine V4 Omega (Release)..."
+echo "🦀 Building KiyEngine V5 (Release)..."
 cargo build --release
 
 # 3. Run Match
-echo "⚔️  Starting Match: KiyEngine V4 Omega vs Stockfish"
+echo "⚔️  Starting Match: KiyEngine V5 vs Stockfish"
 echo "   Time Control: $TC"
 echo "   Games: $GAMES"
 
 $CUTECHESS \
-    -engine name="KiyEngine_V4_Omega" cmd=$ENGINE_BIN dir=. proto=uci \
+    -engine name="KiyEngine_V5" cmd=$ENGINE_BIN dir=. proto=uci \
     -engine name="Stockfish" cmd=$STOCKFISH proto=uci \
     -each tc=$TC \
     -rounds $GAMES \

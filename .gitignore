@@ -16,3 +16,6 @@ target/
 
 # User-specific match results
 match_results.pgn
+
+# Legacy v4 model (use kiyengine.gguf instead)
+kiyengine.safetensors
