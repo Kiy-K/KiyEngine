@@ -1,5 +1,4 @@
-# KiyEngine v4.4.4
-[![Build and Release](https://github.com/Kiy-K/KiyEngine/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/Kiy-K/KiyEngine/actions/workflows/release.yml)
+# KiyEngine v5.0.0
 
 KiyEngine is a high-performance, open-source UCI chess engine written in Rust. It features a BitNet 1.58-bit Transformer architecture for evaluation and a highly optimized tactical search engine with Lazy SMP.
 
