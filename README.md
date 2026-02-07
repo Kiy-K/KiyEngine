@@ -3,7 +3,12 @@
 
 KiyEngine is a high-performance, open-source UCI chess engine written in Rust. It features a BitNet 1.58-bit Transformer architecture for evaluation and a highly optimized tactical search engine with Lazy SMP.
 
----
+## What's New in V5
+
+- **GGUF Format Support**: V5 introduces GGUF (GGML Universal File) format for faster loading and better quantization support
+- **Memory-Mapped Loading**: Near-instant model loading via mmap
+- **Backward Compatible**: Still supports legacy v4 `.safetensors` format
+- **Auto-Format Detection**: Automatically detects and loads either format
 
 ## Release v4.4.4
 This patch release addresses a correctness issue and improves robustness in the search subsystem, as well as cleaning up and testing the transposition table implementation.

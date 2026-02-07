@@ -1,6 +1,7 @@
 use chess::{Board, ChessMove};
-use kiy_engine_v4_omega::engine::Engine;
-use kiy_engine_v4_omega::search::{Searcher, TranspositionTable};
+use kiy_engine_v5_alpha::engine::Engine;
+use kiy_engine_v5_alpha::search::lazy_smp::Searcher;
+use kiy_engine_v5_alpha::search::tt::AtomicTT;
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
@@ -29,7 +30,7 @@ fn main() -> anyhow::Result<()> {
         ("UNDERPROMO", "k7/P7/8/8/8/8/8/K7 w - - 0 1"),
     ];
 
-    println!("=== KiyEngine V4 Omega - Extensive Standard Test ===");
+    println!("=== KiyEngine V5 Alpha - Extensive Standard Test ===");
 
     for (name, fen) in test_positions {
         println!("\nTesting Position: {}", name);
@@ -42,17 +43,30 @@ fn main() -> anyhow::Result<()> {
         let start = Instant::now();
         // Lower depth for bench to stay responsive
         // Pass 0 for all time params as we want depth-limited bench
-        searcher.search_async(board, vec![], 3, 0, 0, 0, 0, 0, Arc::clone(&stop_flag), tx);
+        searcher.search_async(
+            board,
+            vec![],
+            vec![],
+            3,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Arc::clone(&stop_flag),
+            tx,
+        );
 
         match rx.recv_timeout(Duration::from_secs(30)) {
             Ok(msg) => {
-                let duration = start.elapsed();
+                let duration: Duration = start.elapsed();
                 println!("Result: {} (took {:?})", msg, duration);
 
-                let move_str = msg.split_whitespace().last().unwrap();
-                let mv = ChessMove::from_str(move_str)
+                let move_str: &str = msg.split_whitespace().last().unwrap();
+                let mv: ChessMove = ChessMove::from_str(move_str)
                     .map_err(|e| anyhow::anyhow!("Move error: {:?}", e))?;
                 if board.legal(mv) {
+                    println!("Status: LEGAL MOVE");
                     println!("Status: ✅ LEGAL MOVE");
                 } else {
                     println!("Status: ❌ ILLEGAL MOVE PRODUCED!");

@@ -2,12 +2,17 @@
 
 use crate::book::OpeningBook;
 use crate::engine::Engine;
-use crate::search::{Searcher, TranspositionTable};
+use crate::search::lazy_smp::Searcher;
+use crate::search::tt::AtomicTT;
 use chess::{Board, ChessMove, MoveGen, Square};
 use std::io::{self, BufRead};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
+
+pub mod mcts_handler;
+
+pub use mcts_handler::MCTSUciHandler;
 
 pub struct MoveCodec;
 
@@ -35,8 +40,14 @@ impl MoveCodec {
         if token < 4096 {
             let from_idx = token / 64;
             let to_idx = token % 64;
-            let from = unsafe { Square::new(from_idx as u8) };
-            let to = unsafe { Square::new(to_idx as u8) };
+            let from = unsafe {
+                // SAFETY: from_idx is modulo 64 from token/64, so it's always 0-63
+                Square::new(from_idx as u8)
+            };
+            let to = unsafe {
+                // SAFETY: to_idx is modulo 64 from token%64, so it's always 0-63
+                Square::new(to_idx as u8)
+            };
 
             let mv = ChessMove::new(from, to, None);
             if board.legal(mv) {
@@ -50,7 +61,10 @@ impl MoveCodec {
             let promo_part = token - 4096;
             let piece_idx = promo_part / 64;
             let to_idx = promo_part % 64;
-            let to = unsafe { Square::new(to_idx as u8) };
+            let to = unsafe {
+                // SAFETY: to_idx is modulo 64 from token%64, so it's always 0-63
+                Square::new(to_idx as u8)
+            };
 
             let piece = match piece_idx {
                 0 => chess::Piece::Knight,
@@ -73,12 +87,16 @@ impl MoveCodec {
 
 pub struct UciHandler {
     searcher: Searcher,
-    tt: Arc<TranspositionTable>,
-    book: OpeningBook,
+    tt: Arc<AtomicTT>,
+    _book: OpeningBook,
     board: Board,
-    move_history: Vec<usize>,
+    move_history: Vec<usize>,   // For NN Context (Tokens)
+    position_history: Vec<u64>, // For Repetition (Zobrist Hashes)
     stop_flag: Arc<AtomicBool>,
     tx_move: mpsc::Sender<String>,
+    analysis_mode: bool,
+    multipv: usize,
+    show_wdl: bool,
 }
 
 impl UciHandler {
@@ -98,11 +116,15 @@ impl UciHandler {
         Ok(Self {
             searcher,
             tt,
-            book,
+            _book: book,
             board: Board::default(),
             move_history: Vec::new(),
+            position_history: Vec::new(),
             stop_flag: Arc::new(AtomicBool::new(false)),
             tx_move: tx,
+            analysis_mode: false,
+            multipv: 1,
+            show_wdl: false,
         })
     }
 
@@ -122,11 +144,14 @@ impl UciHandler {
         let parts: Vec<&str> = command.split_whitespace().collect();
         match parts.get(0).copied() {
             Some("uci") => {
-                println!("id name KiyEngine V4.4.1 Titan");
+                println!("id name KiyEngine V4.4.5 Titan");
                 println!("id author Khoi");
-                println!("option name Hash type spin default 512 min 1 max 65536");
+                println!("option name Hash type spin default 64 min 1 max 65536");
                 println!("option name Threads type spin default 1 min 1 max 256");
                 println!("option name Move Overhead type spin default 30 min 0 max 5000");
+                println!("option name Analysis Mode type check default false");
+                println!("option name MultiPV type spin default 1 min 1 max 500");
+                println!("option name UCI_ShowWDL type check default false");
                 println!("uciok");
             }
             Some("isready") => {
@@ -135,6 +160,7 @@ impl UciHandler {
             Some("ucinewgame") => {
                 self.board = Board::default();
                 self.move_history.clear();
+                self.position_history.clear();
                 self.tt.clear();
             }
             Some("position") => {
@@ -180,8 +206,61 @@ impl UciHandler {
         }
     }
 
+    fn handle_setoption(&mut self, parts: &[&str]) {
+        let mut value_idx = 0;
+        for (i, &part) in parts.iter().enumerate() {
+            if part == "value" {
+                value_idx = i;
+                break;
+            }
+        }
+
+        if value_idx == 0 || value_idx == parts.len() - 1 {
+            return;
+        }
+
+        if parts[0] != "name" {
+            return;
+        }
+
+        let name = parts[1..value_idx].join(" ").to_lowercase();
+        let value = parts[(value_idx + 1)..].join(" ");
+
+        match name.as_str() {
+            "hash" => {
+                if let Ok(_mb) = value.parse::<usize>() {
+                    // Should resize TT here
+                    self.tt.clear();
+                }
+            }
+            "threads" => {
+                if let Ok(num) = value.parse::<usize>() {
+                    self.searcher.threads = num.max(1);
+                }
+            }
+            "move overhead" => {
+                if let Ok(ov) = value.parse::<u32>() {
+                    self.searcher.move_overhead = ov;
+                }
+            }
+            "analysis mode" => {
+                self.analysis_mode = value == "true";
+            }
+            "multipv" => {
+                if let Ok(mpv) = value.parse::<usize>() {
+                    self.multipv = mpv;
+                }
+            }
+            "uci_showwdl" => {
+                self.show_wdl = value == "true";
+            }
+            _ => {}
+        }
+    }
+
     fn handle_position(&mut self, parts: &[&str]) {
         self.move_history.clear();
+        self.position_history.clear();
         let mut i = 0;
 
         if parts.get(0) == Some(&"startpos") {
