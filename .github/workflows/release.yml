@@ -22,12 +22,12 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact_name: kiy_engine_linux
-            asset_name: kiy_engine_v4_omega_linux.tar.gz
-            binary_name: kiy_engine_v4_omega
+            asset_name: kiy_engine_v5_alpha_linux.tar.gz
+            binary_name: kiy_engine_v5_alpha
           - os: windows-latest
             artifact_name: kiy_engine_windows
-            asset_name: kiy_engine_v4_omega_windows.exe
-            binary_name: kiy_engine_v4_omega.exe
+            asset_name: kiy_engine_v5_alpha_windows.exe
+            binary_name: kiy_engine_v5_alpha.exe
 
     # [FIX] Steps phải nằm ở đây (ngang hàng strategy), không được thọt vào trong
     steps:
