@@ -12,9 +12,13 @@ jobs:
   build:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # Ép dùng Bash shell để lệnh cp/tar chạy giống nhau trên cả Win và Linux
+    defaults:
+      run:
+        shell: bash
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
         include:
           - os: ubuntu-latest
             artifact_name: kiy_engine_linux
@@ -25,6 +29,7 @@ jobs:
             asset_name: kiy_engine_v4_omega_windows.exe
             binary_name: kiy_engine_v4_omega.exe
 
+    # [FIX] Steps phải nằm ở đây (ngang hàng strategy), không được thọt vào trong
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -42,16 +47,21 @@ jobs:
         run: |
           tar -czvf ${{ matrix.asset_name }} -C target/release ${{ matrix.binary_name }}
 
-      - name: Prepare Windows artifact
+      - name: Package Windows artifact
         if: matrix.os == 'windows-latest'
+        # Dùng cp của bash để copy và đổi tên file luôn
         run: |
-          cp target/release/${{ matrix.binary_name }} ${{ matrix.asset_name }}
+          cp target/release/${{ matrix.binary_name }} ./${{ matrix.asset_name }}
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.asset_name }}
+
+      # [THEO YÊU CẦU] Xóa cache build sau khi xong việc
+      - name: Clean up Build Cache
+        run: cargo clean
 
   release:
     name: Create GitHub Release
@@ -61,22 +71,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download Linux Artifact
+      # Download tất cả artifact từ job trên về chung 1 thư mục
+      - name: Download All Artifacts
         uses: actions/download-artifact@v4
         with:
-          name: kiy_engine_linux
+          path: release_assets
+          pattern: kiy_engine_*
+          merge-multiple: true # Quan trọng: Gom hết file vào 1 chỗ, không chia folder con
 
-      - name: Download Windows Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: kiy_engine_windows
+      - name: List files (Debug)
+        run: ls -R release_assets
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            kiy_engine_v4_omega_linux.tar.gz
-            kiy_engine_v4_omega_windows.exe
+          files: release_assets/*
           name: KiyEngine Release ${{ github.ref_name }}
           draft: false
           prerelease: false
