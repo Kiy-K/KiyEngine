@@ -26,16 +26,24 @@ Thank you for your interest in contributing to KiyEngine! This document provides
 ### Module Organization
 ```
 src/
-├── lib.rs           # Library exports
-├── main.rs          # Binary entry point
-├── constants.rs     # Global constants
-├── bin/             # Additional binaries
-├── book/            # Opening book
-├── engine/          # Neural network engine
-├── eval/            # Evaluation functions
-├── search/          # Search algorithms
-├── simd/            # SIMD optimizations
-└── uci/             # UCI protocol
+├── lib.rs               # Library exports
+├── main.rs              # Binary entry point
+├── constants.rs         # Global constants
+├── bin/                 # Additional binaries (inspect_gguf, chess_bench)
+├── book/                # Polyglot opening book
+│   ├── mod.rs           # Book probing & Zobrist hashing
+│   └── polyglot_keys.rs # Official 781-key Random64 array
+├── engine/              # Neural network inference (GGUF/safetensors)
+├── eval/                # Piece-square tables
+├── search/
+│   ├── mod.rs           # Alpha-beta, lock-free TT, move ordering, quiescence
+│   ├── eval.rs          # Material + PST static evaluation
+│   ├── time.rs          # Time management
+│   ├── lazy_smp.rs      # Lazy SMP threading
+│   ├── mcts*.rs         # MCTS implementations (experimental)
+│   └── tt.rs            # Atomic TT (alternative implementation)
+├── simd/                # AVX2/SIMD optimizations
+└── uci/                 # UCI protocol handler
 ```
 
 ### Testing

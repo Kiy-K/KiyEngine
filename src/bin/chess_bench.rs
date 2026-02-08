@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 fn main() -> anyhow::Result<()> {
     let engine = Arc::new(Engine::new()?);
-    let tt = Arc::new(TranspositionTable::new(512));
+    let tt = Arc::new(AtomicTT::new(64));
     let searcher = Searcher::new(Arc::clone(&engine), Arc::clone(&tt));
 
     let test_positions = vec![

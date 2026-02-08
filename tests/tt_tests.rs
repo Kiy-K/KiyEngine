@@ -1,4 +1,4 @@
-use kiy_engine_v4_omega::search::{TTEntry, TTFlag, TranspositionTable};
+use kiy_engine_v5_alpha::search::{TTEntry, TTFlag, TranspositionTable};
 
 #[test]
 fn test_tt_new_zero_size_and_store_get() {

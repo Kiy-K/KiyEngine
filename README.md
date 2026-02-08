@@ -1,35 +1,48 @@
 # KiyEngine v5.0.0
 
-KiyEngine is a high-performance, open-source UCI chess engine written in Rust. It features a BitNet 1.58-bit Transformer architecture for evaluation and a highly optimized tactical search engine with Lazy SMP.
+A high-performance UCI chess engine written in Rust, featuring a **BitNet 1.58-bit Transformer** neural network for evaluation and a heavily optimized alpha-beta search with Lazy SMP.
 
-## What's New in V5
+## Highlights
 
-- **GGUF Format Support**: V5 introduces GGUF (GGML Universal File) format for faster loading and better quantization support
-- **Memory-Mapped Loading**: Near-instant model loading via mmap
-- **Backward Compatible**: Still supports legacy v4 `.safetensors` format
-- **Auto-Format Detection**: Automatically detects and loads either format
-
-## Release v4.4.4
-This patch release addresses a correctness issue and improves robustness in the search subsystem, as well as cleaning up and testing the transposition table implementation.
-
-Notable changes in v4.4.4:
-- Fix duplicated logic in Quiescence Search (QS) that could cause incorrect recursion and unstable behavior in tactical lines.
-- Guard Transposition Table sizing to ensure at least one bucket and avoid mask underflow for small Hash settings.
-- Add unit tests for `TranspositionTable::new` and `TranspositionTable::clear`.
-- Remove unused imports and constants to reduce warnings and improve maintainability.
-
----
+| Metric | Value |
+|--------|-------|
+| **NPS** | ~2.2 million nodes/sec (4 threads) |
+| **Search Depth** | 15–19 ply in 40/60 time control |
+| **Model Format** | GGUF (28 MB, memory-mapped) |
+| **Quantization** | BitNet 1.58-bit (ternary weights) |
 
 ## Key Features
-- BitNet-based evaluation with a transformer architecture for improved positional assessments.
-- Efficient tactical search with Quiescence Search, Principal Variation Search, and aspiration windows.
-- Lazy SMP support where helper threads populate the Transposition Table while a main thread searches full depth.
-- Hybrid move ordering that combines TT moves, policy suggestions, MVV-LVA captures, killer/history heuristics, and simple opening bonuses.
 
----
+### Neural Network
+- **BitNet 1.58-bit Transformer** with 72-plane policy head (4608 output classes)
+- **GGUF model format** — 4× smaller than safetensors, instant mmap loading
+- Single NN forward pass shared across all search threads via `Arc`
+- Automatic fallback to legacy `.safetensors` format
+
+### Search
+- **Alpha-Beta with PVS** (Principal Variation Search)
+- **Lazy SMP** — 4 threads (configurable), lock-free shared transposition table
+- **Lock-Free TT** — Hyatt/Mann XOR trick, interleaved cache-line layout, depth-preferred replacement
+- **Aspiration Windows** — ±50 cp starting at depth 4, progressive widening
+- **Late Move Reductions (LMR)** — pre-computed lookup table (no transcendental math in hot path)
+- **Razoring**, **Reverse Futility Pruning**, **Null Move Pruning** (static approximation)
+- **Late Move Pruning (LMP)**, **Futility Pruning**, **SEE Pruning**
+- **Internal Iterative Reduction (IIR)** when no TT move is found
+- **Quiescence Search** with delta pruning and MVV-LVA ordering
+- **Search Stability** — periodic time checks every 2048 nodes, `MAX_PLY` guard in qsearch
+
+### Move Ordering
+TT Move → NN Policy (root) → Captures (MVV-LVA) → Promotions → Killer Moves → History Heuristic
+
+### Opening Book
+- **Polyglot format** — dual-book support (`book1.bin`, `book2.bin`)
+- Official Polyglot Zobrist hashing (781-key Random64 array)
+- Weighted random selection, limited to first 30 plies
+- Fully loaded into memory at startup — zero I/O during search
 
 ## Installation & Build
-Build requires the Rust toolchain (rustup).
+
+Requires Rust 1.70+ ([rustup](https://rustup.rs/)).
 
 ```bash
 git clone https://github.com/Kiy-K/KiyEngine.git
@@ -37,37 +50,73 @@ cd KiyEngine
 cargo build --release
 ```
 
-The release binary is available at `./target/release/kiy_engine_v4_omega`.
+The release binary is at `./target/release/kiy_engine_v5_alpha`.
 
----
+Place `kiyengine.gguf` in the same directory as the binary (or alongside `Cargo.toml` for development).
 
-## UCI Usage
-KiyEngine implements the UCI protocol and can be used with any UCI-compatible GUI.
+## UCI Options
 
-Configuration options:
-- `Hash` (spin) — default: 512 MB — Transposition Table size in megabytes.
-- `Threads` (spin) — default: 1 — Number of search threads.
-- `Move Overhead` (spin) — default: 30 ms — Time buffer to account for latency.
+| Option | Type | Default | Range | Description |
+|--------|------|---------|-------|-------------|
+| `Hash` | spin | 512 | 64–65536 | Transposition table size (MB) |
+| `Threads` | spin | 4 | 1–256 | Number of search threads |
+| `Move Overhead` | spin | 60 | 0–5000 | Time buffer for latency (ms) |
+| `Analysis Mode` | check | false | — | Disable book in analysis |
+| `MultiPV` | spin | 1 | 1–500 | Number of principal variations |
 
-Example:
+### Example
+
 ```
 uci
 setoption name Hash value 1024
+setoption name Threads value 4
 isready
 position startpos
-go depth 25
+go wtime 60000 btime 60000 movestogo 40
 ```
 
----
+## Project Structure
+
+```
+src/
+├── main.rs              # Binary entry point
+├── lib.rs               # Library exports
+├── constants.rs         # Global constants
+├── book/                # Polyglot opening book
+│   ├── mod.rs           # Book probing & Zobrist hashing
+│   └── polyglot_keys.rs # Official 781-key Random64 array
+├── engine/              # Neural network inference (GGUF/safetensors)
+├── eval/                # Piece-square tables
+├── search/
+│   ├── mod.rs           # Alpha-beta, TT, move ordering, quiescence
+│   ├── eval.rs          # Material + PST static evaluation
+│   ├── time.rs          # Time management
+│   ├── lazy_smp.rs      # Lazy SMP threading
+│   ├── mcts*.rs         # MCTS implementations (experimental)
+│   └── tt.rs            # Atomic TT (alternative implementation)
+├── simd/                # AVX2/SIMD optimizations
+└── uci/                 # UCI protocol handler
+```
+
+## Running Matches
+
+Use [cutechess-cli](https://github.com/cutechess/cutechess) for automated matches:
+
+```bash
+bash run_match.sh
+```
+
+Results are saved to `omega_match.pgn`.
 
 ## Troubleshooting
-- If weights are missing, place `kiyengine_v4.safetensors` in the executable directory.
-- Use the `release` build for best performance.
-- Reduce `Hash` if you encounter out-of-memory issues.
 
----
+- **Missing model**: Place `kiyengine.gguf` next to the binary.
+- **Out of memory**: Reduce `Hash` (e.g., `setoption name Hash value 128`).
+- **Slow NPS**: Ensure you are using `--release` build. Check `Threads` is set appropriately for your CPU.
+- **Book not loading**: Ensure `src/book/book1.bin` and `src/book/book2.bin` exist relative to the executable.
 
 ## License
-KiyEngine is licensed under the Apache License 2.0. See `LICENSE` for details.
+
+KiyEngine is licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
 
 © 2026 Khoi

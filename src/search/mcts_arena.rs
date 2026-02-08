@@ -794,7 +794,7 @@ impl MCTSHandler {
         let mut move_logits: Vec<(ChessMove, f32)> = legal_moves
             .into_iter()
             .filter_map(|mv| {
-                let token = MoveCodec::move_to_token(&mv) as usize;
+                let token = MoveCodec::get_policy_index(&mv);
                 if token < logits.len() {
                     Some((mv, logits[token]))
                 } else {
