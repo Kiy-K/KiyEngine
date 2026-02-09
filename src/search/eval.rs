@@ -1,5 +1,5 @@
-use chess::{Board, Color, Piece};
 use crate::eval::pst::PST;
+use chess::{Board, Color, Piece};
 
 /// Simple material + PST evaluation (fallback when neural network fails)
 pub fn evaluate(board: &Board, _ply: usize) -> i32 {
@@ -27,5 +27,9 @@ pub fn evaluate(board: &Board, _ply: usize) -> i32 {
         score += PST::get_score(Piece::King, ksq, color) * mult;
     }
 
-    if board.side_to_move() == Color::White { score } else { -score }
+    if board.side_to_move() == Color::White {
+        score
+    } else {
+        -score
+    }
 }

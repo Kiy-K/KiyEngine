@@ -5,7 +5,7 @@
 
 /// Engine identification
 pub const ENGINE_NAME: &str = "KiyEngine";
-pub const ENGINE_VERSION: &str = "5.0.0";
+pub const ENGINE_VERSION: &str = "5.2.0";
 pub const ENGINE_AUTHOR: &str = "Khoi";
 
 /// Default model file path for V5 (GGUF format)
@@ -36,9 +36,11 @@ pub const MAX_MOVE_OVERHEAD_MS: u32 = 5000;
 
 /// Neural network architecture constants
 pub const VOCAB_SIZE: usize = 4608;
-pub const CONTEXT_LENGTH: usize = 32;
-pub const D_MODEL: usize = 1024;
-pub const NUM_LAYERS: usize = 4;
+pub const CONTEXT_LENGTH: usize = 64;
+pub const D_MODEL: usize = 512;
+pub const HIDDEN_DIM: usize = 1024;
+pub const NUM_LAYERS: usize = 8;
+pub const NUM_HEADS: usize = 8;
 
 /// Evaluation constants
 pub const PAWN_VALUE: i32 = 100;

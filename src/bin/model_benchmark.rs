@@ -1,17 +1,15 @@
 // src/bin/model_benchmark.rs
-//! Comprehensive benchmark for the fine-tuned KiyEngine model
-//!
-//! Tests model loading, inference speed, and evaluation accuracy
+//! v5.2.0 KiyNet_Ultimate benchmark
 
 use candle_core::Device;
-use kiy_engine_v5_alpha::constants::{DEFAULT_MODEL_PATH, LEGACY_MODEL_PATH};
+use kiy_engine_v5_alpha::constants::DEFAULT_MODEL_PATH;
 use kiy_engine_v5_alpha::engine::Engine;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn main() -> anyhow::Result<()> {
     println!("========================================");
-    println!("KiyEngine Model Benchmark Suite v5.0.0");
+    println!("KiyEngine Model Benchmark Suite v5.2.0");
     println!("========================================\n");
 
     let device = Device::Cpu;
@@ -21,175 +19,157 @@ fn main() -> anyhow::Result<()> {
     println!("-----------------------");
 
     let start = Instant::now();
-    let finetuned_engine =
-        Engine::load_from_safetensors(DEFAULT_MODEL_PATH, device.clone()).map(Arc::new);
-    let finetuned_load_time = start.elapsed();
-
-    match &finetuned_engine {
-        Ok(_) => println!(
-            "Fine-tuned model:        Loaded in {:?}",
-            finetuned_load_time
-        ),
-        Err(e) => println!("Fine-tuned model:        FAILED - {}", e),
-    }
-
-    let start = Instant::now();
-    let legacy_engine =
-        Engine::load_from_safetensors(LEGACY_MODEL_PATH, device.clone()).map(Arc::new);
-    let legacy_load_time = start.elapsed();
-
-    match &legacy_engine {
-        Ok(_) => println!("Legacy model (v4):       Loaded in {:?}", legacy_load_time),
-        Err(e) => println!("Legacy model (v4):       Not available - {}", e),
-    }
+    let engine = Engine::load_from_gguf(DEFAULT_MODEL_PATH, device)?.into();
+    let load_time = start.elapsed();
+    let engine: Arc<Engine> = engine;
+    println!("Model loaded in {:?}", load_time);
     println!();
 
     // Test 2: Inference Speed Benchmark
-    if finetuned_engine.is_ok() {
-        println!("[Test 2] Inference Speed Benchmark");
-        println!("-----------------------------------");
+    println!("[Test 2] Inference Speed Benchmark");
+    println!("-----------------------------------");
 
-        let engine = finetuned_engine.as_ref().unwrap();
-
-        // Warm-up runs
-        let warmup_tokens: Vec<usize> = (0..10).map(|i| (i * 100) % 4608).collect();
-        for _ in 0..5 {
-            let _ = engine.forward(&warmup_tokens);
-        }
-
-        // Benchmark with varying sequence lengths
-        let seq_lengths = vec![4, 8, 16, 32];
-        let iterations = 100;
-
-        for seq_len in seq_lengths {
-            let test_tokens: Vec<usize> = (0..seq_len).map(|i| (i * 150) % 4608).collect();
-
-            let start = Instant::now();
-            for _ in 0..iterations {
-                let _ = engine.forward(&test_tokens);
-            }
-            let total_time = start.elapsed();
-            let avg_time = total_time / iterations;
-            let throughput = 1000.0 / avg_time.as_millis() as f64;
-
-            println!(
-                "Sequence length {}: avg={:?} ({:.1} inferences/sec)",
-                seq_len, avg_time, throughput
-            );
-        }
-        println!();
+    // Warm-up
+    let warmup_tokens: Vec<usize> = (0..10).map(|i| (i * 100) % 4608).collect();
+    for _ in 0..3 {
+        let _ = engine.forward(&warmup_tokens);
     }
 
-    // Test 3: Position Evaluation Tests
-    if finetuned_engine.is_ok() {
-        println!("[Test 3] Position Evaluation Tests");
-        println!("-----------------------------------");
+    let seq_lengths = vec![4, 8, 16, 32, 64];
+    let iterations = 50u32;
 
-        let engine = finetuned_engine.as_ref().unwrap();
-
-        // Standard test positions
-        let test_positions = vec![
-            ("Start Position", vec![], 0.0), // Neutral start
-            ("White Advantage", vec![100, 100, 100, 100, 100], 0.3), // Some moves made
-            ("Tactical Complex", vec![1234, 567, 890, 123, 456, 789], 0.0),
-        ];
-
-        for (name, tokens, _expected_range) in test_positions {
-            let start = Instant::now();
-            let result = engine.forward(&tokens);
-            let inference_time = start.elapsed();
-
-            match result {
-                Ok((policy, value)) => {
-                    let policy_shape = policy.shape().clone();
-                    println!(
-                        "{}: value={:.3}, policy_shape={:?}, time={:?}",
-                        name, value, policy_shape, inference_time
-                    );
-                }
-                Err(e) => {
-                    println!("{}: ERROR - {}", name, e);
-                }
-            }
-        }
-        println!();
-    }
-
-    // Test 4: Comparison Test (if legacy model available)
-    if legacy_engine.is_ok() && finetuned_engine.is_ok() {
-        println!("[Test 4] Model Comparison (Fine-tuned vs Legacy)");
-        println!("--------------------------");
-
-        let legacy = legacy_engine.as_ref().unwrap();
-        let finetuned = finetuned_engine.as_ref().unwrap();
-
-        let test_tokens: Vec<usize> = (0..16).map(|i| (i * 300) % 4608).collect();
-
-        // Run both models
-        let start = Instant::now();
-        let legacy_result = legacy.forward(&test_tokens);
-        let legacy_time = start.elapsed();
+    for seq_len in seq_lengths {
+        let test_tokens: Vec<usize> = (0..seq_len).map(|i| (i * 150) % 4608).collect();
 
         let start = Instant::now();
-        let finetuned_result = finetuned.forward(&test_tokens);
-        let finetuned_time = start.elapsed();
-
-        match (legacy_result, finetuned_result) {
-            (Ok((_, legacy_val)), Ok((_, finetuned_val))) => {
-                let diff = (legacy_val - finetuned_val).abs();
-                println!(
-                    "Value difference: {:.4} (legacy={:.3}, finetuned={:.3})",
-                    diff, legacy_val, finetuned_val
-                );
-                println!(
-                    "Inference time - Legacy: {:?}, Fine-tuned: {:?}",
-                    legacy_time, finetuned_time
-                );
-
-                if finetuned_time < legacy_time {
-                    let speedup = legacy_time.as_nanos() as f64 / finetuned_time.as_nanos() as f64;
-                    println!("Fine-tuned model is {:.2}x faster!", speedup);
-                }
-            }
-            _ => println!("Comparison failed - one or both models returned errors"),
+        for _ in 0..iterations {
+            let _ = engine.forward(&test_tokens);
         }
-    }
-
-    // Test 5: Stress Test (batch inference simulation)
-    if finetuned_engine.is_ok() {
-        println!("\n[Test 5] Stress Test (1000 inferences)");
-        println!("---------------------------------------");
-
-        let engine = finetuned_engine.as_ref().unwrap();
-        let iterations = 1000;
-        let mut success_count = 0;
-        let mut error_count = 0;
-        let mut total_time = Duration::ZERO;
-
-        for i in 0..iterations {
-            // Vary token sequence length and content
-            let seq_len = 4 + (i % 28); // 4 to 32
-            let tokens: Vec<usize> = (0..seq_len)
-                .map(|j| ((i * 100 + j * 50) % 4608) as usize)
-                .collect();
-
-            let start = Instant::now();
-            match engine.forward(&tokens) {
-                Ok(_) => success_count += 1,
-                Err(_) => error_count += 1,
-            }
-            total_time += start.elapsed();
-        }
-
+        let total_time = start.elapsed();
         let avg_time = total_time / iterations;
         let throughput = iterations as f64 / total_time.as_secs_f64();
 
         println!(
-            "Success rate: {}/{} ({} errors)",
-            success_count, iterations, error_count
+            "seq_len={:>2}: avg={:?} ({:.1} inf/sec)",
+            seq_len, avg_time, throughput
         );
-        println!("Average inference time: {:?}", avg_time);
-        println!("Throughput: {:.1} inferences/sec", throughput);
+    }
+    println!();
+
+    // Test 3: Position Evaluation
+    println!("[Test 3] Position Evaluation");
+    println!("----------------------------");
+
+    let test_positions: Vec<(&str, Vec<usize>)> = vec![
+        ("Start Position", vec![]),
+        ("Short game", vec![100, 200, 300, 400, 500]),
+        ("Tactical", vec![1234, 567, 890, 123, 456, 789]),
+    ];
+
+    for (name, tokens) in &test_positions {
+        let start = Instant::now();
+        match engine.forward(tokens) {
+            Ok((policy, value)) => {
+                println!(
+                    "{}: value={:.3}, policy_shape={:?}, time={:?}",
+                    name,
+                    value,
+                    policy.shape(),
+                    start.elapsed()
+                );
+            }
+            Err(e) => println!("{}: ERROR - {}", name, e),
+        }
+    }
+    println!();
+
+    // Test 4: Stress Test
+    println!("[Test 4] Stress Test (500 inferences)");
+    println!("--------------------------------------");
+
+    let stress_iters = 500u32;
+    let mut success = 0u32;
+    let mut total_time = Duration::ZERO;
+
+    for i in 0..stress_iters {
+        let seq_len = 4 + (i as usize % 60);
+        let tokens: Vec<usize> = (0..seq_len)
+            .map(|j| (i as usize * 100 + j * 50) % 4608)
+            .collect();
+
+        let start = Instant::now();
+        if engine.forward(&tokens).is_ok() {
+            success += 1;
+        }
+        total_time += start.elapsed();
+    }
+
+    let avg = total_time / stress_iters;
+    let throughput = stress_iters as f64 / total_time.as_secs_f64();
+    println!("Success: {}/{}", success, stress_iters);
+    println!("Avg: {:?} ({:.1} inf/sec)", avg, throughput);
+
+    // Test 5: KV Cache Incremental Inference
+    println!("\n[Test 5] KV Cache Incremental Inference");
+    println!("----------------------------------------");
+
+    {
+        let mut cache = engine.create_kv_cache();
+
+        // Simulate a game: start with 4 tokens, add 1-2 each "move"
+        let base_tokens: Vec<usize> = (0..4).map(|i| (i * 150) % 4608).collect();
+
+        // Cold start (cache miss) — full forward
+        let start = Instant::now();
+        let (_, val_cold) = engine.forward_with_cache(&base_tokens, &mut cache)?;
+        let cold_time = start.elapsed();
+        println!(
+            "Cold  (4 tokens, cache miss):  {:?}  value={:.3}",
+            cold_time, val_cold
+        );
+
+        // Verify cache populated
+        assert_eq!(cache.seq_len, 4);
+
+        // Incremental: add 1 token at a time (cache hit)
+        let mut tokens = base_tokens.clone();
+        let mut cache_times = vec![];
+        for step in 0..10 {
+            tokens.push((1000 + step * 77) % 4608);
+            let start = Instant::now();
+            let (_, _val) = engine.forward_with_cache(&tokens, &mut cache)?;
+            cache_times.push(start.elapsed());
+        }
+        let avg_cached = cache_times.iter().sum::<Duration>() / cache_times.len() as u32;
+        println!(
+            "Cached (+1 token, 10 steps):   avg={:?}  (seq 5→14)",
+            avg_cached
+        );
+
+        // Compare: full forward at same seq_len (no cache)
+        let start = Instant::now();
+        let iters = 10u32;
+        for _ in 0..iters {
+            let _ = engine.forward(&tokens);
+        }
+        let avg_full = start.elapsed() / iters;
+        println!("Full  (14 tokens, no cache):   avg={:?}", avg_full);
+
+        let speedup = avg_full.as_secs_f64() / avg_cached.as_secs_f64();
+        println!("KV Cache speedup: {:.1}x", speedup);
+
+        // Verify correctness: cached vs non-cached should produce same value
+        let mut fresh_cache = engine.create_kv_cache();
+        let (_, val_cached) = engine.forward_with_cache(&tokens, &mut fresh_cache)?;
+        let (_, val_full) = engine.forward(&tokens).map(|(p, v)| (p, v))?;
+        let diff = (val_cached - val_full).abs();
+        println!(
+            "Correctness: cached={:.6} full={:.6} diff={:.6} {}",
+            val_cached,
+            val_full,
+            diff,
+            if diff < 1e-4 { "✓" } else { "✗ MISMATCH" }
+        );
     }
 
     println!("\n========================================");

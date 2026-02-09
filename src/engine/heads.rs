@@ -1,79 +1,71 @@
 // src/engine/heads.rs
-//! Neural network heads for policy and value prediction
+//! v5.2.0 Neural network heads for policy and value prediction
+//!
+//! Head weights are continuous FP16 (sandwich strategy: FP16 shell, ternary core).
+//! PolicyHead: RMSNorm -> Linear(d_model, vocab_size)
+//! ValueHead: RMSNorm -> Linear(d_model, 256) -> SiLU -> RMSNorm -> Linear(256, 1) -> Tanh
+//!
+//! Input is already ln_f-normalized by Engine before reaching heads.
 
-use crate::constants::{D_MODEL, VOCAB_SIZE};
-use crate::engine::rms_norm;
-use crate::engine::ModelFormat;
-use candle_core::{Result, Tensor};
-use candle_nn::{Linear, Module, VarBuilder};
+use crate::engine::bitlinear::rms_norm;
+use candle_core::Result;
+use candle_core::Tensor;
+use candle_nn::{Module, VarBuilder};
 
-/// Value head: predicts position evaluation (-1 to +1)
+/// Value head: RMSNorm -> Linear(d_model, 256) -> SiLU -> RMSNorm -> Linear(256, 1)
+/// Weights pre-transposed at load time for faster matmul.
 pub struct ValueHead {
-    pub norm_weight: Tensor,
-    pub linear1: Linear,
-    pub linear2: Linear,
+    pub norm1: Tensor,
+    pub w1_t: Tensor, // [d_model, 256] pre-transposed + contiguous
+    pub norm2: Tensor,
+    pub w2_t: Tensor, // [256, 1] pre-transposed + contiguous
 }
 
 impl ValueHead {
-    /// Load from original format
-    pub fn load(vb: &VarBuilder) -> Result<Self> {
-        Self::load_with_format(vb, ModelFormat::Original)
-    }
+    pub fn load(vb: &VarBuilder, d_model: usize) -> Result<Self> {
+        let norm1 = vb.get((d_model,), "value_head.0.norm.weight")?;
+        let w1 = vb.get((256, d_model), "value_head.0.weight")?;
+        let w1_t = w1.t()?.contiguous()?;
 
-    /// Load with specified format
-    pub fn load_with_format(vb: &VarBuilder, format: ModelFormat) -> Result<Self> {
-        let prefix = match format {
-            ModelFormat::Original => "value_head",
-            ModelFormat::Finetuned => "_orig_mod.value_head",
-        };
+        let norm2 = vb.get((256,), "value_head.2.norm.weight")?;
+        let w2 = vb.get((1, 256), "value_head.2.weight")?;
+        let w2_t = w2.t()?.contiguous()?;
 
-        let norm_weight = vb.get((D_MODEL,), &format!("{}.0.weight", prefix))?;
-        let linear1_w = vb.get((512, D_MODEL), &format!("{}.1.weight", prefix))?;
-        let linear2_w = vb.get((1, 512), &format!("{}.3.weight", prefix))?;
         Ok(Self {
-            norm_weight,
-            linear1: Linear::new(linear1_w, None),
-            linear2: Linear::new(linear2_w, None),
+            norm1,
+            w1_t,
+            norm2,
+            w2_t,
         })
     }
 
+    /// Forward: RMSNorm -> matmul -> SiLU -> RMSNorm -> matmul (caller applies tanh)
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = rms_norm(x, &self.norm_weight, 1e-5)?;
-        let x = self.linear1.forward(&x)?;
-        let x = x.relu()?;
-        self.linear2.forward(&x)
+        let x = rms_norm(x, &self.norm1, 1e-5)?;
+        let x = x.broadcast_matmul(&self.w1_t)?;
+        let x = candle_nn::Activation::Silu.forward(&x)?;
+        let x = rms_norm(&x, &self.norm2, 1e-5)?;
+        x.broadcast_matmul(&self.w2_t)
     }
 }
 
-/// Policy head: outputs logits for move probabilities
+/// Policy head: RMSNorm -> Linear(d_model, vocab_size)
+/// Weight pre-transposed at load time for faster matmul.
 pub struct PolicyHead {
-    pub norm_weight: Tensor,
-    pub linear: Linear,
+    pub norm: Tensor,
+    pub w_t: Tensor, // [d_model, vocab_size] pre-transposed + contiguous
 }
 
 impl PolicyHead {
-    /// Load from original format
-    pub fn load(vb: &VarBuilder) -> Result<Self> {
-        Self::load_with_format(vb, ModelFormat::Original)
-    }
-
-    /// Load with specified format
-    pub fn load_with_format(vb: &VarBuilder, format: ModelFormat) -> Result<Self> {
-        let prefix = match format {
-            ModelFormat::Original => "policy_head",
-            ModelFormat::Finetuned => "_orig_mod.policy_head",
-        };
-
-        let norm_weight = vb.get((D_MODEL,), &format!("{}.0.weight", prefix))?;
-        let linear_w = vb.get((VOCAB_SIZE, D_MODEL), &format!("{}.1.weight", prefix))?;
-        Ok(Self {
-            norm_weight,
-            linear: Linear::new(linear_w, None),
-        })
+    pub fn load(vb: &VarBuilder, d_model: usize, vocab_size: usize) -> Result<Self> {
+        let norm = vb.get((d_model,), "policy_head.norm.weight")?;
+        let w = vb.get((vocab_size, d_model), "policy_head.weight")?;
+        let w_t = w.t()?.contiguous()?;
+        Ok(Self { norm, w_t })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = rms_norm(x, &self.norm_weight, 1e-5)?;
-        self.linear.forward(&x)
+        let x = rms_norm(x, &self.norm, 1e-5)?;
+        x.broadcast_matmul(&self.w_t)
     }
 }

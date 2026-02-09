@@ -1,4 +1,4 @@
-use crate::engine::Engine;
+use crate::engine::{Engine, KVCache};
 use crate::uci::MoveCodec;
 use chess::{BitBoard, Board, ChessMove, Color, MoveGen, Piece};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -98,9 +98,13 @@ impl TranspositionTable {
         let idx = (hash as usize) & self.mask;
         let base = idx * 2;
         let d = self.slots[base + 1].load(Ordering::Relaxed);
-        if d == 0 { return None; }
+        if d == 0 {
+            return None;
+        }
         let k = self.slots[base].load(Ordering::Relaxed);
-        if k ^ d != hash { return None; }
+        if k ^ d != hash {
+            return None;
+        }
         Self::unpack(hash, d)
     }
 
@@ -141,8 +145,8 @@ impl TranspositionTable {
             let promo: u64 = match mv.get_promotion() {
                 Some(chess::Piece::Knight) => 1,
                 Some(chess::Piece::Bishop) => 2,
-                Some(chess::Piece::Rook)   => 3,
-                Some(chess::Piece::Queen)  => 4,
+                Some(chess::Piece::Rook) => 3,
+                Some(chess::Piece::Queen) => 4,
                 _ => 0,
             };
             d |= from | (to << 6) | (promo << 12);
@@ -151,7 +155,7 @@ impl TranspositionTable {
         d |= (score_u16 as u64) << 16;
         d |= (entry.depth as u64) << 32;
         let flag_bits: u64 = match entry.flag {
-            TTFlag::Exact      => 0,
+            TTFlag::Exact => 0,
             TTFlag::LowerBound => 1,
             TTFlag::UpperBound => 2,
         };
@@ -161,7 +165,9 @@ impl TranspositionTable {
     }
 
     fn unpack(hash: u64, d: u64) -> Option<TTEntry> {
-        if d == 0 { return None; }
+        if d == 0 {
+            return None;
+        }
         let from = (d & 0x3F) as u8;
         let to = ((d >> 6) & 0x3F) as u8;
         let promo = ((d >> 12) & 0xF) as u8;
@@ -186,7 +192,13 @@ impl TranspositionTable {
             1 => TTFlag::LowerBound,
             _ => TTFlag::UpperBound,
         };
-        Some(TTEntry { hash, depth, score, flag, best_move })
+        Some(TTEntry {
+            hash,
+            depth,
+            score,
+            flag,
+            best_move,
+        })
     }
 }
 
@@ -234,6 +246,7 @@ impl Searcher {
         movestogo: u32,
         stop_flag: Arc<AtomicBool>,
         tx: mpsc::Sender<String>,
+        kv_cache: Option<Arc<parking_lot::Mutex<KVCache>>>,
     ) {
         let engine = Arc::clone(&self.engine);
         let tt = Arc::clone(&self.tt);
@@ -253,8 +266,15 @@ impl Searcher {
             ));
 
             // Pre-compute NN policy ONCE, then share across all threads
+            // Use KV cache if available for incremental inference
             let shared_policy: Arc<Option<(Vec<f32>, f32)>> = {
-                if let Ok(res) = engine.forward(&move_history) {
+                let result = if let Some(ref cache) = kv_cache {
+                    let mut cache_guard = cache.lock();
+                    engine.forward_with_cache(&move_history, &mut cache_guard)
+                } else {
+                    engine.forward(&move_history)
+                };
+                if let Ok(res) = result {
                     if let Ok(pol_vec) = res.0.to_vec1::<f32>() {
                         Arc::new(Some((pol_vec, res.1)))
                     } else {
@@ -276,110 +296,133 @@ impl Searcher {
                 let is_main = i == 0;
                 let policy_clone = Arc::clone(&shared_policy);
 
-                handles.push(std::thread::spawn(move || {
-                    let mut worker = SearchWorker::new(
-                        tt_clone,
-                        board_clone,
-                        stop_clone,
-                    );
-                    let mut best_move = None;
-                    let mut last_score = 0;
-                    let start_time = std::time::Instant::now();
+                handles.push(
+                    std::thread::Builder::new()
+                        .stack_size(64 * 1024 * 1024) // 64MB stack for deep recursion
+                        .spawn(move || {
+                            let mut worker = SearchWorker::new(tt_clone, board_clone, stop_clone);
+                            let mut best_move = None;
+                            let mut last_score = 0;
+                            let mut stability: u32 = 0; // Best-move stability counter
+                            let mut prev_best: Option<ChessMove> = None;
+                            let start_time = std::time::Instant::now();
 
-                    // Use shared pre-computed NN policy (no per-thread forward pass)
-                    worker.set_cached_policy(&*policy_clone);
+                            // Use shared pre-computed NN policy (no per-thread forward pass)
+                            worker.set_cached_policy(&*policy_clone);
 
-                    // Wire time manager for in-search abort checks
-                    let depth_only_check = max_depth > 0 && wtime == 0 && btime == 0;
-                    if !depth_only_check {
-                        worker.time_manager = Some(Arc::clone(&tm_clone));
-                    }
-
-                    // Lazy SMP: Thread chính chạy full depth, Thread phụ chạy depth-1 để feed TT
-                    let effective_max = if max_depth == 0 { MAX_DEPTH } else { max_depth };
-                    let local_max_depth = if is_main {
-                        effective_max
-                    } else {
-                        effective_max.saturating_sub(1).max(1)
-                    };
-
-                    let depth_only = max_depth > 0 && wtime == 0 && btime == 0;
-                    const MIN_DEPTH: u8 = 3; // Always complete at least depth 3
-
-                    for depth in 1..=local_max_depth {
-                        // Only allow time abort AFTER minimum depth is reached
-                        if worker.stop_flag.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        if !depth_only && depth > MIN_DEPTH && tm_clone.should_stop() {
-                            break;
-                        }
-
-                        // Aspiration Windows logic
-                        let mut alpha = -INFINITY;
-                        let mut beta = INFINITY;
-                        if depth > 3 {
-                            alpha = last_score - 50;
-                            beta = last_score + 50;
-                        }
-
-                        loop {
-                            let (score, mv) = worker.alpha_beta(alpha, beta, depth, 0);
-
-                            if worker.stop_flag.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            if !depth_only && depth > MIN_DEPTH && tm_clone.should_stop() {
-                                break;
+                            // Wire time manager for in-search abort checks
+                            let depth_only_check = max_depth > 0 && wtime == 0 && btime == 0;
+                            if !depth_only_check {
+                                worker.time_manager = Some(Arc::clone(&tm_clone));
                             }
 
-                            if score <= alpha {
-                                alpha = alpha.saturating_sub(150); // Widen window
-                            } else if score >= beta {
-                                beta = beta.saturating_add(150); // Widen window
+                            // Lazy SMP: Thread chính chạy full depth, Thread phụ chạy depth-1 để feed TT
+                            let effective_max = if max_depth == 0 { MAX_DEPTH } else { max_depth };
+                            let local_max_depth = if is_main {
+                                effective_max
                             } else {
-                                if is_main {
-                                    best_move = mv;
-                                    last_score = score;
-                                    let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
-                                    let nps = (worker.nodes as f64 / elapsed) as u64;
+                                effective_max.saturating_sub(1).max(1)
+                            };
 
-                                    // In thông tin UCI chuẩn
-                                    let pv_str = if let Some(m) = mv {
-                                        format!("{}", m)
-                                    } else {
-                                        "".to_string()
-                                    };
-                                    println!(
-                                        "info depth {} score cp {} nodes {} nps {} pv {}",
-                                        depth, score, worker.nodes, nps, pv_str
-                                    );
+                            let depth_only = max_depth > 0 && wtime == 0 && btime == 0;
+                            const MIN_DEPTH: u8 = 3; // Always complete at least depth 3
+
+                            for depth in 1..=local_max_depth {
+                                // Age history tables between iterations to prevent stale values
+                                if depth > 1 {
+                                    worker.age_history();
                                 }
-                                break;
-                            }
-                            // Nếu window đã mở hết cỡ mà vẫn fail, break
-                            if alpha <= -INFINITY && beta >= INFINITY {
-                                break;
-                            }
-                        }
-                    }
 
-                    // Gửi kết quả cuối cùng (chỉ main thread)
-                    if is_main {
-                        if let Some(mv) = best_move {
-                            let _ = tx_clone.unwrap().send(format!("bestmove {}", mv));
-                        } else {
-                            // Fallback: Lấy đại một nước hợp lệ nếu chưa tìm thấy gì
-                            let mut moves = MoveGen::new_legal(&board_clone);
-                            if let Some(mv) = moves.next() {
-                                let _ = tx_clone.unwrap().send(format!("bestmove {}", mv));
-                            } else {
-                                // Checkmate/Stalemate detected at root
-                                let _ = tx_clone.unwrap().send("bestmove (none)".to_string());
+                                // Only allow time abort AFTER minimum depth is reached
+                                if worker.stop_flag.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                if !depth_only && depth > MIN_DEPTH {
+                                    if is_main {
+                                        // Use stability-aware soft stop between depths
+                                        if tm_clone.should_stop_soft(stability) {
+                                            break;
+                                        }
+                                    } else if tm_clone.should_stop() {
+                                        break;
+                                    }
+                                }
+
+                                // Aspiration Windows logic
+                                let mut alpha = -INFINITY;
+                                let mut beta = INFINITY;
+                                if depth > 3 {
+                                    alpha = last_score - 50;
+                                    beta = last_score + 50;
+                                }
+
+                                loop {
+                                    let (score, mv) = worker.alpha_beta(alpha, beta, depth, 0);
+
+                                    if worker.stop_flag.load(Ordering::Relaxed) {
+                                        break;
+                                    }
+                                    if !depth_only && depth > MIN_DEPTH && tm_clone.should_stop() {
+                                        break;
+                                    }
+
+                                    if score <= alpha {
+                                        alpha = alpha.saturating_sub(150); // Widen window
+                                    } else if score >= beta {
+                                        beta = beta.saturating_add(150); // Widen window
+                                    } else {
+                                        if is_main {
+                                            // Track best-move stability
+                                            if mv == prev_best {
+                                                stability = stability.saturating_add(1);
+                                            } else {
+                                                stability = 0;
+                                            }
+                                            prev_best = mv;
+                                            best_move = mv;
+                                            last_score = score;
+                                            let elapsed =
+                                                start_time.elapsed().as_secs_f64().max(0.001);
+                                            let nps = (worker.nodes as f64 / elapsed) as u64;
+
+                                            let pv_str = if let Some(m) = mv {
+                                                format!("{}", m)
+                                            } else {
+                                                "".to_string()
+                                            };
+                                            println!(
+                                                "info depth {} score cp {} nodes {} nps {} pv {}",
+                                                depth, score, worker.nodes, nps, pv_str
+                                            );
+                                        }
+                                        break;
+                                    }
+                                    // Nếu window đã mở hết cỡ mà vẫn fail, break
+                                    if alpha <= -INFINITY && beta >= INFINITY {
+                                        break;
+                                    }
+                                }
                             }
-                        }
-                    }
-                }));
+
+                            // Gửi kết quả cuối cùng (chỉ main thread)
+                            if is_main {
+                                if let Some(mv) = best_move {
+                                    let _ = tx_clone.unwrap().send(format!("bestmove {}", mv));
+                                } else {
+                                    // Fallback: Lấy đại một nước hợp lệ nếu chưa tìm thấy gì
+                                    let mut moves = MoveGen::new_legal(&board_clone);
+                                    if let Some(mv) = moves.next() {
+                                        let _ = tx_clone.unwrap().send(format!("bestmove {}", mv));
+                                    } else {
+                                        // Checkmate/Stalemate detected at root
+                                        let _ =
+                                            tx_clone.unwrap().send("bestmove (none)".to_string());
+                                    }
+                                }
+                            }
+                        })
+                        .expect("failed to spawn search thread"),
+                );
             }
 
             for handle in handles {
@@ -401,17 +444,27 @@ pub struct SearchWorker {
     pub nodes: u64,
     killers: [[Option<ChessMove>; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
+    // Countermove heuristic: indexed by [prev_from][prev_to]
+    countermove: [[Option<ChessMove>; 64]; 64],
+    // Continuation history: indexed by [prev_piece][prev_to][piece][to]
+    // Piece index: 0-5 for White P/N/B/R/Q/K, 6-11 for Black P/N/B/R/Q/K
+    cont_history: Box<[[[[i32; 64]; 12]; 64]; 12]>,
+    // Static eval stack for "improving" detection (eval at each ply)
+    eval_stack: [i32; MAX_PLY],
+    // Previous move at each ply (for countermove + continuation history)
+    move_stack: [Option<ChessMove>; MAX_PLY],
+    // Piece that moved at each ply
+    piece_stack: [u8; MAX_PLY],
+    // Capture history: indexed by [moved_piece_idx][to_sq][captured_piece_idx]
+    // Piece index: P=0 N=1 B=2 R=3 Q=4 K=5
+    capture_history: Box<[[[i32; 6]; 64]; 6]>,
     // Cached NN results — computed once, reused across all ID iterations
     cached_root_policy: Option<Vec<f32>>,
     cached_root_value: f32,
 }
 
 impl SearchWorker {
-    pub fn new(
-        tt: Arc<TranspositionTable>,
-        board: Board,
-        stop_flag: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new(tt: Arc<TranspositionTable>, board: Board, stop_flag: Arc<AtomicBool>) -> Self {
         Self {
             tt,
             board,
@@ -420,8 +473,33 @@ impl SearchWorker {
             nodes: 0,
             killers: [[None; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
+            countermove: [[None; 64]; 64],
+            cont_history: Box::new([[[[0i32; 64]; 12]; 64]; 12]),
+            capture_history: Box::new([[[0i32; 6]; 64]; 6]),
+            eval_stack: [0; MAX_PLY],
+            move_stack: [None; MAX_PLY],
+            piece_stack: [0; MAX_PLY],
             cached_root_policy: None,
             cached_root_value: 0.0,
+        }
+    }
+
+    /// Age history tables: halve all scores to prevent stale values from dominating.
+    /// Called between iterative deepening iterations.
+    fn age_history(&mut self) {
+        for side in 0..2 {
+            for from in 0..64 {
+                for to in 0..64 {
+                    self.history[side][from][to] /= 2;
+                }
+            }
+        }
+        for p in 0..6 {
+            for sq in 0..64 {
+                for v in 0..6 {
+                    self.capture_history[p][sq][v] /= 2;
+                }
+            }
         }
     }
 
@@ -449,7 +527,41 @@ impl SearchWorker {
     #[inline]
     fn is_capture(&self, mv: ChessMove) -> bool {
         let targets = *self.board.color_combined(!self.board.side_to_move());
-        (targets & BitBoard::from_square(mv.get_dest())).popcnt() > 0
+        (targets & BitBoard::from_square(mv.get_dest())).0 != 0
+    }
+
+    // =========================================================================
+    // HELPER: piece index for continuation history (0-11)
+    // White P=0,N=1,B=2,R=3,Q=4,K=5  Black P=6,N=7,B=8,R=9,Q=10,K=11
+    // =========================================================================
+    #[inline]
+    fn piece_index(piece: Piece, color: Color) -> u8 {
+        let base = match piece {
+            Piece::Pawn => 0,
+            Piece::Knight => 1,
+            Piece::Bishop => 2,
+            Piece::Rook => 3,
+            Piece::Queen => 4,
+            Piece::King => 5,
+        };
+        if color == Color::Black {
+            base + 6
+        } else {
+            base
+        }
+    }
+
+    /// Piece index 0-5 (color-independent) for capture history
+    #[inline]
+    fn cap_piece_index(piece: Piece) -> usize {
+        match piece {
+            Piece::Pawn => 0,
+            Piece::Knight => 1,
+            Piece::Bishop => 2,
+            Piece::Rook => 3,
+            Piece::Queen => 4,
+            Piece::King => 5,
+        }
     }
 
     // =========================================================================
@@ -462,7 +574,7 @@ impl SearchWorker {
         let pawns = self.board.pieces(Piece::Pawn);
         let king_bb = BitBoard::from_square(self.board.king_square(us));
         let non_pawn = our_pieces & !pawns & !king_bb;
-        non_pawn.popcnt() > 0
+        non_pawn.0 != 0
     }
 
     // =========================================================================
@@ -475,8 +587,13 @@ impl SearchWorker {
         mut depth: u8,
         ply: usize,
     ) -> (i32, Option<ChessMove>) {
+        // --- Step 0: MAX_PLY guard (prevent stack overflow) ---
+        if ply >= MAX_PLY {
+            return (self.fast_eval(), None);
+        }
+
         // --- Step 1: Abort check (+ periodic time check every 2048 nodes) ---
-        if self.nodes & 2047 == 0 {
+        if self.nodes & 4095 == 0 {
             if let Some(ref tm) = self.time_manager {
                 if tm.should_stop() {
                     self.stop_flag.store(true, Ordering::Relaxed);
@@ -491,7 +608,7 @@ impl SearchWorker {
         let is_root = ply == 0;
 
         // --- Step 2: Check extension ---
-        let in_check = self.board.checkers().popcnt() > 0;
+        let in_check = self.board.checkers().0 != 0;
         if in_check && depth < MAX_PLY as u8 {
             depth += 1;
         }
@@ -502,17 +619,25 @@ impl SearchWorker {
         if !is_root {
             let mating_score = MATE_SCORE - ply as i32;
             let mated_score = -MATE_SCORE + ply as i32;
-            if alpha >= mating_score { return (alpha, None); }
-            if beta <= mated_score { return (beta, None); }
+            if alpha >= mating_score {
+                return (alpha, None);
+            }
+            if beta <= mated_score {
+                return (beta, None);
+            }
             alpha = alpha.max(mated_score);
             beta = beta.min(mating_score);
-            if alpha >= beta { return (alpha, None); }
+            if alpha >= beta {
+                return (alpha, None);
+            }
         }
 
         // --- Step 4: TT Lookup ---
         let hash = self.board.get_hash();
         let tt_entry = self.tt.get(hash);
         let tt_move = tt_entry.as_ref().and_then(|e| e.best_move);
+        let tt_score = tt_entry.as_ref().map(|e| e.score);
+        let tt_depth = tt_entry.as_ref().map(|e| e.depth).unwrap_or(0);
 
         if !is_pv {
             if let Some(ref entry) = tt_entry {
@@ -541,10 +666,21 @@ impl SearchWorker {
         self.nodes += 1;
 
         // --- Step 6: Static Evaluation for pruning (fast, no NN) ---
-        let static_eval = if in_check { -INFINITY } else { self.fast_eval() };
+        let static_eval = if in_check {
+            -INFINITY
+        } else {
+            self.fast_eval()
+        };
+
+        // Store eval in stack for improving detection
+        self.eval_stack[ply_idx] = static_eval;
+
+        // --- Step 6b: Improving flag ---
+        // Position is "improving" if static eval is better than 2 plies ago
+        let improving =
+            !in_check && ply >= 2 && static_eval > self.eval_stack[ply_idx.saturating_sub(2)];
 
         // --- Step 7: Razoring (Stockfish-style) ---
-        // If eval is far below alpha, drop into qsearch
         if !is_pv && !in_check && depth <= 3 {
             let razor_margin = 300 + 250 * (depth as i32);
             if static_eval + razor_margin < alpha {
@@ -556,29 +692,63 @@ impl SearchWorker {
         }
 
         // --- Step 8: Reverse Futility Pruning (Static Null Move Pruning) ---
-        // If our position is so good that even subtracting a margin still >= beta
-        if !is_pv && !in_check && depth <= 7
-            && static_eval - 80 * (depth as i32) >= beta
+        // Improving flag: tighter margin when position is improving
+        if !is_pv
+            && !in_check
+            && depth <= 7
+            && static_eval - (if improving { 60 } else { 90 }) * (depth as i32) >= beta
             && static_eval < MATE_SCORE - 100
         {
             return (static_eval, None);
         }
 
-        // --- Step 9: Null Move Pruning (approximation) ---
-        // chess crate doesn't support null moves directly, so we use
-        // an enhanced static pruning: if eval >= beta + depth-scaled margin, prune.
-        if !is_pv && !in_check && depth >= 3
-            && static_eval >= beta
-            && self.has_non_pawn_material()
+        // --- Step 8b: Probcut ---
+        // If a shallow search with a raised beta finds a cutoff, prune
+        let probcut_beta = beta + 200;
+        if !is_pv
+            && !in_check
+            && depth >= 5
+            && static_eval >= probcut_beta - 100
+            && static_eval < MATE_SCORE - 100
         {
-            let null_margin = 120 * (depth as i32) / 3;
-            if static_eval - null_margin >= beta {
-                return (beta, None);
+            let pc_depth = depth.saturating_sub(4);
+            let (val, _) = self.alpha_beta(probcut_beta - 1, probcut_beta, pc_depth, ply);
+            if val >= probcut_beta {
+                return (val, None);
+            }
+        }
+
+        // --- Step 9: Real Null Move Pruning ---
+        // Actually pass the move and search with reduced depth
+        if !is_pv && !in_check && depth >= 3 && static_eval >= beta && self.has_non_pawn_material()
+        {
+            if let Some(null_board) = self.board.null_move() {
+                let old_board = self.board;
+                self.board = null_board;
+
+                // Adaptive reduction: R = 3 + depth/6, capped
+                let r = 3 + (depth / 6).min(3);
+                let null_depth = depth.saturating_sub(r);
+                let (val, _) = self.alpha_beta(-beta, -beta + 1, null_depth, ply + 1);
+                let null_score = -val;
+
+                self.board = old_board;
+
+                if self.stop_flag.load(Ordering::Relaxed) {
+                    return (0, None);
+                }
+
+                if null_score >= beta {
+                    // Don't return unproven mate scores
+                    if null_score >= MATE_SCORE - 100 {
+                        return (beta, None);
+                    }
+                    return (null_score, None);
+                }
             }
         }
 
         // --- Step 10: Internal Iterative Reduction (IIR) ---
-        // If no TT move found at this depth, reduce depth
         if depth >= 4 && tt_move.is_none() && !in_check {
             depth -= 1;
         }
@@ -591,12 +761,7 @@ impl SearchWorker {
         };
 
         // --- Step 12: Generate and order moves ---
-        let moves = self.order_moves(
-            MoveGen::new_legal(&self.board),
-            policy,
-            ply,
-            tt_move,
-        );
+        let moves = self.order_moves(MoveGen::new_legal(&self.board), policy, ply, tt_move);
 
         if moves.is_empty() {
             return if in_check {
@@ -606,10 +771,58 @@ impl SearchWorker {
             };
         }
 
+        // --- Step 12b: Singular Extensions (Stockfish restricted SE) ---
+        // If TT move exists at sufficient depth with a lower-bound, test if it's singular
+        // by searching *only the second-best move* at reduced depth.
+        // If no alternative beats se_beta, the TT move is "singular" → extend it.
+        let mut singular_extension: i8 = 0;
+        if !is_root
+            && depth >= 8
+            && tt_move.is_some()
+            && tt_depth >= depth.saturating_sub(3)
+            && tt_entry
+                .as_ref()
+                .map_or(false, |e| e.flag != TTFlag::UpperBound)
+        {
+            let tt_sc = tt_score.unwrap_or(0);
+            let se_beta = tt_sc - 2 * (depth as i32);
+            let se_depth = (depth - 1) / 2;
+
+            // Search only the best non-TT move at reduced depth
+            let mut se_found_fail = true;
+            for (mv, _) in &moves {
+                if Some(*mv) == tt_move {
+                    continue;
+                }
+                let old_board = self.board;
+                self.board = old_board.make_move_new(*mv);
+                let (val, _) = self.alpha_beta(-se_beta, -se_beta + 1, se_depth, ply + 1);
+                let score = -val;
+                self.board = old_board;
+
+                if self.stop_flag.load(Ordering::Relaxed) {
+                    return (0, None);
+                }
+
+                if score >= se_beta {
+                    se_found_fail = false;
+                }
+                // Only test the top-ranked non-TT move (restricted SE)
+                break;
+            }
+
+            if se_found_fail {
+                singular_extension = 1;
+            }
+        }
+
         let original_alpha = alpha;
         let mut best_move = None;
         let mut best_score = -INFINITY;
         let mut moves_searched = 0;
+        // Track quiet moves that failed to produce a cutoff (for history gravity)
+        let mut quiets_tried: [Option<ChessMove>; 64] = [None; 64];
+        let mut quiets_count = 0usize;
 
         for (mv, _move_score) in &moves {
             let mv = *mv;
@@ -618,16 +831,16 @@ impl SearchWorker {
             let is_tactical = is_cap || is_promo;
 
             // --- Step 13: Late Move Pruning (LMP) ---
-            // Skip quiet late moves at low depth
+            // Improving flag: allow more moves when improving
             if !is_root && !in_check && !is_tactical && depth <= 5 {
-                let lmp_threshold = (3 + (depth as usize) * (depth as usize)) / 2;
+                let base = (3 + (depth as usize) * (depth as usize)) / 2;
+                let lmp_threshold = if improving { base + 2 } else { base };
                 if moves_searched >= lmp_threshold {
                     continue;
                 }
             }
 
             // --- Step 14: Futility Pruning ---
-            // At frontier/pre-frontier nodes, skip quiet moves if eval + margin < alpha
             if !is_root && !in_check && !is_tactical && depth <= 6 && moves_searched > 0 {
                 let futility_margin = static_eval + 100 + 120 * (depth as i32);
                 if futility_margin <= alpha {
@@ -636,42 +849,49 @@ impl SearchWorker {
             }
 
             // --- Step 15: SEE Pruning for bad captures ---
-            // Skip captures where we lose material (e.g., QxP defended by pawn)
             if !is_root && is_cap && !is_promo && depth <= 4 && moves_searched > 0 {
                 let victim = self.board.piece_on(mv.get_dest()).unwrap_or(Piece::Pawn);
                 let attacker = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
-                // Simple SEE approximation: skip if attacker > victim + margin
                 if piece_value(attacker) > piece_value(victim) + 200 {
                     continue;
                 }
             }
 
             // --- Step 16: Make move ---
+            let moved_piece = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
+            let moved_color = self.board.side_to_move();
             let old_board = self.board;
             self.board = self.board.make_move_new(mv);
 
-            let gives_check = self.board.checkers().popcnt() > 0;
+            // Record move/piece in stacks for continuation history
+            self.move_stack[ply_idx] = Some(mv);
+            self.piece_stack[ply_idx] = Self::piece_index(moved_piece, moved_color);
+
+            let gives_check = self.board.checkers().0 != 0;
 
             let mut score;
 
+            // Apply singular extension to TT move
+            let ext: u8 = if Some(mv) == tt_move && singular_extension > 0 {
+                1
+            } else {
+                0
+            };
+            let effective_depth = depth - 1 + ext;
+
             // --- Step 17: PVS (Principal Variation Search) ---
             if moves_searched == 0 {
-                let (val, _) = self.alpha_beta(-beta, -alpha, depth - 1, ply + 1);
+                let (val, _) = self.alpha_beta(-beta, -alpha, effective_depth, ply + 1);
                 score = -val;
             } else {
                 // --- Step 18: Late Move Reductions (LMR) ---
-                // Conditions: depth >= 3, not in check, not PV node
-                // Quiet moves (non-capture, non-promo, non-check) get
-                // heavier reduction after move 4.
                 let mut r: u8 = 0;
                 if depth >= 3 && !in_check && !is_pv {
                     if is_tactical || gives_check {
-                        // Tactical moves: only light reduction after many moves
                         if moves_searched >= 6 {
                             r = 1;
                         }
                     } else {
-                        // Quiet moves: use pre-computed LMR table
                         if moves_searched > 4 {
                             let di = (depth as usize).min(LMR_MAX_DEPTH - 1);
                             let mi = moves_searched.min(LMR_MAX_MOVES - 1);
@@ -681,33 +901,64 @@ impl SearchWorker {
                         }
                     }
                     // Reduce less for killer moves
-                    if self.killers[ply_idx][0] == Some(mv)
-                        || self.killers[ply_idx][1] == Some(mv)
+                    if self.killers[ply_idx][0] == Some(mv) || self.killers[ply_idx][1] == Some(mv)
                     {
                         r = r.saturating_sub(1);
                     }
+
+                    // --- History-based LMR adjustment ---
+                    if !is_tactical {
+                        let side = if moved_color == Color::White { 0 } else { 1 };
+                        let h = self.history[side][mv.get_source().to_index()]
+                            [mv.get_dest().to_index()];
+                        // Good history → reduce less; bad history → reduce more
+                        let h_adj = (h / 5000).clamp(-2, 2) as i8;
+                        r = (r as i8 - h_adj).max(0) as u8;
+
+                        // Also use continuation history for LMR adjustment
+                        if ply >= 1 {
+                            let prev_ply = (ply - 1).min(MAX_PLY - 1);
+                            let pp = self.piece_stack[prev_ply] as usize;
+                            if let Some(prev_mv) = self.move_stack[prev_ply] {
+                                let pt = prev_mv.get_dest().to_index();
+                                let cp = Self::piece_index(moved_piece, moved_color) as usize;
+                                let ct = mv.get_dest().to_index();
+                                if pp < 12 && cp < 12 {
+                                    let ch = self.cont_history[pp][pt][cp][ct];
+                                    let ch_adj = (ch / 5000).clamp(-1, 1) as i8;
+                                    r = (r as i8 - ch_adj).max(0) as u8;
+                                }
+                            }
+                        }
+                    }
+
+                    // Reduce more when NOT improving
+                    if !improving {
+                        r = r.saturating_add(1);
+                    }
+
                     // Never reduce into qsearch (keep at least depth 1)
-                    r = r.min(depth.saturating_sub(2));
+                    r = r.min(effective_depth.saturating_sub(1));
                 }
 
                 // Null-window search with reduction
                 let (val, _) = self.alpha_beta(
                     -alpha - 1,
                     -alpha,
-                    depth.saturating_sub(1 + r),
+                    effective_depth.saturating_sub(r),
                     ply + 1,
                 );
                 score = -val;
 
                 // Re-search at full depth if LMR failed high
                 if r > 0 && score > alpha {
-                    let (val, _) = self.alpha_beta(-alpha - 1, -alpha, depth - 1, ply + 1);
+                    let (val, _) = self.alpha_beta(-alpha - 1, -alpha, effective_depth, ply + 1);
                     score = -val;
                 }
 
                 // Full PV re-search if null-window failed high
                 if score > alpha && score < beta {
-                    let (val, _) = self.alpha_beta(-beta, -alpha, depth - 1, ply + 1);
+                    let (val, _) = self.alpha_beta(-beta, -alpha, effective_depth, ply + 1);
                     score = -val;
                 }
             }
@@ -717,6 +968,12 @@ impl SearchWorker {
 
             if self.stop_flag.load(Ordering::Relaxed) {
                 return (0, None);
+            }
+
+            // Track quiet moves for history gravity
+            if !is_cap && !is_promo && quiets_count < 64 {
+                quiets_tried[quiets_count] = Some(mv);
+                quiets_count += 1;
             }
 
             moves_searched += 1;
@@ -731,21 +988,94 @@ impl SearchWorker {
                 alpha = score;
 
                 if score >= beta {
-                    // --- Step 21: Beta cutoff → update killers & history ---
-                    if !is_cap {
-                        self.killers[ply_idx][1] = self.killers[ply_idx][0];
-                        self.killers[ply_idx][0] = Some(mv);
-                    }
-                    let side = if self.board.side_to_move() == Color::White { 0 } else { 1 };
+                    // --- Step 21: Beta cutoff → update killers, history, countermove, cont_history ---
+                    let side = if moved_color == Color::White { 0 } else { 1 };
                     let from = mv.get_source().to_index();
                     let to = mv.get_dest().to_index();
-                    self.history[side][from][to] += (depth as i32) * (depth as i32);
-                    // Prevent history overflow
-                    if self.history[side][from][to] > 30000 {
-                        for s in 0..2 {
-                            for f in 0..64 {
-                                for t in 0..64 {
-                                    self.history[s][f][t] /= 2;
+
+                    if is_cap {
+                        // Capture history bonus for the capture that caused cutoff
+                        let bonus = (depth as i32) * (depth as i32);
+                        let ai = Self::cap_piece_index(moved_piece);
+                        let vi = Self::cap_piece_index(
+                            old_board.piece_on(mv.get_dest()).unwrap_or(Piece::Pawn),
+                        );
+                        let ct = mv.get_dest().to_index();
+                        self.capture_history[ai][ct][vi] += bonus;
+                        self.capture_history[ai][ct][vi] =
+                            self.capture_history[ai][ct][vi].clamp(-30000, 30000);
+                    }
+
+                    if !is_cap {
+                        // Killer moves
+                        self.killers[ply_idx][1] = self.killers[ply_idx][0];
+                        self.killers[ply_idx][0] = Some(mv);
+
+                        // History bonus for the move that caused cutoff
+                        let bonus = (depth as i32) * (depth as i32);
+                        self.history[side][from][to] += bonus;
+
+                        // History gravity: penalize all quiet moves that didn't cause cutoff
+                        let malus = -bonus;
+                        for i in 0..quiets_count {
+                            if let Some(q) = quiets_tried[i] {
+                                if q != mv {
+                                    let qf = q.get_source().to_index();
+                                    let qt = q.get_dest().to_index();
+                                    self.history[side][qf][qt] += malus;
+                                    self.history[side][qf][qt] =
+                                        self.history[side][qf][qt].clamp(-30000, 30000);
+                                }
+                            }
+                        }
+
+                        // Clamp history to prevent overflow (per-entry, no full table scan)
+                        self.history[side][from][to] =
+                            self.history[side][from][to].clamp(-30000, 30000);
+
+                        // Countermove heuristic: record this move as refutation of previous move
+                        if ply >= 1 {
+                            let prev_ply = (ply - 1).min(MAX_PLY - 1);
+                            if let Some(prev_mv) = self.move_stack[prev_ply] {
+                                let pf = prev_mv.get_source().to_index();
+                                let pt = prev_mv.get_dest().to_index();
+                                self.countermove[pf][pt] = Some(mv);
+                            }
+                        }
+
+                        // Continuation history: update [prev_piece][prev_to][cur_piece][cur_to]
+                        if ply >= 1 {
+                            let prev_ply = (ply - 1).min(MAX_PLY - 1);
+                            let pp = self.piece_stack[prev_ply] as usize;
+                            if let Some(prev_mv) = self.move_stack[prev_ply] {
+                                let pt = prev_mv.get_dest().to_index();
+                                let cp = Self::piece_index(moved_piece, moved_color) as usize;
+                                let ct = mv.get_dest().to_index();
+                                if pp < 12 && cp < 12 {
+                                    self.cont_history[pp][pt][cp][ct] += bonus;
+                                    self.cont_history[pp][pt][cp][ct] =
+                                        self.cont_history[pp][pt][cp][ct].clamp(-30000, 30000);
+
+                                    // Penalize quiet non-cutoff moves in cont_history too
+                                    for i in 0..quiets_count {
+                                        if let Some(q) = quiets_tried[i] {
+                                            if q != mv {
+                                                let qp = self
+                                                    .board
+                                                    .piece_on(q.get_source())
+                                                    .unwrap_or(Piece::Pawn);
+                                                let qi =
+                                                    Self::piece_index(qp, moved_color) as usize;
+                                                let qt = q.get_dest().to_index();
+                                                if qi < 12 {
+                                                    self.cont_history[pp][pt][qi][qt] += malus;
+                                                    self.cont_history[pp][pt][qi][qt] = self
+                                                        .cont_history[pp][pt][qi][qt]
+                                                        .clamp(-30000, 30000);
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -782,7 +1112,7 @@ impl SearchWorker {
     }
 
     // =========================================================================
-    // QUIESCENCE SEARCH with Delta Pruning
+    // QUIESCENCE SEARCH with Delta Pruning + Check Extensions
     // =========================================================================
     fn quiescence(&mut self, mut alpha: i32, beta: i32, ply: usize) -> i32 {
         self.nodes += 1;
@@ -791,7 +1121,7 @@ impl SearchWorker {
         if ply >= MAX_PLY {
             return self.fast_eval();
         }
-        if self.nodes & 2047 == 0 {
+        if self.nodes & 4095 == 0 {
             if let Some(ref tm) = self.time_manager {
                 if tm.should_stop() {
                     self.stop_flag.store(true, Ordering::Relaxed);
@@ -802,41 +1132,95 @@ impl SearchWorker {
             return 0;
         }
 
+        let in_check = self.board.checkers().0 != 0;
+
+        // --- TT probe in qsearch ---
+        let hash = self.board.get_hash();
+        if let Some(entry) = self.tt.get(hash) {
+            match entry.flag {
+                TTFlag::Exact => return entry.score,
+                TTFlag::LowerBound => {
+                    if entry.score >= beta {
+                        return entry.score;
+                    }
+                }
+                TTFlag::UpperBound => {
+                    if entry.score <= alpha {
+                        return entry.score;
+                    }
+                }
+            }
+        }
+
         // Use fast static eval in quiescence (NN is too slow per-node)
-        let stand_pat = self.fast_eval();
+        let stand_pat = if in_check {
+            -INFINITY
+        } else {
+            self.fast_eval()
+        };
 
-        if stand_pat >= beta {
-            return stand_pat;
+        if !in_check {
+            if stand_pat >= beta {
+                return stand_pat;
+            }
+            if stand_pat > alpha {
+                alpha = stand_pat;
+            }
+
+            // Delta pruning threshold: if even capturing the best piece can't raise alpha
+            let big_delta = 1000; // Queen value ~= 900, with margin
+            if stand_pat + big_delta < alpha {
+                return alpha;
+            }
         }
-        if stand_pat > alpha {
-            alpha = stand_pat;
+
+        // When in check: search ALL legal moves (must escape check)
+        // Otherwise: only search captures
+        let mut scored_moves: Vec<(ChessMove, i32)> = Vec::with_capacity(16);
+
+        if in_check {
+            let moves = MoveGen::new_legal(&self.board);
+            for mv in moves {
+                let targets = *self.board.color_combined(!self.board.side_to_move());
+                let is_cap = (targets & BitBoard::from_square(mv.get_dest())).0 != 0;
+                let mut score: i32 = 0;
+                if is_cap {
+                    let victim = self.board.piece_on(mv.get_dest()).unwrap_or(Piece::Pawn);
+                    let attacker = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
+                    score = piece_value(victim) * 10 - piece_value(attacker) + 50_000;
+                }
+                scored_moves.push((mv, score));
+            }
+            // If no legal moves in check → checkmate
+            if scored_moves.is_empty() {
+                return -MATE_SCORE + ply as i32;
+            }
+        } else {
+            let targets = *self.board.color_combined(!self.board.side_to_move());
+            let mut moves = MoveGen::new_legal(&self.board);
+            moves.set_iterator_mask(targets);
+            for mv in moves {
+                let victim = self.board.piece_on(mv.get_dest()).unwrap_or(Piece::Pawn);
+                let attacker = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
+                let see_score = piece_value(victim) * 10 - piece_value(attacker);
+                scored_moves.push((mv, see_score));
+            }
         }
+        scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
-        // Delta pruning threshold: if even capturing the best piece can't raise alpha
-        let big_delta = 1000; // Queen value ~= 900, with margin
-        if stand_pat + big_delta < alpha {
-            return alpha;
-        }
+        let original_alpha = alpha;
+        let mut best_move = None;
+        let mut best_score = stand_pat;
 
-        let targets = *self.board.color_combined(!self.board.side_to_move());
-        let mut moves = MoveGen::new_legal(&self.board);
-        moves.set_iterator_mask(targets);
+        for (mv, _) in &scored_moves {
+            let mv = *mv;
 
-        // Collect and sort captures by MVV-LVA
-        let mut captures: Vec<(ChessMove, i32)> = Vec::with_capacity(16);
-        for mv in moves {
-            let victim = self.board.piece_on(mv.get_dest()).unwrap_or(Piece::Pawn);
-            let attacker = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
-            let see_score = piece_value(victim) * 10 - piece_value(attacker);
-            captures.push((mv, see_score));
-        }
-        captures.sort_by(|a, b| b.1.cmp(&a.1));
-
-        for (mv, _) in captures {
-            // Delta pruning per-move: skip if captured piece can't raise alpha
-            let victim = self.board.piece_on(mv.get_dest()).unwrap_or(Piece::Pawn);
-            if stand_pat + piece_value(victim) + 200 < alpha && mv.get_promotion().is_none() {
-                continue;
+            // Delta pruning per-move (skip when in check)
+            if !in_check {
+                let victim = self.board.piece_on(mv.get_dest()).unwrap_or(Piece::Pawn);
+                if stand_pat + piece_value(victim) + 200 < alpha && mv.get_promotion().is_none() {
+                    continue;
+                }
             }
 
             let old_board = self.board;
@@ -846,7 +1230,20 @@ impl SearchWorker {
 
             self.board = old_board;
 
+            if score > best_score {
+                best_score = score;
+                best_move = Some(mv);
+            }
+
             if score >= beta {
+                // Store TT entry for beta cutoff in qsearch
+                self.tt.store(TTEntry {
+                    hash,
+                    depth: 0,
+                    score,
+                    flag: TTFlag::LowerBound,
+                    best_move: Some(mv),
+                });
                 return score;
             }
             if score > alpha {
@@ -854,11 +1251,25 @@ impl SearchWorker {
             }
         }
 
+        // Store TT entry for qsearch result
+        let flag = if best_move.is_some() && alpha > original_alpha {
+            TTFlag::Exact
+        } else {
+            TTFlag::UpperBound
+        };
+        self.tt.store(TTEntry {
+            hash,
+            depth: 0,
+            score: best_score,
+            flag,
+            best_move,
+        });
+
         alpha
     }
 
     // =========================================================================
-    // MOVE ORDERING: TT move > Policy > Captures (MVV-LVA) > Killers > History
+    // MOVE ORDERING: TT > Policy > Captures > Promos > Killers > Countermove > ContHist > History
     // =========================================================================
     fn order_moves(
         &self,
@@ -866,58 +1277,100 @@ impl SearchWorker {
         policy: Option<&[f32]>,
         ply: usize,
         tt_move: Option<ChessMove>,
-    ) -> Vec<(ChessMove, f32)> {
+    ) -> Vec<(ChessMove, i32)> {
         let ply_idx = ply.min(MAX_PLY - 1);
         let targets = *self.board.color_combined(!self.board.side_to_move());
-        let mut scored: Vec<(ChessMove, f32)> = Vec::with_capacity(40);
+        let side = if self.board.side_to_move() == Color::White {
+            0
+        } else {
+            1
+        };
+        let mut scored: Vec<(ChessMove, i32)> = Vec::with_capacity(40);
+
+        // Pre-fetch previous move info for countermove + continuation history
+        let prev_info: Option<(usize, usize, usize)> = if ply >= 1 {
+            let prev_ply = (ply - 1).min(MAX_PLY - 1);
+            if let Some(prev_mv) = self.move_stack[prev_ply] {
+                let pf = prev_mv.get_source().to_index();
+                let pt = prev_mv.get_dest().to_index();
+                let pp = self.piece_stack[prev_ply] as usize;
+                Some((pf, pt, pp))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         for mv in moves {
-            let mut score: f32 = 0.0;
+            let mut score: i32 = 0;
 
             // 1. TT move gets highest priority
             if Some(mv) == tt_move {
-                score += 200_000.0;
+                score += 200_000;
             }
 
             // 2. Neural policy score (very high priority when available)
             if let Some(pol) = policy {
                 let token = MoveCodec::get_policy_index(&mv);
                 if token < pol.len() {
-                    score += pol[token] * 15_000.0;
+                    score += (pol[token] * 15_000.0) as i32;
                 }
             }
 
-            // 3. Captures scored by MVV-LVA
-            if (targets & BitBoard::from_square(mv.get_dest())).popcnt() > 0 {
+            // 3. Captures scored by MVV-LVA + capture history
+            if (targets & BitBoard::from_square(mv.get_dest())).0 != 0 {
                 let victim = self.board.piece_on(mv.get_dest()).unwrap_or(Piece::Pawn);
                 let attacker = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
-                let victim_val = piece_value(victim);
-                let attacker_val = piece_value(attacker);
-                score += (victim_val * 10 - attacker_val) as f32 + 50_000.0;
+                score += piece_value(victim) * 10 - piece_value(attacker) + 50_000;
+                // Capture history bonus
+                let ai = Self::cap_piece_index(attacker);
+                let vi = Self::cap_piece_index(victim);
+                let to = mv.get_dest().to_index();
+                score += self.capture_history[ai][to][vi] / 2;
             }
 
             // 4. Promotions
             if mv.get_promotion().is_some() {
-                score += 45_000.0;
+                score += 45_000;
             }
 
             // 5. Killer moves
             if self.killers[ply_idx][0] == Some(mv) {
-                score += 40_000.0;
+                score += 40_000;
             } else if self.killers[ply_idx][1] == Some(mv) {
-                score += 35_000.0;
+                score += 35_000;
             }
 
-            // 6. History heuristic
-            let side = if self.board.side_to_move() == Color::White { 0 } else { 1 };
+            // 6. Countermove heuristic
+            if let Some((pf, pt, _)) = prev_info {
+                if self.countermove[pf][pt] == Some(mv) {
+                    score += 30_000;
+                }
+            }
+
+            // 7. Continuation history
+            if let Some((_, pt, pp)) = prev_info {
+                if pp < 12 {
+                    let piece = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
+                    let color = self.board.side_to_move();
+                    let cp = Self::piece_index(piece, color) as usize;
+                    let ct = mv.get_dest().to_index();
+                    if cp < 12 {
+                        score += self.cont_history[pp][pt][cp][ct] / 2;
+                    }
+                }
+            }
+
+            // 8. History heuristic
             let from = mv.get_source().to_index();
             let to = mv.get_dest().to_index();
-            score += self.history[side][from][to] as f32;
+            score += self.history[side][from][to];
 
             scored.push((mv, score));
         }
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_unstable_by(|a, b| b.1.cmp(&a.1));
         scored
     }
 }

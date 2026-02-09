@@ -5,6 +5,55 @@ All notable changes to KiyEngine will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.2.0] - 2026-02-10
+
+### Added
+- **Bit-Packed Ternary Weights** — dual bitmask format (`pos_bits` + `neg_bits`)
+  - Each ternary weight {-1, 0, +1} stored in 2 bits across two masks (4× denser than i8)
+  - `pack_ternary_bits()` packing computed at load time from i8 weights
+  - Weight memory: ~3 MB packed vs ~12 MB i8 (4× reduction)
+- **AVX-512 Packed GEMV** — load 2 bytes directly as native `__mmask16`, zero expansion needed
+  - `_mm512_mask_add_ps` / `_mm512_mask_sub_ps` process 16 weights per cycle
+- **AVX2 Packed GEMV** — byte→8-lane mask expansion using `set1_epi32` + `and` + `cmpeq` trick
+- **NEON Packed GEMV** — 4-lane bit expansion with `vbslq_f32`
+- **Scalar Packed GEMV** — portable fallback with bit extraction loop
+- `dispatch_packed_gemv()` method for automatic ISA selection at runtime
+
+### Changed
+- `BitLinear` struct now stores `pos_bits`, `neg_bits`, `row_bytes` alongside `weight_i8`
+- `forward_single()` uses packed GEMV instead of i8→f32 conversion SIMD
+- `forward()` stays F32 matmul for sequences (candle's tiled GEMM beats per-token GEMV for batch > 1)
+
+### Performance
+- KV Cache incremental inference: 4.5–5× speedup (packed GEMV on single-token path)
+- Weight data 4× smaller → improved CPU cache utilization
+- Correctness verified: `diff=0.000000` between cached and full inference
+
+## [5.1.0] - 2026-02-09
+
+### Added
+- **KV Cache** for incremental transformer inference
+  - `KVCache` struct stores per-layer (K, V) tensors, tracks cached sequence length
+  - `MultiheadAttention::forward_cached()` processes only new tokens, concatenates with cached K/V
+  - `TransformerBlock::forward_cached()` and `Engine::forward_with_cache()`
+  - UCI integration via `Arc<parking_lot::Mutex<KVCache>>`, cleared on `ucinewgame`
+- **Capture History** — `[piece_moved][to_sq][captured_piece]` table (6×64×6)
+  - Updated on capture beta cutoffs, used to improve capture ordering
+- **Check Extensions in Quiescence** — searches all legal moves when in check, detects checkmate
+- **History Aging** — halves all history + capture_history scores between iterative deepening iterations
+
+### Changed
+- **Pre-transposed `out_proj` weight** in `MultiheadAttention`
+  - Replaced `candle_nn::Linear` with manual `broadcast_matmul` on pre-transposed contiguous weight
+- **Pre-transposed head weights** — `PolicyHead.w_t` and `ValueHead.w1_t/w2_t` transposed at load time
+- **Fused RMSNorm+MatMul** in `BitLinear` — `fused_rms_norm_matmul()` eliminates intermediate tensor allocations
+
+### Performance
+- KV Cache: 3.6–4.6× speedup for incremental inference
+- seq_len=4: ~10.4ms (was 12.7ms), seq_len=8: ~9.6ms (was 16.7ms)
+- KV cached +1 token: ~5.2ms
+- Search NPS: ~625K at depth 14 (single-thread equivalent)
+
 ## [5.0.0] - 2026-02-08
 
 ### Added

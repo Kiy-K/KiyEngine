@@ -1,7 +1,7 @@
 // src/uci/mod.rs
 
 use crate::book::OpeningBook;
-use crate::engine::Engine;
+use crate::engine::{Engine, KVCache};
 use crate::search::{Searcher, TranspositionTable};
 use chess::{Board, ChessMove, MoveGen, Square};
 use std::io::{self, BufRead};
@@ -39,10 +39,10 @@ impl MoveCodec {
     /// This is used for BOTH input-token embedding AND policy-head lookup.
     pub fn move_to_token(mv: &ChessMove) -> u32 {
         let from = mv.get_source().to_int() as i32;
-        let to   = mv.get_dest().to_int() as i32;
+        let to = mv.get_dest().to_int() as i32;
 
-        let df = (to % 8) - (from % 8);   // delta file
-        let dr = (to / 8) - (from / 8);   // delta rank
+        let df = (to % 8) - (from % 8); // delta file
+        let dr = (to / 8) - (from / 8); // delta rank
 
         let plane: i32 = if let Some(promo) = mv.get_promotion() {
             if promo == chess::Piece::Queen {
@@ -52,13 +52,23 @@ impl MoveCodec {
             } else {
                 // Under-promotion: determine direction index
                 //   left-diag=0 (df<0), straight=1 (df==0), right-diag=2 (df>0)
-                let dir_idx = if df < 0 { 0 } else if df == 0 { 1 } else { 2 };
+                let dir_idx = if df < 0 {
+                    0
+                } else if df == 0 {
+                    1
+                } else {
+                    2
+                };
                 match promo {
                     chess::Piece::Knight => 64 + dir_idx,
                     chess::Piece::Bishop => 67 + dir_idx,
                     chess::Piece::Rook => {
                         // Only left(70) and right(71); straight maps to 70 as fallback
-                        if df < 0 { 70 } else { 71 }
+                        if df < 0 {
+                            70
+                        } else {
+                            71
+                        }
                     }
                     _ => 64 + dir_idx,
                 }
@@ -103,15 +113,15 @@ impl MoveCodec {
     #[inline]
     fn queen_direction(df: i32, dr: i32) -> i32 {
         match (df.signum(), dr.signum()) {
-            ( 0,  1) => 0, // N
-            ( 1,  1) => 1, // NE
-            ( 1,  0) => 2, // E
-            ( 1, -1) => 3, // SE
-            ( 0, -1) => 4, // S
+            (0, 1) => 0,   // N
+            (1, 1) => 1,   // NE
+            (1, 0) => 2,   // E
+            (1, -1) => 3,  // SE
+            (0, -1) => 4,  // S
             (-1, -1) => 5, // SW
-            (-1,  0) => 6, // W
-            (-1,  1) => 7, // NW
-            _         => 0, // fallback (should never happen for legal moves)
+            (-1, 0) => 6,  // W
+            (-1, 1) => 7,  // NW
+            _ => 0,        // fallback (should never happen for legal moves)
         }
     }
 
@@ -121,15 +131,15 @@ impl MoveCodec {
     #[inline]
     fn knight_index(df: i32, dr: i32) -> i32 {
         match (df, dr) {
-            ( 1,  2) => 0,
-            ( 2,  1) => 1,
-            ( 2, -1) => 2,
-            ( 1, -2) => 3,
+            (1, 2) => 0,
+            (2, 1) => 1,
+            (2, -1) => 2,
+            (1, -2) => 3,
             (-1, -2) => 4,
             (-2, -1) => 5,
-            (-2,  1) => 6,
-            (-1,  2) => 7,
-            _        => 0,
+            (-2, 1) => 6,
+            (-1, 2) => 7,
+            _ => 0,
         }
     }
 }
@@ -146,6 +156,8 @@ pub struct UciHandler {
     analysis_mode: bool,
     multipv: usize,
     show_wdl: bool,
+    /// KV cache for incremental NN inference (persists across moves)
+    kv_cache: Arc<parking_lot::Mutex<KVCache>>,
 }
 
 impl UciHandler {
@@ -153,10 +165,7 @@ impl UciHandler {
         let engine = Arc::new(Engine::new()?);
         let tt = Arc::new(TranspositionTable::new(512));
         let searcher = Searcher::new(Arc::clone(&engine), Arc::clone(&tt));
-        let book = OpeningBook::load(&[
-            "src/book/book1.bin",
-            "src/book/book2.bin",
-        ]);
+        let book = OpeningBook::load(&["src/book/book1.bin", "src/book/book2.bin"]);
         let (tx, rx) = mpsc::channel();
 
         std::thread::spawn(move || {
@@ -165,6 +174,7 @@ impl UciHandler {
             }
         });
 
+        let num_layers = engine.num_layers();
         Ok(Self {
             searcher,
             tt,
@@ -177,6 +187,7 @@ impl UciHandler {
             analysis_mode: false,
             multipv: 1,
             show_wdl: false,
+            kv_cache: Arc::new(parking_lot::Mutex::new(KVCache::new(num_layers))),
         })
     }
 
@@ -214,6 +225,7 @@ impl UciHandler {
                 self.move_history.clear();
                 self.position_history.clear();
                 self.tt.clear();
+                self.kv_cache.lock().clear();
             }
             Some("position") => {
                 self.handle_position(&parts[1..]);
@@ -304,7 +316,6 @@ impl UciHandler {
             if let Ok(b) = Board::from_str(&fen) {
                 self.board = b;
             }
-
         }
 
         // Parse moves
@@ -437,6 +448,7 @@ impl UciHandler {
             movestogo,
             Arc::clone(&self.stop_flag),
             self.tx_move.clone(),
+            Some(Arc::clone(&self.kv_cache)),
         );
     }
 }

@@ -1,6 +1,6 @@
-# KiyEngine v5.0.0
+# KiyEngine v5.2.0
 
-A high-performance UCI chess engine written in Rust, featuring a **BitNet 1.58-bit Transformer** neural network for evaluation and a heavily optimized alpha-beta search with Lazy SMP.
+A high-performance UCI chess engine written in Rust, featuring a **BitNet 1.58-bit Transformer** neural network with bit-packed ternary weights and a heavily optimized alpha-beta search with Lazy SMP.
 
 ## Highlights
 
@@ -8,16 +8,22 @@ A high-performance UCI chess engine written in Rust, featuring a **BitNet 1.58-b
 |--------|-------|
 | **NPS** | ~2.2 million nodes/sec (4 threads) |
 | **Search Depth** | 15–19 ply in 40/60 time control |
-| **Model Format** | GGUF (28 MB, memory-mapped) |
-| **Quantization** | BitNet 1.58-bit (ternary weights) |
+| **Model** | 22.76M params, GGUF format (28 MB, mmap) |
+| **Quantization** | BitNet 1.58-bit (ternary, dual-bitmask packed) |
+| **KV Cache** | 4–5× speedup for incremental inference |
 
 ## Key Features
 
 ### Neural Network
-- **BitNet 1.58-bit Transformer** with 72-plane policy head (4608 output classes)
+- **BitNet 1.58-bit Transformer** — 8 layers, 512 d_model, 8 heads, 1024 hidden dim
+- **Bit-Packed Ternary Weights** — dual bitmask format (pos_bits + neg_bits), 4× denser than i8
+- **SIMD Packed GEMV** — AVX-512 (native 16-bit mask registers), AVX2 (byte→8-lane expansion), NEON, scalar fallback
+- **KV Cache** — per-layer Key/Value caching for incremental inference (process only new tokens)
+- **Pre-transposed weights** — attention out_proj, policy head, value head transposed at load time
+- **Fused RMSNorm+MatMul** — single-pass normalization and projection in BitLinear
 - **GGUF model format** — 4× smaller than safetensors, instant mmap loading
 - Single NN forward pass shared across all search threads via `Arc`
-- Automatic fallback to legacy `.safetensors` format
+- 72-plane policy head (4608 output classes)
 
 ### Search
 - **Alpha-Beta with PVS** (Principal Variation Search)
@@ -28,11 +34,13 @@ A high-performance UCI chess engine written in Rust, featuring a **BitNet 1.58-b
 - **Razoring**, **Reverse Futility Pruning**, **Null Move Pruning** (static approximation)
 - **Late Move Pruning (LMP)**, **Futility Pruning**, **SEE Pruning**
 - **Internal Iterative Reduction (IIR)** when no TT move is found
-- **Quiescence Search** with delta pruning and MVV-LVA ordering
+- **Quiescence Search** with delta pruning, MVV-LVA ordering, and check extensions
+- **Capture History** — `[piece][to_sq][captured]` table for capture move ordering
+- **History Aging** — halves history tables between iterative deepening iterations
 - **Search Stability** — periodic time checks every 2048 nodes, `MAX_PLY` guard in qsearch
 
 ### Move Ordering
-TT Move → NN Policy (root) → Captures (MVV-LVA) → Promotions → Killer Moves → History Heuristic
+TT Move → NN Policy (root) → Captures (MVV-LVA + Capture History) → Promotions → Killer Moves → History Heuristic
 
 ### Opening Book
 - **Polyglot format** — dual-book support (`book1.bin`, `book2.bin`)
@@ -81,20 +89,24 @@ go wtime 60000 btime 60000 movestogo 40
 src/
 ├── main.rs              # Binary entry point
 ├── lib.rs               # Library exports
-├── constants.rs         # Global constants
+├── constants.rs         # Global constants (model dims, search params)
 ├── book/                # Polyglot opening book
 │   ├── mod.rs           # Book probing & Zobrist hashing
 │   └── polyglot_keys.rs # Official 781-key Random64 array
-├── engine/              # Neural network inference (GGUF/safetensors)
+├── engine/              # Neural network inference
+│   ├── mod.rs           # Engine struct, forward/forward_with_cache
+│   ├── bitlinear.rs     # BitLinear: bit-packed ternary weights, SIMD GEMV
+│   ├── transformer.rs   # MultiheadAttention, BitSwiGLU, TransformerBlock, KVCache
+│   ├── heads.rs         # PolicyHead, ValueHead (pre-transposed weights)
+│   └── gguf.rs          # GGUF format parser & loader
 ├── eval/                # Piece-square tables
 ├── search/
 │   ├── mod.rs           # Alpha-beta, TT, move ordering, quiescence
 │   ├── eval.rs          # Material + PST static evaluation
 │   ├── time.rs          # Time management
 │   ├── lazy_smp.rs      # Lazy SMP threading
-│   ├── mcts*.rs         # MCTS implementations (experimental)
-│   └── tt.rs            # Atomic TT (alternative implementation)
-├── simd/                # AVX2/SIMD optimizations
+│   └── mcts*.rs         # MCTS implementations (experimental)
+├── simd/                # SIMD utilities
 └── uci/                 # UCI protocol handler
 ```
 

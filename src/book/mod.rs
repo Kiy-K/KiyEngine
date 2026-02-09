@@ -4,7 +4,7 @@
 // Loads one or more .bin files (Titan, Perfect2023, etc.) and probes them
 // using the standard Polyglot Zobrist key algorithm.
 
-use chess::{Board, ChessMove, Color, Piece, Square, BitBoard, CastleRights};
+use chess::{BitBoard, Board, CastleRights, ChessMove, Color, Piece, Square};
 
 mod polyglot_keys;
 use polyglot_keys::POLYGLOT_KEYS;
@@ -26,18 +26,18 @@ pub fn polyglot_hash(board: &Board) -> u64 {
         if let Some(piece) = board.piece_on(sq) {
             if let Some(color) = board.color_on(sq) {
                 let kind = match (piece, color) {
-                    (Piece::Pawn,   Color::Black) => 0,
-                    (Piece::Pawn,   Color::White) => 1,
+                    (Piece::Pawn, Color::Black) => 0,
+                    (Piece::Pawn, Color::White) => 1,
                     (Piece::Knight, Color::Black) => 2,
                     (Piece::Knight, Color::White) => 3,
                     (Piece::Bishop, Color::Black) => 4,
                     (Piece::Bishop, Color::White) => 5,
-                    (Piece::Rook,   Color::Black) => 6,
-                    (Piece::Rook,   Color::White) => 7,
-                    (Piece::Queen,  Color::Black) => 8,
-                    (Piece::Queen,  Color::White) => 9,
-                    (Piece::King,   Color::Black) => 10,
-                    (Piece::King,   Color::White) => 11,
+                    (Piece::Rook, Color::Black) => 6,
+                    (Piece::Rook, Color::White) => 7,
+                    (Piece::Queen, Color::Black) => 8,
+                    (Piece::Queen, Color::White) => 9,
+                    (Piece::King, Color::Black) => 10,
+                    (Piece::King, Color::White) => 11,
                 };
                 hash ^= keys[kind * 64 + sq_idx as usize];
             }
@@ -69,11 +69,11 @@ pub fn polyglot_hash(board: &Board) -> u64 {
         // Check if any of our pawns can reach the EP square
         let can_capture = if us == Color::White {
             // White pawns attack from rank below: check sq-7 (left) and sq-9 (right)
-            let left  = BitBoard::new(ep_bb.0 >> 9) & BitBoard::new(!0x8080808080808080u64);
+            let left = BitBoard::new(ep_bb.0 >> 9) & BitBoard::new(!0x8080808080808080u64);
             let right = BitBoard::new(ep_bb.0 >> 7) & BitBoard::new(!0x0101010101010101u64);
             (left | right) & our_pawns
         } else {
-            let left  = BitBoard::new(ep_bb.0 << 7) & BitBoard::new(!0x8080808080808080u64);
+            let left = BitBoard::new(ep_bb.0 << 7) & BitBoard::new(!0x8080808080808080u64);
             let right = BitBoard::new(ep_bb.0 << 9) & BitBoard::new(!0x0101010101010101u64);
             (left | right) & our_pawns
         };
@@ -148,7 +148,11 @@ impl OpeningBook {
             for candidate in &candidates {
                 if let Ok(data) = std::fs::read(candidate) {
                     if data.len() >= 16 {
-                        eprintln!("Book loaded: {} ({} entries)", candidate.display(), data.len() / 16);
+                        eprintln!(
+                            "Book loaded: {} ({} entries)",
+                            candidate.display(),
+                            data.len() / 16
+                        );
                         books.push(data);
                         break;
                     }
@@ -277,8 +281,8 @@ impl OpeningBook {
     /// Polyglot encodes castling as king→rook (e.g., e1h1 for O-O),
     /// which must be converted to king→destination (e1g1).
     fn parse_polyglot_move(m: u16, board: &Board) -> Option<ChessMove> {
-        let to_file  = (m & 0x7) as u8;
-        let to_rank  = ((m >> 3) & 0x7) as u8;
+        let to_file = (m & 0x7) as u8;
+        let to_rank = ((m >> 3) & 0x7) as u8;
         let from_file = ((m >> 6) & 0x7) as u8;
         let from_rank = ((m >> 9) & 0x7) as u8;
         let promo_raw = ((m >> 12) & 0x7) as u8;
@@ -293,13 +297,21 @@ impl OpeningBook {
         if board.piece_on(from) == Some(Piece::King) {
             // White king on e1
             if from_idx == 4 {
-                if to_idx == 7 { to_idx = 6; }   // e1h1 → e1g1 (O-O)
-                if to_idx == 0 { to_idx = 2; }   // e1a1 → e1c1 (O-O-O)
+                if to_idx == 7 {
+                    to_idx = 6;
+                } // e1h1 → e1g1 (O-O)
+                if to_idx == 0 {
+                    to_idx = 2;
+                } // e1a1 → e1c1 (O-O-O)
             }
             // Black king on e8
             if from_idx == 60 {
-                if to_idx == 63 { to_idx = 62; }  // e8h8 → e8g8 (O-O)
-                if to_idx == 56 { to_idx = 58; }  // e8a8 → e8c8 (O-O-O)
+                if to_idx == 63 {
+                    to_idx = 62;
+                } // e8h8 → e8g8 (O-O)
+                if to_idx == 56 {
+                    to_idx = 58;
+                } // e8a8 → e8c8 (O-O-O)
             }
         }
 
