@@ -1,71 +1,95 @@
 // src/engine/heads.rs
-//! v5.2.0 Neural network heads for policy and value prediction
+//! v6.0.0 Neural network heads for policy and value prediction
 //!
-//! Head weights are continuous FP16 (sandwich strategy: FP16 shell, ternary core).
-//! PolicyHead: RMSNorm -> Linear(d_model, vocab_size)
-//! ValueHead: RMSNorm -> Linear(d_model, 256) -> SiLU -> RMSNorm -> Linear(256, 1) -> Tanh
+//! V6: ALL head weights are BitLinear (ternary with RMSNorm).
+//! PolicyHead: BitLinear(d_model, vocab_size) — SIMD GEMV for single token
+//! ValueHead: BitLinear(d_model, 256) -> SiLU -> BitLinear(256, 1) -> Tanh
 //!
 //! Input is already ln_f-normalized by Engine before reaching heads.
 
-use crate::engine::bitlinear::rms_norm;
+use crate::engine::bitlinear::{rms_norm_vec, BitLinear};
 use candle_core::Result;
 use candle_core::Tensor;
 use candle_nn::{Module, VarBuilder};
 
-/// Value head: RMSNorm -> Linear(d_model, 256) -> SiLU -> RMSNorm -> Linear(256, 1)
-/// Weights pre-transposed at load time for faster matmul.
+/// Value head: BitLinear(d_model, 256) -> SiLU -> BitLinear(256, 1)
+/// Uses SIMD packed GEMV for single-token inference.
 pub struct ValueHead {
-    pub norm1: Tensor,
-    pub w1_t: Tensor, // [d_model, 256] pre-transposed + contiguous
-    pub norm2: Tensor,
-    pub w2_t: Tensor, // [256, 1] pre-transposed + contiguous
+    pub layer1: BitLinear, // d_model -> 256
+    pub layer2: BitLinear, // 256 -> 1
 }
 
 impl ValueHead {
     pub fn load(vb: &VarBuilder, d_model: usize) -> Result<Self> {
-        let norm1 = vb.get((d_model,), "value_head.0.norm.weight")?;
-        let w1 = vb.get((256, d_model), "value_head.0.weight")?;
-        let w1_t = w1.t()?.contiguous()?;
-
-        let norm2 = vb.get((256,), "value_head.2.norm.weight")?;
-        let w2 = vb.get((1, 256), "value_head.2.weight")?;
-        let w2_t = w2.t()?.contiguous()?;
-
-        Ok(Self {
-            norm1,
-            w1_t,
-            norm2,
-            w2_t,
-        })
+        let layer1 = BitLinear::load_from_vb(
+            "value_head.0.weight",
+            "value_head.0.norm.weight",
+            vb, d_model, 256,
+        )?;
+        let layer2 = BitLinear::load_from_vb(
+            "value_head.2.weight",
+            "value_head.2.norm.weight",
+            vb, 256, 1,
+        )?;
+        Ok(Self { layer1, layer2 })
     }
 
-    /// Forward: RMSNorm -> matmul -> SiLU -> RMSNorm -> matmul (caller applies tanh)
+    /// Forward: BitLinear -> SiLU -> BitLinear (caller applies tanh)
+    /// Single token: zero-tensor f32 path with SIMD GEMV.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = rms_norm(x, &self.norm1, 1e-5)?;
-        let x = x.broadcast_matmul(&self.w1_t)?;
+        let shape = x.dims();
+        let is_single = shape[0] == 1 && (shape.len() < 2 || shape.get(1).copied().unwrap_or(1) == 1);
+
+        if is_single {
+            return self.forward_single(x);
+        }
+
+        let x = self.layer1.forward(x)?;
         let x = candle_nn::Activation::Silu.forward(&x)?;
-        let x = rms_norm(&x, &self.norm2, 1e-5)?;
-        x.broadcast_matmul(&self.w2_t)
+        self.layer2.forward(&x)
+    }
+
+    /// Fully-fused single-token path: raw f32 + SIMD GEMV
+    fn forward_single(&self, x: &Tensor) -> Result<Tensor> {
+        let device = x.device();
+        let x_f32: Vec<f32> = x.flatten_all()?.to_vec1::<f32>()?;
+
+        // Layer 1: RMSNorm + SIMD GEMV
+        let normed1 = rms_norm_vec(&x_f32, &self.layer1.rms_norm_weight_f32, 1e-5);
+        let mut hidden = vec![0.0f32; self.layer1.out_dim];
+        self.layer1.dispatch_packed_gemv(&normed1, &mut hidden);
+
+        // SiLU in-place
+        for h in hidden.iter_mut() {
+            *h = *h / (1.0 + (-*h).exp());
+        }
+
+        // Layer 2: RMSNorm + SIMD GEMV
+        let normed2 = rms_norm_vec(&hidden, &self.layer2.rms_norm_weight_f32, 1e-5);
+        let mut out = vec![0.0f32; self.layer2.out_dim];
+        self.layer2.dispatch_packed_gemv(&normed2, &mut out);
+
+        Tensor::from_vec(out, (1, self.layer2.out_dim), device)
     }
 }
 
-/// Policy head: RMSNorm -> Linear(d_model, vocab_size)
-/// Weight pre-transposed at load time for faster matmul.
+/// Policy head: BitLinear(d_model, vocab_size) — SIMD GEMV for single token
 pub struct PolicyHead {
-    pub norm: Tensor,
-    pub w_t: Tensor, // [d_model, vocab_size] pre-transposed + contiguous
+    pub layer: BitLinear, // d_model -> vocab_size
 }
 
 impl PolicyHead {
     pub fn load(vb: &VarBuilder, d_model: usize, vocab_size: usize) -> Result<Self> {
-        let norm = vb.get((d_model,), "policy_head.norm.weight")?;
-        let w = vb.get((vocab_size, d_model), "policy_head.weight")?;
-        let w_t = w.t()?.contiguous()?;
-        Ok(Self { norm, w_t })
+        let layer = BitLinear::load_from_vb(
+            "policy_head.weight",
+            "policy_head.norm.weight",
+            vb, d_model, vocab_size,
+        )?;
+        Ok(Self { layer })
     }
 
+    /// Forward: BitLinear (auto-dispatches to SIMD for single token)
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = rms_norm(x, &self.norm, 1e-5)?;
-        x.broadcast_matmul(&self.w_t)
+        self.layer.forward(x)
     }
 }

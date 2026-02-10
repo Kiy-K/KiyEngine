@@ -1,8 +1,8 @@
 // src/engine/mod.rs
-//! v5.2.0 KiyNet_Ultimate neural network engine for chess evaluation
+//! v6.0.0 KiyNet_V6 neural network engine for chess evaluation
 //!
-//! Architecture: Embedding → Positional → 8× TransformerBlock → ln_f → PolicyHead / ValueHead
-//! TransformerBlock: RMSNorm → MultiheadAttention → LayerScale → RMSNorm → BitSwiGLU → LayerScale
+//! Architecture: Embedding → 12× TransformerBlock(GQA+RoPE) → ln_f → PolicyHead / ValueHead
+//! TransformerBlock: RMSNorm → GQAttention(BitLinear Q/K/V/O + RoPE) → LayerScale → RMSNorm → BitSwiGLU → LayerScale
 
 pub mod bitlinear;
 pub mod gguf;
@@ -16,10 +16,11 @@ mod tests;
 pub use bitlinear::{rms_norm, BitLinear};
 pub use heads::{PolicyHead, ValueHead};
 pub use model::{ChessModel, ModelConfig};
-pub use transformer::{KVCache, TransformerBlock};
+pub use transformer::{KVCache, TransformerBlock, precompute_rope};
 
 use crate::constants::{
-    CONTEXT_LENGTH, DEFAULT_MODEL_PATH, D_MODEL, HIDDEN_DIM, NUM_HEADS, NUM_LAYERS, VOCAB_SIZE,
+    CONTEXT_LENGTH, DEFAULT_MODEL_PATH, D_MODEL, HIDDEN_DIM, NUM_HEADS, NUM_KV_HEADS,
+    NUM_LAYERS, ROPE_THETA, VOCAB_SIZE,
 };
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder};
@@ -28,7 +29,6 @@ use std::collections::HashMap;
 /// Main engine struct containing the neural network
 pub struct Engine {
     pub embedding: Embedding,
-    pub pos_embed: Tensor,
     pub layers: Vec<TransformerBlock>,
     pub ln_f: Tensor,
     pub policy_head: PolicyHead,
@@ -36,9 +36,16 @@ pub struct Engine {
     pub device: Device,
     /// Pre-computed causal mask [1, 1, ctx_len, ctx_len] (avoids per-call allocation)
     pub causal_mask: Tensor,
+    /// Pre-computed RoPE cos/sin [max_len, head_dim/2]
+    pub rope_cos: Tensor,
+    pub rope_sin: Tensor,
+    /// Cached f32 RoPE tables for zero-tensor single-token path [max_len * half_dim]
+    pub rope_cos_f32: Vec<f32>,
+    pub rope_sin_f32: Vec<f32>,
     // Runtime config (read from GGUF metadata)
     pub d_model: usize,
     pub context_length: usize,
+    pub head_dim: usize,
 }
 
 impl Engine {
@@ -51,14 +58,14 @@ impl Engine {
         };
 
         if std::path::Path::new(DEFAULT_MODEL_PATH).exists() {
-            println!("Loading v5.2.0 GGUF model: {}", DEFAULT_MODEL_PATH);
+            println!("Loading v6.0.0 GGUF model: {}", DEFAULT_MODEL_PATH);
             return Self::load_from_gguf(DEFAULT_MODEL_PATH, device);
         }
 
         anyhow::bail!("No model file found. Expected '{}'", DEFAULT_MODEL_PATH,)
     }
 
-    /// Load model weights from GGUF file (v5.2.0 KiyNet_Ultimate format)
+    /// Load model weights from GGUF file (v6.0.0 KiyNet_V6 format)
     pub fn load_from_gguf(model_path: &str, device: Device) -> anyhow::Result<Self> {
         use crate::engine::gguf::GgmlQuantizationType;
         use crate::engine::gguf::GgufFile;
@@ -79,15 +86,20 @@ impl Engine {
             .get_u32("kiyengine.block_count")
             .unwrap_or(NUM_LAYERS as u32) as usize;
         let num_heads = gguf
-            .get_u32("kiyengine.head_count")
+            .get_u32("kiyengine.attention.head_count")
+            .or_else(|| gguf.get_u32("kiyengine.head_count"))
             .unwrap_or(NUM_HEADS as u32) as usize;
+        let num_kv_heads = gguf
+            .get_u32("kiyengine.attention.head_count_kv")
+            .unwrap_or(NUM_KV_HEADS as u32) as usize;
         let hidden_dim = gguf
             .get_u32("kiyengine.feed_forward_length")
             .unwrap_or(HIDDEN_DIM as u32) as usize;
+        let head_dim = d_model / num_heads;
 
         println!(
-            "  Config: d_model={}, layers={}, heads={}, hidden={}, ctx={}, vocab={}",
-            d_model, num_layers, num_heads, hidden_dim, context_length, vocab_size
+            "  Config: d_model={}, layers={}, heads={}, kv_heads={}, head_dim={}, hidden={}, ctx={}, vocab={}",
+            d_model, num_layers, num_heads, num_kv_heads, head_dim, hidden_dim, context_length, vocab_size
         );
 
         // Convert all GGUF tensors to f32 Candle tensors
@@ -128,15 +140,17 @@ impl Engine {
         let embed_w = vb.get((vocab_size, d_model), "embed.weight")?;
         let embedding = Embedding::new(embed_w, d_model);
 
-        // Load positional embedding [1, ctx_len, d_model]
-        // (GGUF loader already reverses dims from GGML order)
-        let pos_embed = vb.get((1, context_length, d_model), "pos_embed")?;
+        // V6: No positional embedding — using RoPE instead
+        // Precompute RoPE cos/sin for max context length
+        let (rope_cos, rope_sin) = precompute_rope(head_dim, context_length, ROPE_THETA, &device)?;
+        let rope_cos_f32 = rope_cos.flatten_all()?.to_vec1::<f32>()?;
+        let rope_sin_f32 = rope_sin.flatten_all()?.to_vec1::<f32>()?;
 
-        // Load transformer blocks
+        // Load transformer blocks (with GQA params)
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             layers.push(TransformerBlock::load(
-                i, &vb, d_model, hidden_dim, num_heads,
+                i, &vb, d_model, hidden_dim, num_heads, num_kv_heads, head_dim,
             )?);
         }
 
@@ -159,24 +173,36 @@ impl Engine {
 
         // Pre-warm all BitLinear weight caches (avoids lazy init on first inference)
         for layer in &layers {
+            let _ = layer.attn.q_proj.get_weights_t(&device);
+            let _ = layer.attn.k_proj.get_weights_t(&device);
+            let _ = layer.attn.v_proj.get_weights_t(&device);
+            let _ = layer.attn.o_proj.get_weights_t(&device);
             let _ = layer.mlp.w_gate.get_weights_t(&device);
             let _ = layer.mlp.w_val.get_weights_t(&device);
             let _ = layer.mlp.w_out.get_weights_t(&device);
         }
+        // Pre-warm head BitLinear caches
+        let _ = policy_head.layer.get_weights_t(&device);
+        let _ = value_head.layer1.get_weights_t(&device);
+        let _ = value_head.layer2.get_weights_t(&device);
 
-        println!("  Model loaded successfully ({} layers)", num_layers);
+        println!("  Model loaded successfully ({} layers, GQA {}/{})", num_layers, num_heads, num_kv_heads);
 
         Ok(Self {
             embedding,
-            pos_embed,
             layers,
             ln_f,
             policy_head,
             value_head,
             device,
             causal_mask,
+            rope_cos,
+            rope_sin,
+            rope_cos_f32,
+            rope_sin_f32,
             d_model,
             context_length,
+            head_dim,
         })
     }
 
@@ -219,26 +245,39 @@ impl Engine {
             let new_count = take_len - cached_len;
             let new_tokens_slice = &tokens_slice[cached_len..];
 
-            // Embed only new tokens
+            // Embed only new tokens (no positional embedding — RoPE handles positions)
             let new_tokens_u32: Vec<u32> = new_tokens_slice.iter().map(|&t| t as u32).collect();
             let new_tensor = Tensor::new(new_tokens_u32.as_slice(), &self.device)?.unsqueeze(0)?;
             let mut x = self.embedding.forward(&new_tensor)?;
 
-            // Positional embedding for new positions only
-            let pos_slice = self.pos_embed.narrow(1, cached_len, new_count)?;
-            x = x.broadcast_add(&pos_slice)?;
-
-            // Process through layers with KV cache
-            let total_seq = take_len;
-            for (i, layer) in self.layers.iter().enumerate() {
-                let (ck, cv) = cache.layers[i]
-                    .as_ref()
-                    .map(|(k, v)| (Some(k), Some(v)))
-                    .unwrap_or((None, None));
-                let (out, new_k, new_v) =
-                    layer.forward_cached(&x, ck, cv, &self.causal_mask, total_seq)?;
-                x = out;
-                cache.layers[i] = Some((new_k, new_v));
+            // Process through layers with KV cache + RoPE
+            if new_count == 1 {
+                // Fused single-token path: inline RoPE on f32, per-group attention
+                let pos = cached_len; // position of the new token
+                for (i, layer) in self.layers.iter().enumerate() {
+                    let (ck, cv) = cache.layers[i]
+                        .as_ref()
+                        .map(|(k, v)| (Some(k), Some(v)))
+                        .unwrap_or((None, None));
+                    let (out, new_k, new_v) = layer.forward_cached_single_token(
+                        &x, ck, cv, &self.rope_cos_f32, &self.rope_sin_f32, pos,
+                    )?;
+                    x = out;
+                    cache.layers[i] = Some((new_k, new_v));
+                }
+            } else {
+                let total_seq = take_len;
+                for (i, layer) in self.layers.iter().enumerate() {
+                    let (ck, cv) = cache.layers[i]
+                        .as_ref()
+                        .map(|(k, v)| (Some(k), Some(v)))
+                        .unwrap_or((None, None));
+                    let (out, new_k, new_v) = layer.forward_cached(
+                        &x, ck, cv, &self.rope_cos, &self.rope_sin, &self.causal_mask, total_seq,
+                    )?;
+                    x = out;
+                    cache.layers[i] = Some((new_k, new_v));
+                }
             }
 
             // Update cache metadata
@@ -267,13 +306,11 @@ impl Engine {
         let tokens_tensor = Tensor::new(tokens_u32.as_slice(), &self.device)?.unsqueeze(0)?;
         let mut x = self.embedding.forward(&tokens_tensor)?;
 
-        let pos_slice = self.pos_embed.narrow(1, 0, take_len)?;
-        x = x.broadcast_add(&pos_slice)?;
-
-        // Full forward with cache population
+        // Full forward with cache population (RoPE applied inside each layer)
         for (i, layer) in self.layers.iter().enumerate() {
-            let (out, new_k, new_v) =
-                layer.forward_cached(&x, None, None, &self.causal_mask, take_len)?;
+            let (out, new_k, new_v) = layer.forward_cached(
+                &x, None, None, &self.rope_cos, &self.rope_sin, &self.causal_mask, take_len,
+            )?;
             x = out;
             cache.layers[i] = Some((new_k, new_v));
         }
@@ -315,18 +352,14 @@ impl Engine {
         let tokens_tensor = Tensor::new(tokens_u32.as_slice(), &self.device)?.unsqueeze(0)?;
         let mut x = self.embedding.forward(&tokens_tensor)?;
 
-        // Add positional embedding
-        let pos_slice = self.pos_embed.narrow(1, 0, take_len)?;
-        x = x.broadcast_add(&pos_slice)?;
-
-        // Transformer layers (attention + BitSwiGLU MLP)
+        // V6: No positional embedding — RoPE applied inside each attention layer
         let mask = if take_len > 1 {
             Some(&self.causal_mask)
         } else {
             None
         };
         for layer in &self.layers {
-            x = layer.forward(&x, mask)?;
+            x = layer.forward(&x, &self.rope_cos, &self.rope_sin, mask)?;
         }
 
         // Extract last token, apply final layer norm

@@ -19,6 +19,18 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
     x_normed.broadcast_mul(weight)
 }
 
+/// RMS normalization on raw f32 slices — zero tensor allocation for single-token SIMD path
+#[inline]
+pub(crate) fn rms_norm_vec(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+    let n = x.len() as f32;
+    let sum_sq: f32 = x.iter().map(|v| v * v).sum();
+    let inv_rms = 1.0 / ((sum_sq / n + eps).sqrt());
+    x.iter()
+        .zip(weight.iter())
+        .map(|(&xi, &wi)| xi * inv_rms * wi)
+        .collect()
+}
+
 /// Pack F16 ternary values {-1.0, 0.0, 1.0} into i8 {-1, 0, 1}
 pub fn pack_f16_to_ternary_i8(raw: &[f32]) -> Vec<i8> {
     raw.iter()
@@ -86,6 +98,8 @@ pub struct BitLinear {
     pub in_dim: usize,
     pub out_dim: usize,
     pub rms_norm_weight: Tensor,
+    /// Cached f32 norm weights for zero-tensor single-token SIMD path
+    pub(crate) rms_norm_weight_f32: Vec<f32>,
     pub eps: f64,
     /// Cached dequantized weights as F32 transposed [in_dim, out_dim] (lazy init, thread-safe)
     dequantized_cache_t: RwLock<Option<Tensor>>,
@@ -110,6 +124,7 @@ impl BitLinear {
 
         // Load RMS norm weight
         let rms_norm_weight = vb.get((in_dim,), norm_key)?;
+        let rms_norm_weight_f32 = rms_norm_weight.flatten_all()?.to_vec1::<f32>()?;
 
         // Pack ternary weights into dual bitmasks (4x memory reduction)
         let (pos_bits, neg_bits, row_bytes) = pack_ternary_bits(&weight_i8, out_dim, in_dim);
@@ -123,6 +138,7 @@ impl BitLinear {
             in_dim,
             out_dim,
             rms_norm_weight,
+            rms_norm_weight_f32,
             eps: 1e-5,
             dequantized_cache_t: RwLock::new(None),
         })
@@ -172,8 +188,9 @@ impl BitLinear {
         x_normed.broadcast_matmul(w_t)
     }
 
-    /// Dispatch packed GEMV for a single input row (called from forward_packed)
-    fn dispatch_packed_gemv(&self, input: &[f32], output: &mut [f32]) {
+    /// Dispatch packed GEMV for a single input row.
+    /// Uses runtime ISA auto-selection: AVX-512 > AVX2 > NEON > scalar.
+    pub(crate) fn dispatch_packed_gemv(&self, input: &[f32], output: &mut [f32]) {
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx512f") {
@@ -203,34 +220,49 @@ impl BitLinear {
 
     /// Forward pass: y = RMSNorm(x) @ W^T
     ///
-    /// Uses F32 matmul with cached transposed weights — candle's tiled GEMM
-    /// is fastest for sequences due to cache-line-friendly memory access patterns.
+    /// Auto-dispatches: single token → SIMD packed GEMV (bit-packed ternary),
+    /// sequences → F32 matmul with cached transposed weights (candle's tiled GEMM).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let shape = x.dims();
+        // Single-token auto-dispatch: SIMD packed GEMV is faster than F32 GEMM
+        // because ternary bits are 4x denser (better cache) and use add/sub (no multiply)
+        let is_single = match shape.len() {
+            2 => shape[0] == 1,
+            3 => shape[0] == 1 && shape[1] == 1,
+            _ => false,
+        };
+        if is_single {
+            return self.forward_single(x);
+        }
         let device = x.device();
         let w_t = self.get_weights_t(device)?;
         self.fused_rms_norm_matmul(x, &w_t)
     }
 
     /// Optimized forward for single token (batch_size=1, seq_len=1)
-    /// Uses bit-packed SIMD (AVX-512/AVX2/NEON) for maximum throughput.
+    /// Zero-tensor hot path: raw f32 RMSNorm + SIMD packed GEMV.
     /// Bit-packed weights are 4x denser than i8, greatly improving cache utilization.
     pub fn forward_single(&self, x: &Tensor) -> Result<Tensor> {
         let device = x.device();
-        let shape = x.dims();
+        let orig_rank = x.dims().len();
 
-        // Ensure single token
-        if shape[0] != 1 || (shape.len() > 1 && shape[1] != 1) {
-            return self.forward(x);
-        }
+        // Single copy: tensor → f32 slice
+        let x_f32: Vec<f32> = x.flatten_all()?.to_vec1::<f32>()?;
 
-        // Apply RMS norm (stays F32)
-        let x_normed = rms_norm(x, &self.rms_norm_weight, self.eps)?;
-        let x_f32: Vec<f32> = x_normed.flatten_all()?.to_vec1::<f32>()?;
+        // RMS norm on raw f32 — zero tensor allocation
+        let x_normed = rms_norm_vec(&x_f32, &self.rms_norm_weight_f32, self.eps as f32);
 
+        // SIMD packed GEMV (AVX-512/AVX2/NEON)
         let mut output = vec![0.0f32; self.out_dim];
-        self.dispatch_packed_gemv(&x_f32, &mut output);
+        self.dispatch_packed_gemv(&x_normed, &mut output);
 
-        Tensor::from_vec(output, (1, 1, self.out_dim), device)
+        // Single copy back: f32 slice → tensor (preserve input rank)
+        let out_shape = if orig_rank <= 2 {
+            vec![1, self.out_dim]
+        } else {
+            vec![1, 1, self.out_dim]
+        };
+        Tensor::from_vec(output, out_shape, device)
     }
 
     /// Scalar packed GEMV: extract bits and add/subtract input values

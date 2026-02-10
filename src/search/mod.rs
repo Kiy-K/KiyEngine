@@ -1,4 +1,7 @@
 use crate::engine::{Engine, KVCache};
+use crate::nnue::accumulator::Accumulator;
+use crate::nnue::features;
+use crate::nnue::NnueNetwork;
 use crate::uci::MoveCodec;
 use chess::{BitBoard, Board, ChessMove, Color, MoveGen, Piece};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -222,6 +225,7 @@ pub struct Searcher {
     tt: Arc<TranspositionTable>,
     pub threads: usize,
     pub move_overhead: u32,
+    pub nnue: Option<Arc<NnueNetwork>>,
 }
 
 impl Searcher {
@@ -231,6 +235,7 @@ impl Searcher {
             tt,
             threads: 4,
             move_overhead: 60, // Default 60ms overhead
+            nnue: None,
         }
     }
 
@@ -253,6 +258,7 @@ impl Searcher {
         let num_threads = self.threads;
         let move_overhead = self.move_overhead;
         let is_white = board.side_to_move() == Color::White;
+        let nnue = self.nnue.clone();
 
         std::thread::spawn(move || {
             let time_manager = Arc::new(TimeManager::new(
@@ -295,12 +301,14 @@ impl Searcher {
                 let tx_clone = if i == 0 { Some(tx.clone()) } else { None };
                 let is_main = i == 0;
                 let policy_clone = Arc::clone(&shared_policy);
+                let nnue_clone = nnue.clone();
 
                 handles.push(
                     std::thread::Builder::new()
                         .stack_size(64 * 1024 * 1024) // 64MB stack for deep recursion
                         .spawn(move || {
-                            let mut worker = SearchWorker::new(tt_clone, board_clone, stop_clone);
+                            let mut worker =
+                                SearchWorker::new(tt_clone, board_clone, stop_clone, nnue_clone);
                             let mut best_move = None;
                             let mut last_score = 0;
                             let mut stability: u32 = 0; // Best-move stability counter
@@ -309,6 +317,9 @@ impl Searcher {
 
                             // Use shared pre-computed NN policy (no per-thread forward pass)
                             worker.set_cached_policy(&*policy_clone);
+
+                            // Initialize NNUE accumulator at root (ply 0)
+                            worker.nnue_refresh(0);
 
                             // Wire time manager for in-search abort checks
                             let depth_only_check = max_depth > 0 && wtime == 0 && btime == 0;
@@ -461,10 +472,25 @@ pub struct SearchWorker {
     // Cached NN results — computed once, reused across all ID iterations
     cached_root_policy: Option<Vec<f32>>,
     cached_root_value: f32,
+    // NNUE evaluation (optional — falls back to Material+PST if None)
+    nnue: Option<Arc<NnueNetwork>>,
+    nnue_acc: Vec<Accumulator>,
 }
 
 impl SearchWorker {
-    pub fn new(tt: Arc<TranspositionTable>, board: Board, stop_flag: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        tt: Arc<TranspositionTable>,
+        board: Board,
+        stop_flag: Arc<AtomicBool>,
+        nnue: Option<Arc<NnueNetwork>>,
+    ) -> Self {
+        let nnue_acc = if let Some(ref net) = nnue {
+            (0..MAX_PLY)
+                .map(|_| Accumulator::new(net.hidden_size))
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             tt,
             board,
@@ -481,6 +507,8 @@ impl SearchWorker {
             piece_stack: [0; MAX_PLY],
             cached_root_policy: None,
             cached_root_value: 0.0,
+            nnue,
+            nnue_acc,
         }
     }
 
@@ -514,11 +542,75 @@ impl SearchWorker {
     }
 
     // =========================================================================
-    // FAST STATIC EVAL (Material + PST) — used everywhere except root policy.
+    // FAST STATIC EVAL — NNUE if available, else Material + PST.
     // =========================================================================
     #[inline]
-    fn fast_eval(&self) -> i32 {
+    fn fast_eval(&mut self, ply: usize) -> i32 {
+        if let Some(ref net) = self.nnue {
+            let idx = ply.min(MAX_PLY - 1);
+            if !self.nnue_acc[idx].computed {
+                // Lazy refresh: recompute from current board position
+                self.nnue_acc[idx].refresh(&self.board, net);
+            }
+            let eval = net.evaluate(&self.nnue_acc[idx], self.board.side_to_move());
+            // Clamp to avoid interference with mate score detection (MATE_SCORE=30000)
+            return eval.clamp(-29000, 29000);
+        }
         eval::evaluate(&self.board, 0)
+    }
+
+    // =========================================================================
+    // NNUE ACCUMULATOR MANAGEMENT
+    // =========================================================================
+
+    /// Refresh NNUE accumulator at given ply from the current board.
+    pub fn nnue_refresh(&mut self, ply: usize) {
+        if let Some(ref net) = self.nnue {
+            let idx = ply.min(MAX_PLY - 1);
+            self.nnue_acc[idx].refresh(&self.board, net);
+        }
+    }
+
+    /// Incrementally update NNUE accumulator at ply+1 from ply after a move.
+    /// Falls back to marking child as uncomputed (lazy refresh will handle it).
+    fn nnue_make_move(&mut self, mv: ChessMove, ply: usize) {
+        if let Some(ref net) = self.nnue {
+            let parent_idx = ply.min(MAX_PLY - 1);
+            let child_idx = (ply + 1).min(MAX_PLY - 1);
+
+            if parent_idx >= child_idx {
+                self.nnue_acc[child_idx].computed = false;
+                return;
+            }
+
+            if self.nnue_acc[parent_idx].computed {
+                if let Some(delta) = features::compute_delta(&self.board, mv) {
+                    let (left, right) = self.nnue_acc.split_at_mut(child_idx);
+                    let parent = &left[parent_idx];
+                    let child = &mut right[0];
+                    child.update_from(parent, &delta, net);
+                    return;
+                }
+            }
+            self.nnue_acc[child_idx].computed = false;
+        }
+    }
+
+    /// Copy NNUE accumulator for null move (no pieces change, just side-to-move).
+    fn nnue_null_move(&mut self, ply: usize) {
+        if self.nnue.is_some() {
+            let parent_idx = ply.min(MAX_PLY - 1);
+            let child_idx = (ply + 1).min(MAX_PLY - 1);
+
+            if parent_idx < child_idx && self.nnue_acc[parent_idx].computed {
+                let (left, right) = self.nnue_acc.split_at_mut(child_idx);
+                right[0].white.copy_from_slice(&left[parent_idx].white);
+                right[0].black.copy_from_slice(&left[parent_idx].black);
+                right[0].computed = true;
+            } else {
+                self.nnue_acc[child_idx].computed = false;
+            }
+        }
     }
 
     // =========================================================================
@@ -577,6 +669,12 @@ impl SearchWorker {
         non_pawn.0 != 0
     }
 
+    /// Public wrapper for alpha-beta search from root (used by self-play binary).
+    pub fn alpha_beta_root(&mut self, depth: u8) -> (i32, Option<ChessMove>) {
+        self.nodes = 0;
+        self.alpha_beta(-INFINITY, INFINITY, depth, 0)
+    }
+
     // =========================================================================
     // ALPHA-BETA with Stockfish-inspired pruning techniques
     // =========================================================================
@@ -589,7 +687,7 @@ impl SearchWorker {
     ) -> (i32, Option<ChessMove>) {
         // --- Step 0: MAX_PLY guard (prevent stack overflow) ---
         if ply >= MAX_PLY {
-            return (self.fast_eval(), None);
+            return (self.fast_eval(ply), None);
         }
 
         // --- Step 1: Abort check (+ periodic time check every 2048 nodes) ---
@@ -669,7 +767,7 @@ impl SearchWorker {
         let static_eval = if in_check {
             -INFINITY
         } else {
-            self.fast_eval()
+            self.fast_eval(ply)
         };
 
         // Store eval in stack for improving detection
@@ -725,6 +823,7 @@ impl SearchWorker {
             if let Some(null_board) = self.board.null_move() {
                 let old_board = self.board;
                 self.board = null_board;
+                self.nnue_null_move(ply);
 
                 // Adaptive reduction: R = 3 + depth/6, capped
                 let r = 3 + (depth / 6).min(3);
@@ -761,7 +860,7 @@ impl SearchWorker {
         };
 
         // --- Step 12: Generate and order moves ---
-        let moves = self.order_moves(MoveGen::new_legal(&self.board), policy, ply, tt_move);
+        let mut moves = self.order_moves(MoveGen::new_legal(&self.board), policy, ply, tt_move);
 
         if moves.is_empty() {
             return if in_check {
@@ -795,6 +894,7 @@ impl SearchWorker {
                     continue;
                 }
                 let old_board = self.board;
+                self.nnue_make_move(*mv, ply);
                 self.board = old_board.make_move_new(*mv);
                 let (val, _) = self.alpha_beta(-se_beta, -se_beta + 1, se_depth, ply + 1);
                 let score = -val;
@@ -824,8 +924,9 @@ impl SearchWorker {
         let mut quiets_tried: [Option<ChessMove>; 64] = [None; 64];
         let mut quiets_count = 0usize;
 
-        for (mv, _move_score) in &moves {
-            let mv = *mv;
+        for move_idx in 0..moves.len() {
+            Self::pick_next_move(&mut moves, move_idx);
+            let mv = moves[move_idx].0;
             let is_cap = self.is_capture(mv);
             let is_promo = mv.get_promotion().is_some();
             let is_tactical = is_cap || is_promo;
@@ -861,6 +962,7 @@ impl SearchWorker {
             let moved_piece = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
             let moved_color = self.board.side_to_move();
             let old_board = self.board;
+            self.nnue_make_move(mv, ply);
             self.board = self.board.make_move_new(mv);
 
             // Record move/piece in stacks for continuation history
@@ -1119,7 +1221,7 @@ impl SearchWorker {
 
         // Abort check: prevent infinite qsearch and respect time limits
         if ply >= MAX_PLY {
-            return self.fast_eval();
+            return self.fast_eval(ply);
         }
         if self.nodes & 4095 == 0 {
             if let Some(ref tm) = self.time_manager {
@@ -1156,7 +1258,7 @@ impl SearchWorker {
         let stand_pat = if in_check {
             -INFINITY
         } else {
-            self.fast_eval()
+            self.fast_eval(ply)
         };
 
         if !in_check {
@@ -1206,14 +1308,13 @@ impl SearchWorker {
                 scored_moves.push((mv, see_score));
             }
         }
-        scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-
         let original_alpha = alpha;
         let mut best_move = None;
         let mut best_score = stand_pat;
 
-        for (mv, _) in &scored_moves {
-            let mv = *mv;
+        for move_idx in 0..scored_moves.len() {
+            Self::pick_next_move(&mut scored_moves, move_idx);
+            let mv = scored_moves[move_idx].0;
 
             // Delta pruning per-move (skip when in check)
             if !in_check {
@@ -1224,6 +1325,7 @@ impl SearchWorker {
             }
 
             let old_board = self.board;
+            self.nnue_make_move(mv, ply);
             self.board = self.board.make_move_new(mv);
 
             let score = -self.quiescence(-beta, -alpha, ply + 1);
@@ -1370,8 +1472,24 @@ impl SearchWorker {
             scored.push((mv, score));
         }
 
-        scored.sort_unstable_by(|a, b| b.1.cmp(&a.1));
         scored
+    }
+
+    /// Incremental move picker: swap highest-scored move to position `idx`.
+    /// O(N-idx) per call, but total work is O(k*N) where k << N due to beta cutoffs.
+    #[inline]
+    fn pick_next_move(moves: &mut [(ChessMove, i32)], idx: usize) {
+        let mut best_idx = idx;
+        let mut best_score = moves[idx].1;
+        for i in (idx + 1)..moves.len() {
+            if moves[i].1 > best_score {
+                best_score = moves[i].1;
+                best_idx = i;
+            }
+        }
+        if best_idx != idx {
+            moves.swap(idx, best_idx);
+        }
     }
 }
 
