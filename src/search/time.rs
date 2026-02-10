@@ -50,33 +50,38 @@ impl TimeManager {
         let mtg = if movestogo > 0 {
             movestogo as f64
         } else {
-            // Adaptive: fewer estimated moves as game progresses
-            // Start with ~40, decrease towards 20 in endgame
-            (50.0 - (ply as f64 * 0.4)).clamp(20.0, 50.0)
+            // Stockfish-style: fewer estimated moves as game progresses
+            (40.0 - (ply as f64 * 0.3)).clamp(15.0, 40.0)
         };
 
         // Total time available for this move (pool)
         let time_left = (time_ms + inc_ms * (mtg - 1.0) - overhead * mtg).max(1.0);
 
-        // --- Compute optimal and maximum time ---
+        // --- Compute optimal and maximum time (Stockfish-aligned) ---
         let (opt_scale, max_scale) = if movestogo == 0 {
-            // Sudden death / increment: ply-aware scaling
-            // Early game: spend more time (opening planning)
-            // Endgame: less time needed per move
-            let ply_factor = (0.015 + (ply as f64 + 3.0).powf(0.45) * 0.01).min(0.20);
-            let opt = ply_factor * time_left;
-            // Hard limit: 5-6× optimum, but capped
-            let max = (5.5 * opt).min(0.80 * time_ms - overhead);
+            // Sudden death / increment: Stockfish-style opt/max scaling
+            // optScale: grows with ply but capped conservatively at 0.039
+            let opt_raw =
+                (0.0120 + (ply as f64 + 2.43).powf(0.462) * 0.0084).min(0.039);
+            let opt = opt_raw * time_left;
+
+            // maxScale: allows extending for unstable positions but capped
+            let max_raw =
+                (0.054 + (ply as f64 + 2.0).powf(0.442) * 0.074).min(6.0);
+            let max_from_pool = max_raw * time_left;
+            // Hard cap: never burn more than 25% of remaining clock on one move
+            let max = max_from_pool.min(0.25 * time_ms - overhead);
+
             (opt, max)
         } else {
             // Classical: fixed moves to go
-            let opt = (0.90 + ply as f64 / 120.0).min(0.90) * time_left / mtg;
-            let max = (1.5 + 0.12 * mtg) * opt;
+            let opt = 0.90 * time_left / mtg;
+            let max = (1.5 + 0.10 * mtg) * opt;
             (opt, max)
         };
 
         // Ensure minimum time and cap at remaining time
-        let optimum = opt_scale.max(10.0);
+        let optimum = opt_scale.max(10.0).min(0.20 * time_ms); // Never exceed 20% of clock
         let maximum = max_scale.max(optimum).min(time_ms - overhead).max(10.0);
 
         Self {
@@ -125,11 +130,11 @@ impl TimeManager {
         let falling_eval = ((12.0 + 2.0 * (avg_score - cur_score)) / 100.0).clamp(0.60, 1.70);
 
         // --- Factor 3: Best-move instability ---
-        // More changes → spend more time
+        // More changes → spend more time, but capped to prevent runaway extension
         let changes = self.best_move_changes.load(Ordering::Relaxed) as f64;
-        let instability = 1.0 + 1.5 * changes / 10.0;
+        let instability = (1.0 + 1.0 * changes / 10.0).min(1.50);
 
-        // Combined dynamic time
+        // Combined dynamic time — product of all factors, capped at maximum
         let total_time = self.optimum_ms * falling_eval * reduction_factor * instability;
 
         elapsed >= total_time.min(self.maximum_ms)
