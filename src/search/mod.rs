@@ -494,6 +494,8 @@ pub struct SearchWorker {
     // NNUE evaluation (optional — falls back to Material+PST if None)
     nnue: Option<Arc<NnueNetwork>>,
     nnue_acc: Vec<Accumulator>,
+    // Whether to actually use NNUE for eval (false = skip accumulator updates)
+    use_nnue_eval: bool,
     // Repetition detection: game position hashes from UCI position command
     game_hash_history: Vec<u64>,
     // Search path hashes for 2-fold repetition during search (fixed-size, zero-alloc)
@@ -533,6 +535,7 @@ impl SearchWorker {
             cached_root_value: 0.0,
             nnue,
             nnue_acc,
+            use_nnue_eval: false, // NNUE not ready — skip accumulator updates
             game_hash_history: Vec::new(),
             search_path: [0u64; MAX_PLY],
             search_path_len: 0,
@@ -615,15 +618,7 @@ impl SearchWorker {
     // =========================================================================
     #[inline]
     fn fast_eval(&mut self, _ply: usize) -> i32 {
-        // TODO: Re-enable NNUE eval once training data quality improves
-        // if let Some(ref net) = self.nnue {
-        //     let idx = ply.min(MAX_PLY - 1);
-        //     if !self.nnue_acc[idx].computed {
-        //         self.nnue_acc[idx].refresh(&self.board, net);
-        //     }
-        //     let eval = net.evaluate(&self.nnue_acc[idx], self.board.side_to_move());
-        //     return eval.clamp(-29000, 29000);
-        // }
+        // NNUE not yet ready — using Material + PST fallback
         eval::evaluate(&self.board, 0)
     }
 
@@ -642,6 +637,7 @@ impl SearchWorker {
     /// Incrementally update NNUE accumulator at ply+1 from ply after a move.
     /// Falls back to marking child as uncomputed (lazy refresh will handle it).
     fn nnue_make_move(&mut self, mv: ChessMove, ply: usize) {
+        if !self.use_nnue_eval { return; }
         if let Some(ref net) = self.nnue {
             let parent_idx = ply.min(MAX_PLY - 1);
             let child_idx = (ply + 1).min(MAX_PLY - 1);
@@ -666,6 +662,7 @@ impl SearchWorker {
 
     /// Copy NNUE accumulator for null move (no pieces change, just side-to-move).
     fn nnue_null_move(&mut self, ply: usize) {
+        if !self.use_nnue_eval { return; }
         if self.nnue.is_some() {
             let parent_idx = ply.min(MAX_PLY - 1);
             let child_idx = (ply + 1).min(MAX_PLY - 1);
