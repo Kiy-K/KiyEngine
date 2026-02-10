@@ -1177,16 +1177,16 @@ impl SearchWorker {
                     let to = mv.get_dest().to_index();
 
                     if is_cap {
-                        // Capture history bonus for the capture that caused cutoff
+                        // Capture history with Stockfish gravity formula
                         let bonus = (depth as i32) * (depth as i32);
                         let ai = Self::cap_piece_index(moved_piece);
                         let vi = Self::cap_piece_index(
                             old_board.piece_on(mv.get_dest()).unwrap_or(Piece::Pawn),
                         );
                         let ct = mv.get_dest().to_index();
-                        self.capture_history[ai][ct][vi] += bonus;
-                        self.capture_history[ai][ct][vi] =
-                            self.capture_history[ai][ct][vi].clamp(-30000, 30000);
+                        let ch = &mut self.capture_history[ai][ct][vi];
+                        *ch += bonus - ch.abs() * bonus / 16384;
+                        *ch = (*ch).clamp(-30000, 30000);
                     }
 
                     if !is_cap {
