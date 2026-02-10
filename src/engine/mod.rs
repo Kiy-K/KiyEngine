@@ -16,11 +16,11 @@ mod tests;
 pub use bitlinear::{rms_norm, BitLinear};
 pub use heads::{PolicyHead, ValueHead};
 pub use model::{ChessModel, ModelConfig};
-pub use transformer::{KVCache, TransformerBlock, precompute_rope};
+pub use transformer::{precompute_rope, KVCache, TransformerBlock};
 
 use crate::constants::{
-    CONTEXT_LENGTH, DEFAULT_MODEL_PATH, D_MODEL, HIDDEN_DIM, NUM_HEADS, NUM_KV_HEADS,
-    NUM_LAYERS, ROPE_THETA, VOCAB_SIZE,
+    CONTEXT_LENGTH, DEFAULT_MODEL_PATH, D_MODEL, HIDDEN_DIM, NUM_HEADS, NUM_KV_HEADS, NUM_LAYERS,
+    ROPE_THETA, VOCAB_SIZE,
 };
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder};
@@ -150,7 +150,13 @@ impl Engine {
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             layers.push(TransformerBlock::load(
-                i, &vb, d_model, hidden_dim, num_heads, num_kv_heads, head_dim,
+                i,
+                &vb,
+                d_model,
+                hidden_dim,
+                num_heads,
+                num_kv_heads,
+                head_dim,
             )?);
         }
 
@@ -186,7 +192,10 @@ impl Engine {
         let _ = value_head.layer1.get_weights_t(&device);
         let _ = value_head.layer2.get_weights_t(&device);
 
-        println!("  Model loaded successfully ({} layers, GQA {}/{})", num_layers, num_heads, num_kv_heads);
+        println!(
+            "  Model loaded successfully ({} layers, GQA {}/{})",
+            num_layers, num_heads, num_kv_heads
+        );
 
         Ok(Self {
             embedding,
@@ -260,7 +269,12 @@ impl Engine {
                         .map(|(k, v)| (Some(k), Some(v)))
                         .unwrap_or((None, None));
                     let (out, new_k, new_v) = layer.forward_cached_single_token(
-                        &x, ck, cv, &self.rope_cos_f32, &self.rope_sin_f32, pos,
+                        &x,
+                        ck,
+                        cv,
+                        &self.rope_cos_f32,
+                        &self.rope_sin_f32,
+                        pos,
                     )?;
                     x = out;
                     cache.layers[i] = Some((new_k, new_v));
@@ -273,7 +287,13 @@ impl Engine {
                         .map(|(k, v)| (Some(k), Some(v)))
                         .unwrap_or((None, None));
                     let (out, new_k, new_v) = layer.forward_cached(
-                        &x, ck, cv, &self.rope_cos, &self.rope_sin, &self.causal_mask, total_seq,
+                        &x,
+                        ck,
+                        cv,
+                        &self.rope_cos,
+                        &self.rope_sin,
+                        &self.causal_mask,
+                        total_seq,
                     )?;
                     x = out;
                     cache.layers[i] = Some((new_k, new_v));
@@ -309,7 +329,13 @@ impl Engine {
         // Full forward with cache population (RoPE applied inside each layer)
         for (i, layer) in self.layers.iter().enumerate() {
             let (out, new_k, new_v) = layer.forward_cached(
-                &x, None, None, &self.rope_cos, &self.rope_sin, &self.causal_mask, take_len,
+                &x,
+                None,
+                None,
+                &self.rope_cos,
+                &self.rope_sin,
+                &self.causal_mask,
+                take_len,
             )?;
             x = out;
             cache.layers[i] = Some((new_k, new_v));

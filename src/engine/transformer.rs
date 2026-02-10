@@ -84,12 +84,7 @@ pub fn precompute_rope(
 
 /// Apply RoPE to tensor x of shape [batch, heads, seq_len, head_dim]
 /// cos/sin are [max_len, half_dim], sliced to [seq_len, half_dim] starting at offset.
-fn apply_rope(
-    x: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-    offset: usize,
-) -> Result<Tensor> {
+fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor, offset: usize) -> Result<Tensor> {
     let (_batch, _heads, seq_len, head_dim) = x.dims4()?;
     let half = head_dim / 2;
     // Slice cos/sin for positions [offset .. offset+seq_len]
@@ -151,28 +146,36 @@ impl GQAttention {
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Result<Self> {
-        let q_dim = num_heads * head_dim;     // 512
+        let q_dim = num_heads * head_dim; // 512
         let kv_dim = num_kv_heads * head_dim; // 128
 
         let q_proj = BitLinear::load_from_vb(
             &format!("{}.q_proj.weight", prefix),
             &format!("{}.q_proj.norm.weight", prefix),
-            vb, embed_dim, q_dim,
+            vb,
+            embed_dim,
+            q_dim,
         )?;
         let k_proj = BitLinear::load_from_vb(
             &format!("{}.k_proj.weight", prefix),
             &format!("{}.k_proj.norm.weight", prefix),
-            vb, embed_dim, kv_dim,
+            vb,
+            embed_dim,
+            kv_dim,
         )?;
         let v_proj = BitLinear::load_from_vb(
             &format!("{}.v_proj.weight", prefix),
             &format!("{}.v_proj.norm.weight", prefix),
-            vb, embed_dim, kv_dim,
+            vb,
+            embed_dim,
+            kv_dim,
         )?;
         let o_proj = BitLinear::load_from_vb(
             &format!("{}.o_proj.weight", prefix),
             &format!("{}.o_proj.norm.weight", prefix),
-            vb, embed_dim, embed_dim,
+            vb,
+            embed_dim,
+            embed_dim,
         )?;
 
         Ok(Self {
@@ -223,10 +226,16 @@ impl GQAttention {
         let v = self.v_proj.forward(x)?;
 
         // Reshape: Q → [batch, num_heads, seq, head_dim]
-        let q = q.reshape((batch, seq_len, self.num_heads, self.head_dim))?.transpose(1, 2)?;
+        let q = q
+            .reshape((batch, seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
         // K,V → [batch, num_kv_heads, seq, head_dim]
-        let k = k.reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
-        let v = v.reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
+        let k = k
+            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
 
         // Apply RoPE to Q and K
         let q = apply_rope(&q, rope_cos, rope_sin, 0)?;
@@ -250,10 +259,11 @@ impl GQAttention {
         };
 
         let attn_out = attn_weights.matmul(&v)?;
-        let attn_out = attn_out
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((batch, seq_len, self.embed_dim))?;
+        let attn_out =
+            attn_out
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((batch, seq_len, self.embed_dim))?;
 
         // Output projection (BitLinear with RMSNorm)
         self.o_proj.forward(&attn_out)
@@ -279,9 +289,15 @@ impl GQAttention {
         let k = self.k_proj.forward(x_new)?;
         let v = self.v_proj.forward(x_new)?;
 
-        let q = q.reshape((batch, new_tokens, self.num_heads, self.head_dim))?.transpose(1, 2)?;
-        let k = k.reshape((batch, new_tokens, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
-        let v = v.reshape((batch, new_tokens, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
+        let q = q
+            .reshape((batch, new_tokens, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((batch, new_tokens, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((batch, new_tokens, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
 
         // RoPE with offset for cached positions
         let q = apply_rope(&q, rope_cos, rope_sin, cached_len)?;
@@ -319,10 +335,11 @@ impl GQAttention {
         };
 
         let attn_out = attn_weights.matmul(&v_expanded)?;
-        let attn_out = attn_out
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((batch, new_tokens, self.embed_dim))?;
+        let attn_out =
+            attn_out
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((batch, new_tokens, self.embed_dim))?;
 
         let output = self.o_proj.forward(&attn_out)?;
 
@@ -531,30 +548,40 @@ impl BitSwiGLU {
         let x_unit: Vec<f32> = x_f32.iter().map(|&xi| xi * inv_rms).collect();
 
         // Gate: apply norm weights + SIMD GEMV + SiLU
-        let x_gate: Vec<f32> = x_unit.iter()
+        let x_gate: Vec<f32> = x_unit
+            .iter()
             .zip(self.w_gate.rms_norm_weight_f32.iter())
-            .map(|(&x, &w)| x * w).collect();
+            .map(|(&x, &w)| x * w)
+            .collect();
         let mut gate_out = vec![0.0f32; self.w_gate.out_dim];
         self.w_gate.dispatch_packed_gemv(&x_gate, &mut gate_out);
 
         // Val: apply norm weights + SIMD GEMV
-        let x_val: Vec<f32> = x_unit.iter()
+        let x_val: Vec<f32> = x_unit
+            .iter()
             .zip(self.w_val.rms_norm_weight_f32.iter())
-            .map(|(&x, &w)| x * w).collect();
+            .map(|(&x, &w)| x * w)
+            .collect();
         let mut val_out = vec![0.0f32; self.w_val.out_dim];
         self.w_val.dispatch_packed_gemv(&x_val, &mut val_out);
 
         // SiLU(gate) * val — fused in-place
-        let gated: Vec<f32> = gate_out.iter()
+        let gated: Vec<f32> = gate_out
+            .iter()
             .zip(val_out.iter())
-            .map(|(&g, &v)| silu_f32(g) * v).collect();
+            .map(|(&g, &v)| silu_f32(g) * v)
+            .collect();
 
         // w_out: RMS norm + SIMD GEMV
         let out_normed = rms_norm_vec(&gated, &self.w_out.rms_norm_weight_f32, 1e-5);
         let mut out = vec![0.0f32; self.w_out.out_dim];
         self.w_out.dispatch_packed_gemv(&out_normed, &mut out);
 
-        let out_shape = if orig_rank <= 2 { vec![1, self.w_out.out_dim] } else { vec![1, 1, self.w_out.out_dim] };
+        let out_shape = if orig_rank <= 2 {
+            vec![1, self.w_out.out_dim]
+        } else {
+            vec![1, 1, self.w_out.out_dim]
+        };
         Tensor::from_vec(out, out_shape, device)
     }
 }
@@ -584,7 +611,12 @@ impl TransformerBlock {
 
         let ln1 = vb.get((embed_dim,), &format!("{}.ln1.weight", prefix))?;
         let attn = GQAttention::load(
-            &format!("{}.attn", prefix), vb, embed_dim, num_heads, num_kv_heads, head_dim,
+            &format!("{}.attn", prefix),
+            vb,
+            embed_dim,
+            num_heads,
+            num_kv_heads,
+            head_dim,
         )?;
         // V6: key is "ls1" not "ls1.gamma"
         let ls1 = LayerScale::load(&format!("{}.ls1", prefix), vb, embed_dim)?;
@@ -614,7 +646,9 @@ impl TransformerBlock {
     ) -> Result<Tensor> {
         // Pre-norm attention with LayerScale residual
         let x_norm = rms_norm(x, &self.ln1, 1e-5)?;
-        let attn_out = self.attn.forward(&x_norm, rope_cos, rope_sin, causal_mask)?;
+        let attn_out = self
+            .attn
+            .forward(&x_norm, rope_cos, rope_sin, causal_mask)?;
         let attn_out = self.ls1.forward(&attn_out)?;
         let x = (x + attn_out)?;
 
@@ -641,7 +675,13 @@ impl TransformerBlock {
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let x_norm = rms_norm(x_new, &self.ln1, 1e-5)?;
         let (attn_out, new_k, new_v) = self.attn.forward_cached(
-            &x_norm, cache_k, cache_v, rope_cos, rope_sin, causal_mask, total_seq_len,
+            &x_norm,
+            cache_k,
+            cache_v,
+            rope_cos,
+            rope_sin,
+            causal_mask,
+            total_seq_len,
         )?;
         let attn_out = self.ls1.forward(&attn_out)?;
         let x = (x_new + attn_out)?;
@@ -666,7 +706,12 @@ impl TransformerBlock {
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let x_norm = rms_norm(x_new, &self.ln1, 1e-5)?;
         let (attn_out, new_k, new_v) = self.attn.forward_cached_single_token(
-            &x_norm, cache_k, cache_v, rope_cos_f32, rope_sin_f32, pos,
+            &x_norm,
+            cache_k,
+            cache_v,
+            rope_cos_f32,
+            rope_sin_f32,
+            pos,
         )?;
         let attn_out = self.ls1.forward(&attn_out)?;
         let x = (x_new + attn_out)?;

@@ -24,12 +24,16 @@ impl ValueHead {
         let layer1 = BitLinear::load_from_vb(
             "value_head.0.weight",
             "value_head.0.norm.weight",
-            vb, d_model, 256,
+            vb,
+            d_model,
+            256,
         )?;
         let layer2 = BitLinear::load_from_vb(
             "value_head.2.weight",
             "value_head.2.norm.weight",
-            vb, 256, 1,
+            vb,
+            256,
+            1,
         )?;
         Ok(Self { layer1, layer2 })
     }
@@ -38,7 +42,8 @@ impl ValueHead {
     /// Single token: zero-tensor f32 path with SIMD GEMV.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let shape = x.dims();
-        let is_single = shape[0] == 1 && (shape.len() < 2 || shape.get(1).copied().unwrap_or(1) == 1);
+        let is_single =
+            shape[0] == 1 && (shape.len() < 2 || shape.get(1).copied().unwrap_or(1) == 1);
 
         if is_single {
             return self.forward_single(x);
@@ -83,7 +88,9 @@ impl PolicyHead {
         let layer = BitLinear::load_from_vb(
             "policy_head.weight",
             "policy_head.norm.weight",
-            vb, d_model, vocab_size,
+            vb,
+            d_model,
+            vocab_size,
         )?;
         Ok(Self { layer })
     }

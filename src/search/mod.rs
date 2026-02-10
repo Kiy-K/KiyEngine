@@ -340,7 +340,8 @@ impl Searcher {
                             // --- Single legal move optimization ---
                             // If only one legal move, play it immediately (don't waste time)
                             let legal_count = MoveGen::new_legal(&board_clone).len();
-                            let single_move_limit: u8 = if legal_count == 1 { 1 } else { MAX_DEPTH };
+                            let single_move_limit: u8 =
+                                if legal_count == 1 { 1 } else { MAX_DEPTH };
 
                             // Lazy SMP: main thread full depth, helpers depth-1
                             let effective_max = if max_depth == 0 { MAX_DEPTH } else { max_depth };
@@ -381,8 +382,16 @@ impl Searcher {
 
                                 // --- Aspiration Windows with exponential widening ---
                                 let mut delta: i32 = 12;
-                                let mut alpha = if depth >= 5 { last_score - delta } else { -INFINITY };
-                                let mut beta = if depth >= 5 { last_score + delta } else { INFINITY };
+                                let mut alpha = if depth >= 5 {
+                                    last_score - delta
+                                } else {
+                                    -INFINITY
+                                };
+                                let mut beta = if depth >= 5 {
+                                    last_score + delta
+                                } else {
+                                    INFINITY
+                                };
 
                                 loop {
                                     let (score, mv) = worker.alpha_beta(alpha, beta, depth, 0);
@@ -665,7 +674,9 @@ impl SearchWorker {
     /// Incrementally update NNUE accumulator at ply+1 from ply after a move.
     /// Falls back to marking child as uncomputed (lazy refresh will handle it).
     fn nnue_make_move(&mut self, mv: ChessMove, ply: usize) {
-        if !self.use_nnue_eval { return; }
+        if !self.use_nnue_eval {
+            return;
+        }
         if let Some(ref net) = self.nnue {
             let parent_idx = ply.min(MAX_PLY - 1);
             let child_idx = (ply + 1).min(MAX_PLY - 1);
@@ -690,7 +701,9 @@ impl SearchWorker {
 
     /// Copy NNUE accumulator for null move (no pieces change, just side-to-move).
     fn nnue_null_move(&mut self, ply: usize) {
-        if !self.use_nnue_eval { return; }
+        if !self.use_nnue_eval {
+            return;
+        }
         if self.nnue.is_some() {
             let parent_idx = ply.min(MAX_PLY - 1);
             let child_idx = (ply + 1).min(MAX_PLY - 1);
@@ -780,10 +793,14 @@ impl SearchWorker {
 
         // Pawn attackers: reverse the attack direction to find pawns that attack sq
         let sq_val = BitBoard::from_square(sq).0;
-        let white_pawns = *self.board.pieces(Piece::Pawn) & *self.board.color_combined(Color::White);
-        let black_pawns = *self.board.pieces(Piece::Pawn) & *self.board.color_combined(Color::Black);
-        let wp = BitBoard(((sq_val >> 7) & !FILE_A_BB) | ((sq_val >> 9) & !FILE_H_BB)) & white_pawns;
-        let bp = BitBoard(((sq_val << 7) & !FILE_H_BB) | ((sq_val << 9) & !FILE_A_BB)) & black_pawns;
+        let white_pawns =
+            *self.board.pieces(Piece::Pawn) & *self.board.color_combined(Color::White);
+        let black_pawns =
+            *self.board.pieces(Piece::Pawn) & *self.board.color_combined(Color::Black);
+        let wp =
+            BitBoard(((sq_val >> 7) & !FILE_A_BB) | ((sq_val >> 9) & !FILE_H_BB)) & white_pawns;
+        let bp =
+            BitBoard(((sq_val << 7) & !FILE_H_BB) | ((sq_val << 9) & !FILE_A_BB)) & black_pawns;
 
         (knights | king | bishops_queens | rooks_queens | wp | bp) & occupied
     }
@@ -1444,7 +1461,8 @@ impl SearchWorker {
                                                     Self::piece_index(qp, moved_color) as usize;
                                                 let qt = q.get_dest().to_index();
                                                 if qi < 12 {
-                                                    let qch = &mut self.cont_history[pp][pt][qi][qt];
+                                                    let qch =
+                                                        &mut self.cont_history[pp][pt][qi][qt];
                                                     *qch += -bonus - qch.abs() * bonus / 16384;
                                                     *qch = (*qch).clamp(-30000, 30000);
                                                 }

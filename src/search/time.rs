@@ -137,12 +137,7 @@ impl TimeManager {
 
     /// Update search state after each completed depth iteration.
     /// Called by main thread from the ID loop.
-    pub fn update_iteration(
-        &self,
-        depth: u32,
-        score: i32,
-        best_move_changed: bool,
-    ) {
+    pub fn update_iteration(&self, depth: u32, score: i32, best_move_changed: bool) {
         self.completed_depth.store(depth, Ordering::Relaxed);
 
         // Update falling eval tracking

@@ -15,14 +15,14 @@ const FILE_MASKS: [u64; 8] = [
 
 // Adjacent file masks for isolated pawn detection
 const ADJACENT_FILES: [u64; 8] = [
-    FILE_MASKS[1],                       // A: only B
-    FILE_MASKS[0] | FILE_MASKS[2],       // B: A+C
-    FILE_MASKS[1] | FILE_MASKS[3],       // C: B+D
-    FILE_MASKS[2] | FILE_MASKS[4],       // D: C+E
-    FILE_MASKS[3] | FILE_MASKS[5],       // E: D+F
-    FILE_MASKS[4] | FILE_MASKS[6],       // F: E+G
-    FILE_MASKS[5] | FILE_MASKS[7],       // G: F+H
-    FILE_MASKS[6],                       // H: only G
+    FILE_MASKS[1],                 // A: only B
+    FILE_MASKS[0] | FILE_MASKS[2], // B: A+C
+    FILE_MASKS[1] | FILE_MASKS[3], // C: B+D
+    FILE_MASKS[2] | FILE_MASKS[4], // D: C+E
+    FILE_MASKS[3] | FILE_MASKS[5], // E: D+F
+    FILE_MASKS[4] | FILE_MASKS[6], // F: E+G
+    FILE_MASKS[5] | FILE_MASKS[7], // G: F+H
+    FILE_MASKS[6],                 // H: only G
 ];
 
 // Passed pawn bonus by rank (from White's perspective, rank 1-8 index 0-7)
