@@ -252,6 +252,7 @@ impl Searcher {
         stop_flag: Arc<AtomicBool>,
         tx: mpsc::Sender<String>,
         kv_cache: Option<Arc<parking_lot::Mutex<KVCache>>>,
+        position_history: Vec<u64>,
     ) {
         let engine = Arc::clone(&self.engine);
         let tt = Arc::clone(&self.tt);
@@ -259,6 +260,9 @@ impl Searcher {
         let move_overhead = self.move_overhead;
         let is_white = board.side_to_move() == Color::White;
         let nnue = self.nnue.clone();
+
+        let ply = move_history.len() as u32;
+        let pos_hist = Arc::new(position_history);
 
         std::thread::spawn(move || {
             let time_manager = Arc::new(TimeManager::new(
@@ -269,6 +273,7 @@ impl Searcher {
                 movestogo,
                 move_overhead,
                 is_white,
+                ply,
             ));
 
             // Pre-compute NN policy ONCE, then share across all threads
@@ -302,6 +307,7 @@ impl Searcher {
                 let is_main = i == 0;
                 let policy_clone = Arc::clone(&shared_policy);
                 let nnue_clone = nnue.clone();
+                let pos_hist_clone = Arc::clone(&pos_hist);
 
                 handles.push(
                     std::thread::Builder::new()
@@ -309,9 +315,9 @@ impl Searcher {
                         .spawn(move || {
                             let mut worker =
                                 SearchWorker::new(tt_clone, board_clone, stop_clone, nnue_clone);
+                            worker.set_game_history((*pos_hist_clone).clone());
                             let mut best_move = None;
                             let mut last_score = 0;
-                            let mut stability: u32 = 0; // Best-move stability counter
                             let mut prev_best: Option<ChessMove> = None;
                             let start_time = std::time::Instant::now();
 
@@ -322,36 +328,43 @@ impl Searcher {
                             worker.nnue_refresh(0);
 
                             // Wire time manager for in-search abort checks
-                            let depth_only_check = max_depth > 0 && wtime == 0 && btime == 0;
-                            if !depth_only_check {
+                            let depth_only = max_depth > 0 && wtime == 0 && btime == 0;
+                            if !depth_only {
                                 worker.time_manager = Some(Arc::clone(&tm_clone));
                             }
 
-                            // Lazy SMP: Thread chính chạy full depth, Thread phụ chạy depth-1 để feed TT
+                            // --- Single legal move optimization ---
+                            // If only one legal move, play it immediately (don't waste time)
+                            let legal_count = MoveGen::new_legal(&board_clone).len();
+                            let single_move_limit: u8 = if legal_count == 1 { 1 } else { MAX_DEPTH };
+
+                            // Lazy SMP: main thread full depth, helpers depth-1
                             let effective_max = if max_depth == 0 { MAX_DEPTH } else { max_depth };
+                            let effective_max = effective_max.min(single_move_limit);
                             let local_max_depth = if is_main {
                                 effective_max
                             } else {
                                 effective_max.saturating_sub(1).max(1)
                             };
 
-                            let depth_only = max_depth > 0 && wtime == 0 && btime == 0;
-                            const MIN_DEPTH: u8 = 3; // Always complete at least depth 3
+                            const MIN_DEPTH: u8 = 3;
 
                             for depth in 1..=local_max_depth {
-                                // Age history tables between iterations to prevent stale values
+                                // Reset search path for clean repetition detection
+                                worker.search_path_len = 0;
+
+                                // Age history tables between iterations
                                 if depth > 1 {
                                     worker.age_history();
                                 }
 
-                                // Only allow time abort AFTER minimum depth is reached
+                                // Time abort checks (only after minimum depth)
                                 if worker.stop_flag.load(Ordering::Relaxed) {
                                     break;
                                 }
                                 if !depth_only && depth > MIN_DEPTH {
                                     if is_main {
-                                        // Use stability-aware soft stop between depths
-                                        if tm_clone.should_stop_soft(stability) {
+                                        if tm_clone.should_stop_soft() {
                                             break;
                                         }
                                     } else if tm_clone.should_stop() {
@@ -359,13 +372,10 @@ impl Searcher {
                                     }
                                 }
 
-                                // Aspiration Windows logic
-                                let mut alpha = -INFINITY;
-                                let mut beta = INFINITY;
-                                if depth > 3 {
-                                    alpha = last_score - 50;
-                                    beta = last_score + 50;
-                                }
+                                // --- Aspiration Windows with exponential widening ---
+                                let mut delta: i32 = 40;
+                                let mut alpha = if depth > 3 { last_score - delta } else { -INFINITY };
+                                let mut beta = if depth > 3 { last_score + delta } else { INFINITY };
 
                                 loop {
                                     let (score, mv) = worker.alpha_beta(alpha, beta, depth, 0);
@@ -378,20 +388,29 @@ impl Searcher {
                                     }
 
                                     if score <= alpha {
-                                        alpha = alpha.saturating_sub(150); // Widen window
+                                        // Fail low: widen downward, keep beta
+                                        beta = (alpha + beta) / 2;
+                                        alpha = (score - delta).max(-INFINITY);
+                                        delta += delta / 3 + 5;
                                     } else if score >= beta {
-                                        beta = beta.saturating_add(150); // Widen window
+                                        // Fail high: widen upward
+                                        beta = (score + delta).min(INFINITY);
+                                        delta += delta / 3 + 5;
                                     } else {
+                                        // Score within window — iteration complete
+                                        let best_move_changed = mv != prev_best;
                                         if is_main {
-                                            // Track best-move stability
-                                            if mv == prev_best {
-                                                stability = stability.saturating_add(1);
-                                            } else {
-                                                stability = 0;
-                                            }
                                             prev_best = mv;
                                             best_move = mv;
                                             last_score = score;
+
+                                            // Update time manager with iteration results
+                                            tm_clone.update_iteration(
+                                                depth as u32,
+                                                score,
+                                                best_move_changed,
+                                            );
+
                                             let elapsed =
                                                 start_time.elapsed().as_secs_f64().max(0.001);
                                             let nps = (worker.nodes as f64 / elapsed) as u64;
@@ -408,7 +427,7 @@ impl Searcher {
                                         }
                                         break;
                                     }
-                                    // Nếu window đã mở hết cỡ mà vẫn fail, break
+                                    // Safety: if window is already full, break
                                     if alpha <= -INFINITY && beta >= INFINITY {
                                         break;
                                     }
@@ -475,6 +494,11 @@ pub struct SearchWorker {
     // NNUE evaluation (optional — falls back to Material+PST if None)
     nnue: Option<Arc<NnueNetwork>>,
     nnue_acc: Vec<Accumulator>,
+    // Repetition detection: game position hashes from UCI position command
+    game_hash_history: Vec<u64>,
+    // Search path hashes for 2-fold repetition during search (fixed-size, zero-alloc)
+    search_path: [u64; MAX_PLY],
+    search_path_len: usize,
 }
 
 impl SearchWorker {
@@ -509,7 +533,52 @@ impl SearchWorker {
             cached_root_value: 0.0,
             nnue,
             nnue_acc,
+            game_hash_history: Vec::new(),
+            search_path: [0u64; MAX_PLY],
+            search_path_len: 0,
         }
+    }
+
+    /// Set game position history for repetition detection.
+    fn set_game_history(&mut self, history: Vec<u64>) {
+        self.game_hash_history = history;
+    }
+
+    /// Check for repetition: 2-fold in search path OR position seen in game history.
+    /// Only checks every-other position (same side to move) for efficiency.
+    #[inline]
+    fn is_repetition(&self) -> bool {
+        let hash = self.board.get_hash();
+        let len = self.search_path_len;
+        // Check search path in reverse, skip 1 (same side to move repeats at ply-2, ply-4, ...)
+        let mut i = len.wrapping_sub(2);
+        while i < len {
+            if self.search_path[i] == hash {
+                return true;
+            }
+            i = i.wrapping_sub(2);
+        }
+        // Check game history (last 100 positions max for performance)
+        let start = self.game_hash_history.len().saturating_sub(100);
+        for &h in &self.game_hash_history[start..] {
+            if h == hash {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[inline]
+    fn search_path_push(&mut self, hash: u64) {
+        if self.search_path_len < MAX_PLY {
+            self.search_path[self.search_path_len] = hash;
+            self.search_path_len += 1;
+        }
+    }
+
+    #[inline]
+    fn search_path_pop(&mut self) {
+        self.search_path_len = self.search_path_len.saturating_sub(1);
     }
 
     /// Age history tables: halve all scores to prevent stale values from dominating.
@@ -545,17 +614,16 @@ impl SearchWorker {
     // FAST STATIC EVAL — NNUE if available, else Material + PST.
     // =========================================================================
     #[inline]
-    fn fast_eval(&mut self, ply: usize) -> i32 {
-        if let Some(ref net) = self.nnue {
-            let idx = ply.min(MAX_PLY - 1);
-            if !self.nnue_acc[idx].computed {
-                // Lazy refresh: recompute from current board position
-                self.nnue_acc[idx].refresh(&self.board, net);
-            }
-            let eval = net.evaluate(&self.nnue_acc[idx], self.board.side_to_move());
-            // Clamp to avoid interference with mate score detection (MATE_SCORE=30000)
-            return eval.clamp(-29000, 29000);
-        }
+    fn fast_eval(&mut self, _ply: usize) -> i32 {
+        // TODO: Re-enable NNUE eval once training data quality improves
+        // if let Some(ref net) = self.nnue {
+        //     let idx = ply.min(MAX_PLY - 1);
+        //     if !self.nnue_acc[idx].computed {
+        //         self.nnue_acc[idx].refresh(&self.board, net);
+        //     }
+        //     let eval = net.evaluate(&self.nnue_acc[idx], self.board.side_to_move());
+        //     return eval.clamp(-29000, 29000);
+        // }
         eval::evaluate(&self.board, 0)
     }
 
@@ -705,6 +773,11 @@ impl SearchWorker {
         let is_pv = beta - alpha > 1;
         let is_root = ply == 0;
 
+        // --- Step 1b: Repetition detection ---
+        if !is_root && self.is_repetition() {
+            return (0, None); // Draw by repetition
+        }
+
         // --- Step 2: Check extension ---
         let in_check = self.board.checkers().0 != 0;
         if in_check && depth < MAX_PLY as u8 {
@@ -822,6 +895,7 @@ impl SearchWorker {
         {
             if let Some(null_board) = self.board.null_move() {
                 let old_board = self.board;
+                self.search_path_push(self.board.get_hash());
                 self.board = null_board;
                 self.nnue_null_move(ply);
 
@@ -832,6 +906,7 @@ impl SearchWorker {
                 let null_score = -val;
 
                 self.board = old_board;
+                self.search_path_pop();
 
                 if self.stop_flag.load(Ordering::Relaxed) {
                     return (0, None);
@@ -962,6 +1037,8 @@ impl SearchWorker {
             let moved_piece = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
             let moved_color = self.board.side_to_move();
             let old_board = self.board;
+            // Push current position hash for repetition detection
+            self.search_path_push(self.board.get_hash());
             self.nnue_make_move(mv, ply);
             self.board = self.board.make_move_new(mv);
 
@@ -1067,6 +1144,7 @@ impl SearchWorker {
 
             // --- Step 19: Undo move ---
             self.board = old_board;
+            self.search_path_pop();
 
             if self.stop_flag.load(Ordering::Relaxed) {
                 return (0, None);

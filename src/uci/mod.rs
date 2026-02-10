@@ -164,7 +164,22 @@ impl UciHandler {
     pub fn new() -> anyhow::Result<Self> {
         let engine = Arc::new(Engine::new()?);
         let tt = Arc::new(TranspositionTable::new(512));
-        let searcher = Searcher::new(Arc::clone(&engine), Arc::clone(&tt));
+        let mut searcher = Searcher::new(Arc::clone(&engine), Arc::clone(&tt));
+
+        // Try loading NNUE evaluation network
+        let nnue_path = crate::nnue::DEFAULT_NNUE_PATH;
+        if std::path::Path::new(nnue_path).exists() {
+            match crate::nnue::NnueNetwork::load(nnue_path) {
+                Ok(net) => {
+                    println!("info string NNUE loaded: {}", nnue_path);
+                    searcher.nnue = Some(std::sync::Arc::new(net));
+                }
+                Err(e) => {
+                    eprintln!("info string NNUE load failed: {}", e);
+                }
+            }
+        }
+
         let book = OpeningBook::load(&["src/book/book1.bin", "src/book/book2.bin"]);
         let (tx, rx) = mpsc::channel();
 
@@ -376,6 +391,7 @@ impl UciHandler {
         let mut binc: u32 = 0;
         let mut movestogo: u32 = 0;
         let mut depth: u8 = 0;
+        let mut movetime: u32 = 0;
 
         let mut i = 0;
         while i < parts.len() {
@@ -416,6 +432,12 @@ impl UciHandler {
                     }
                     i += 2;
                 }
+                "movetime" => {
+                    if let Some(v) = parts.get(i + 1).and_then(|s| s.parse().ok()) {
+                        movetime = v;
+                    }
+                    i += 2;
+                }
                 "infinite" => {
                     depth = 0;
                     i += 1;
@@ -424,6 +446,15 @@ impl UciHandler {
                     i += 1;
                 }
             }
+        }
+
+        // Handle movetime: convert to wtime/btime with movestogo=1
+        if movetime > 0 {
+            wtime = movetime;
+            btime = movetime;
+            winc = 0;
+            binc = 0;
+            movestogo = 1;
         }
 
         self.stop_flag.store(false, Ordering::SeqCst);
@@ -449,6 +480,7 @@ impl UciHandler {
             Arc::clone(&self.stop_flag),
             self.tx_move.clone(),
             Some(Arc::clone(&self.kv_cache)),
+            self.position_history.clone(),
         );
     }
 }
