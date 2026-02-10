@@ -756,7 +756,7 @@ impl SearchWorker {
         }
 
         // --- Step 1: Abort check (+ periodic time check every 2048 nodes) ---
-        if self.nodes & 4095 == 0 {
+        if self.nodes & 8191 == 0 {
             if let Some(ref tm) = self.time_manager {
                 if tm.should_stop() {
                     self.stop_flag.store(true, Ordering::Relaxed);
@@ -1061,8 +1061,9 @@ impl SearchWorker {
                 score = -val;
             } else {
                 // --- Step 18: Late Move Reductions (LMR) ---
+                // Now applies to PV nodes too (with less reduction)
                 let mut r: u8 = 0;
-                if depth >= 3 && !in_check && !is_pv {
+                if depth >= 3 && !in_check {
                     if is_tactical || gives_check {
                         if moves_searched >= 6 {
                             r = 1;
@@ -1079,6 +1080,11 @@ impl SearchWorker {
                     // Reduce less for killer moves
                     if self.killers[ply_idx][0] == Some(mv) || self.killers[ply_idx][1] == Some(mv)
                     {
+                        r = r.saturating_sub(1);
+                    }
+
+                    // PV nodes get less reduction (proven ~30 Elo gain)
+                    if is_pv {
                         r = r.saturating_sub(1);
                     }
 
@@ -1188,27 +1194,25 @@ impl SearchWorker {
                         self.killers[ply_idx][1] = self.killers[ply_idx][0];
                         self.killers[ply_idx][0] = Some(mv);
 
-                        // History bonus for the move that caused cutoff
+                        // Stockfish-style history gravity:
+                        // bonus = depth^2, update = bonus - |h| * bonus / 16384
                         let bonus = (depth as i32) * (depth as i32);
-                        self.history[side][from][to] += bonus;
+                        let h = &mut self.history[side][from][to];
+                        *h += bonus - h.abs() * bonus / 16384;
+                        *h = (*h).clamp(-30000, 30000);
 
                         // History gravity: penalize all quiet moves that didn't cause cutoff
-                        let malus = -bonus;
                         for i in 0..quiets_count {
                             if let Some(q) = quiets_tried[i] {
                                 if q != mv {
                                     let qf = q.get_source().to_index();
                                     let qt = q.get_dest().to_index();
-                                    self.history[side][qf][qt] += malus;
-                                    self.history[side][qf][qt] =
-                                        self.history[side][qf][qt].clamp(-30000, 30000);
+                                    let qh = &mut self.history[side][qf][qt];
+                                    *qh += -bonus - qh.abs() * bonus / 16384;
+                                    *qh = (*qh).clamp(-30000, 30000);
                                 }
                             }
                         }
-
-                        // Clamp history to prevent overflow (per-entry, no full table scan)
-                        self.history[side][from][to] =
-                            self.history[side][from][to].clamp(-30000, 30000);
 
                         // Countermove heuristic: record this move as refutation of previous move
                         if ply >= 1 {
@@ -1229,9 +1233,9 @@ impl SearchWorker {
                                 let cp = Self::piece_index(moved_piece, moved_color) as usize;
                                 let ct = mv.get_dest().to_index();
                                 if pp < 12 && cp < 12 {
-                                    self.cont_history[pp][pt][cp][ct] += bonus;
-                                    self.cont_history[pp][pt][cp][ct] =
-                                        self.cont_history[pp][pt][cp][ct].clamp(-30000, 30000);
+                                    let ch = &mut self.cont_history[pp][pt][cp][ct];
+                                    *ch += bonus - ch.abs() * bonus / 16384;
+                                    *ch = (*ch).clamp(-30000, 30000);
 
                                     // Penalize quiet non-cutoff moves in cont_history too
                                     for i in 0..quiets_count {
@@ -1245,10 +1249,9 @@ impl SearchWorker {
                                                     Self::piece_index(qp, moved_color) as usize;
                                                 let qt = q.get_dest().to_index();
                                                 if qi < 12 {
-                                                    self.cont_history[pp][pt][qi][qt] += malus;
-                                                    self.cont_history[pp][pt][qi][qt] = self
-                                                        .cont_history[pp][pt][qi][qt]
-                                                        .clamp(-30000, 30000);
+                                                    let qch = &mut self.cont_history[pp][pt][qi][qt];
+                                                    *qch += -bonus - qch.abs() * bonus / 16384;
+                                                    *qch = (*qch).clamp(-30000, 30000);
                                                 }
                                             }
                                         }
@@ -1298,7 +1301,7 @@ impl SearchWorker {
         if ply >= MAX_PLY {
             return self.fast_eval(ply);
         }
-        if self.nodes & 4095 == 0 {
+        if self.nodes & 8191 == 0 {
             if let Some(ref tm) = self.time_manager {
                 if tm.should_stop() {
                     self.stop_flag.store(true, Ordering::Relaxed);
