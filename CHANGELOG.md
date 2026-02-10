@@ -5,6 +5,78 @@ All notable changes to KiyEngine will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.0.0] - 2026-02-12
+
+### Added
+
+- **Stockfish-Inspired Time Management** -- complete rewrite of `TimeManager`
+  - Soft/hard time bounds with ply-aware scaling
+  - Best move stability factor (sigmoid-based time reduction when best move is stable)
+  - Falling eval factor (EMA-based score tracking, spends more time when eval drops)
+  - Best move instability factor (extends time when best move changes frequently)
+  - Adaptive moves-to-go estimation for sudden death: `(50 - 0.4 * ply).clamp(20, 50)`
+- **Repetition Detection** in alpha-beta search
+  - Fixed-size search path array (zero heap allocations)
+  - 2-fold detection in search path, checking every-other position (same side to move)
+  - Game history integration (last 100 positions from UCI position command)
+  - Position history passed from UCI handler through `search_async` to all workers
+- **Enhanced Static Evaluation** -- new positional terms beyond material + PST
+  - Bishop pair bonus (+30cp)
+  - Rook on open file (+20cp) and semi-open file (+10cp)
+  - Passed pawn bonus (rank-scaled 5-100cp, zero-loop bitboard mask computation)
+  - Doubled pawn penalty (-10cp)
+  - Isolated pawn penalty (-15cp)
+- **LMR on PV Nodes** -- Late Move Reductions now apply to PV nodes with 1 less reduction
+- **Stockfish-Style History Gravity** -- `bonus - |h| * bonus / 16384` across all tables
+  - Applied to: history heuristic, continuation history, capture history
+  - Prevents table saturation, maintains ordering signal quality over long searches
+- **Incremental Move Picking** -- `pick_next_move` selects best remaining move on demand
+  - Avoids full sorting of moves pruned early by beta cutoffs
+  - Applied in both alpha-beta and quiescence search
+- **movetime UCI Command** -- fixed-time search support
+  - Converts `movetime` to equivalent `wtime/btime` with `movestogo=1`
+- **Singular Extensions** -- extend TT move when significantly better than alternatives
+- **Continuation History** -- `[prev_piece][prev_to][cur_piece][cur_to]` table for move ordering
+- **Countermove Heuristic** -- records refutation moves for improved quiet move ordering
+- **NNUE Infrastructure** -- accumulator, feature extraction, and network loading in place
+  - `use_nnue_eval` flag allows conditional activation (currently disabled)
+  - Accumulator updates skipped when NNUE is inactive (+19% NPS savings)
+
+### Changed
+
+- **Iterative Deepening Loop** rewritten
+  - Exponential aspiration window widening on fail high/low
+  - Single legal move early exit (no need to search further)
+  - Best move change tracking per iteration for TimeManager feedback
+  - Search path reset at start of each iteration
+- **Node Check Interval** increased from 4096 to 8192 (reduced polling overhead)
+- **Aspiration Windows** start at depth >= 4 with exponential widening (was fixed progressive)
+- **History Table Updates** use gravity formula instead of flat add/clamp
+- **Move Ordering** changed from full sort to score-only with incremental picking
+- Engine version bumped to 6.0.0
+
+### Performance
+
+- **3.6x fewer nodes** to reach depth 20 (9.3M vs 33.9M in v5.2.0)
+- **2.2x faster wall time** to reach depth 20 (7.1s vs 15.6s in v5.2.0)
+- **+19% NPS** from skipping unused NNUE accumulator updates
+- Depth 15+ reached in 60s+1s time control (4 threads)
+- Zero-allocation repetition detection (fixed-size array, no Vec)
+- Incremental move picking avoids sorting moves never searched
+
+### Benchmark (depth 20, 4 threads)
+
+```
+Position: 3r2k1/pp3pp1/2p1bn1p/8/4P3/2N2N2/PPP2PPP/3R2K1 w
+
+Version     Nodes         NPS          Wall Time
+-------     ----------    ----------   ---------
+v5.2.0      33,900,000    2,180,000    ~15.6s
+v6.0.0       9,285,144    1,312,392     ~7.1s
+```
+
+---
+
 ## [5.2.0] - 2026-02-10
 
 ### Added
