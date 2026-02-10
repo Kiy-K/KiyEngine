@@ -27,7 +27,7 @@ static LMR_TABLE: std::sync::LazyLock<[[u8; LMR_MAX_MOVES]; LMR_MAX_DEPTH]> =
             for m in 1..LMR_MAX_MOVES {
                 let df = d as f64;
                 let mf = m as f64;
-                table[d][m] = (0.75 + (df.ln() * mf.ln() / 2.0)) as u8;
+                table[d][m] = (0.77 + (df.ln() * mf.ln() / 2.25)) as u8;
             }
         }
         table
@@ -373,9 +373,9 @@ impl Searcher {
                                 }
 
                                 // --- Aspiration Windows with exponential widening ---
-                                let mut delta: i32 = 40;
-                                let mut alpha = if depth > 3 { last_score - delta } else { -INFINITY };
-                                let mut beta = if depth > 3 { last_score + delta } else { INFINITY };
+                                let mut delta: i32 = 12;
+                                let mut alpha = if depth >= 5 { last_score - delta } else { -INFINITY };
+                                let mut beta = if depth >= 5 { last_score + delta } else { INFINITY };
 
                                 loop {
                                     let (score, mv) = worker.alpha_beta(alpha, beta, depth, 0);
@@ -590,14 +590,14 @@ impl SearchWorker {
         for side in 0..2 {
             for from in 0..64 {
                 for to in 0..64 {
-                    self.history[side][from][to] /= 2;
+                    self.history[side][from][to] = self.history[side][from][to] * 3 / 4;
                 }
             }
         }
         for p in 0..6 {
             for sq in 0..64 {
                 for v in 0..6 {
-                    self.capture_history[p][sq][v] /= 2;
+                    self.capture_history[p][sq][v] = self.capture_history[p][sq][v] * 3 / 4;
                 }
             }
         }
@@ -863,8 +863,8 @@ impl SearchWorker {
         // Improving flag: tighter margin when position is improving
         if !is_pv
             && !in_check
-            && depth <= 7
-            && static_eval - (if improving { 60 } else { 90 }) * (depth as i32) >= beta
+            && depth <= 9
+            && static_eval - (if improving { 70 } else { 100 }) * (depth as i32) >= beta
             && static_eval < MATE_SCORE - 100
         {
             return (static_eval, None);
@@ -896,8 +896,8 @@ impl SearchWorker {
                 self.board = null_board;
                 self.nnue_null_move(ply);
 
-                // Adaptive reduction: R = 3 + depth/6, capped
-                let r = 3 + (depth / 6).min(3);
+                // Adaptive reduction: R = 4 + depth/6, capped (Stockfish-like)
+                let r = 4 + (depth / 6).min(3);
                 let null_depth = depth.saturating_sub(r);
                 let (val, _) = self.alpha_beta(-beta, -beta + 1, null_depth, ply + 1);
                 let null_score = -val;
@@ -920,7 +920,8 @@ impl SearchWorker {
         }
 
         // --- Step 10: Internal Iterative Reduction (IIR) ---
-        if depth >= 4 && tt_move.is_none() && !in_check {
+        // Non-PV: reduce at depth>=3; PV: reduce at depth>=4
+        if tt_move.is_none() && !in_check && (depth >= 4 || (!is_pv && depth >= 3)) {
             depth -= 1;
         }
 
@@ -948,7 +949,7 @@ impl SearchWorker {
         // If no alternative beats se_beta, the TT move is "singular" → extend it.
         let mut singular_extension: i8 = 0;
         if !is_root
-            && depth >= 8
+            && depth >= 6
             && tt_move.is_some()
             && tt_depth >= depth.saturating_sub(3)
             && tt_entry
@@ -960,7 +961,7 @@ impl SearchWorker {
             let se_depth = (depth - 1) / 2;
 
             // Search only the best non-TT move at reduced depth
-            let mut se_found_fail = true;
+            let mut se_score = -INFINITY;
             for (mv, _) in &moves {
                 if Some(*mv) == tt_move {
                     continue;
@@ -976,15 +977,16 @@ impl SearchWorker {
                     return (0, None);
                 }
 
-                if score >= se_beta {
-                    se_found_fail = false;
-                }
+                se_score = score;
                 // Only test the top-ranked non-TT move (restricted SE)
                 break;
             }
 
-            if se_found_fail {
+            if se_score < se_beta {
                 singular_extension = 1;
+            } else if se_score >= beta {
+                // Multi-cut: if the non-TT move also beats beta, prune
+                return (se_score, None);
             }
         }
 
@@ -1005,27 +1007,28 @@ impl SearchWorker {
 
             // --- Step 13: Late Move Pruning (LMP) ---
             // Improving flag: allow more moves when improving
-            if !is_root && !in_check && !is_tactical && depth <= 5 {
-                let base = (3 + (depth as usize) * (depth as usize)) / 2;
-                let lmp_threshold = if improving { base + 2 } else { base };
+            if !is_root && !in_check && !is_tactical && depth <= 8 {
+                let base = 3 + (depth as usize) * (depth as usize) / 3;
+                let lmp_threshold = if improving { base + 3 } else { base };
                 if moves_searched >= lmp_threshold {
                     continue;
                 }
             }
 
             // --- Step 14: Futility Pruning ---
-            if !is_root && !in_check && !is_tactical && depth <= 6 && moves_searched > 0 {
-                let futility_margin = static_eval + 100 + 120 * (depth as i32);
+            if !is_root && !in_check && !is_tactical && depth <= 8 && moves_searched > 0 {
+                let futility_margin = static_eval + 150 + 100 * (depth as i32);
                 if futility_margin <= alpha {
                     continue;
                 }
             }
 
             // --- Step 15: SEE Pruning for bad captures ---
-            if !is_root && is_cap && !is_promo && depth <= 4 && moves_searched > 0 {
+            if !is_root && is_cap && !is_promo && depth <= 7 && moves_searched > 0 {
                 let victim = self.board.piece_on(mv.get_dest()).unwrap_or(Piece::Pawn);
                 let attacker = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
-                if piece_value(attacker) > piece_value(victim) + 200 {
+                let see_threshold = if depth <= 4 { 200 } else { 100 };
+                if piece_value(attacker) > piece_value(victim) + see_threshold {
                     continue;
                 }
             }
@@ -1378,12 +1381,24 @@ impl SearchWorker {
         } else {
             let targets = *self.board.color_combined(!self.board.side_to_move());
             let mut moves = MoveGen::new_legal(&self.board);
+            // First pass: captures
             moves.set_iterator_mask(targets);
-            for mv in moves {
+            for mv in &mut moves {
                 let victim = self.board.piece_on(mv.get_dest()).unwrap_or(Piece::Pawn);
                 let attacker = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
                 let see_score = piece_value(victim) * 10 - piece_value(attacker);
                 scored_moves.push((mv, see_score));
+            }
+            // Second pass: non-capture queen promotions (critical for endgames)
+            moves.set_iterator_mask(!targets & !chess::EMPTY);
+            // Actually, iterate over all remaining non-capture moves and pick queen promos
+            let all_moves = MoveGen::new_legal(&self.board);
+            for mv in all_moves {
+                if mv.get_promotion() == Some(Piece::Queen)
+                    && (targets & BitBoard::from_square(mv.get_dest())).0 == 0
+                {
+                    scored_moves.push((mv, 44_000)); // Just below main search promo score
+                }
             }
         }
         let original_alpha = alpha;
