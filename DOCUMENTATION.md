@@ -28,13 +28,16 @@ KiyEngine is a high-performance UCI chess engine built in Rust with the followin
    - Pre-transposed weights and fused RMSNorm+MatMul
 
 2. **Search Algorithm** (`search/`)
-   - Lazy SMP with configurable thread count, lock-free shared transposition table
+   - Lazy SMP with configurable thread count, varied depth offsets, lock-free shared TT
    - Alpha-beta with PVS, aspiration windows (exponential widening)
-   - LMR on both PV and non-PV nodes with history-based adjustments
+   - Static Exchange Evaluation (SEE) with x-ray sliding attacks
+   - LMR on both PV and non-PV nodes with history + SEE adjustments
+   - Triangular PV table with full PV lines in UCI output
    - Repetition detection (search path + game history)
    - Incremental move picking (avoids sorting pruned moves)
    - Stockfish-style history gravity across all history tables
-   - Singular extensions, null move pruning, razoring, futility pruning
+   - Extensions: singular, recapture, passed pawn push
+   - Null move pruning, razoring, futility pruning, SEE pruning
 
 3. **Static Evaluation** (`search/eval.rs`)
    - Material + PeSTO piece-square tables
@@ -171,8 +174,11 @@ Centralized constants to avoid magic numbers:
 **SearchWorker** -- per-thread search state
 
 - Alpha-beta with PVS, exponential aspiration windows
+- Static Exchange Evaluation (SEE) with x-ray attacks for pruning and LMR
+- Triangular PV table (`pv_table[ply][i]`, `pv_len[ply]`) for full PV tracking
 - Killer moves (2 per ply), history heuristic, continuation history, capture history
 - Countermove heuristic
+- Extensions: singular, recapture (same-square), passed pawn push (6th/7th rank)
 - Repetition detection: fixed-size search path array + game hash history
 - NNUE accumulator (infrastructure ready, evaluation not yet active)
 - Incremental move picking via `pick_next_move`
@@ -208,12 +214,14 @@ Centralized constants to avoid magic numbers:
 | Technique | Condition | Description |
 |-----------|-----------|-------------|
 | Razoring | depth <= 3, eval far below alpha | Skip to qsearch |
-| Reverse Futility | depth <= 7, eval above beta + margin | Return eval |
-| Null Move | depth >= 3, non-PV, not in check | Reduce R = 3 + depth/4 |
+| Reverse Futility | depth <= 9, eval above beta + margin | Return eval |
+| Null Move | depth >= 3, non-PV, not in check | Reduce R = 4 + depth/6 |
 | Probcut | depth >= 5, shallow search confirms | Early beta cutoff |
-| Late Move Pruning | quiet moves beyond threshold | Skip late quiet moves |
-| Futility Pruning | depth <= 6, eval + margin < alpha | Skip futile quiet moves |
-| SEE Pruning | bad captures (SEE < 0) | Skip losing captures |
+| Late Move Pruning | depth <= 8, quiet moves beyond threshold | Skip late quiet moves |
+| Futility Pruning | depth <= 8, eval + margin < alpha | Skip futile quiet moves |
+| SEE Pruning (captures) | SEE < -20 × depth | Skip losing captures |
+| SEE Pruning (quiets) | depth <= 8, SEE < -50 × depth | Skip losing quiet moves |
+| SEE Pruning (qsearch) | SEE < 0 | Skip losing captures in qsearch |
 
 ### Reduction Techniques
 
@@ -224,14 +232,17 @@ Centralized constants to avoid magic numbers:
 | History adj. | quiet moves, good/bad history | Reduce less/more based on history |
 | Killer adj. | killer moves | 1 less reduction |
 | Improving adj. | position not improving | 1 more reduction |
-| IIR | no TT move found | Reduce depth by 1 |
+| SEE adj. | captures with SEE < 0 | 1 more reduction |
+| IIR | no TT move found, depth >= 3 | Reduce depth by 1 |
 
 ### Extension Techniques
 
 | Technique | Condition | Description |
 |-----------|-----------|-------------|
 | Check extension | king in check | +1 depth |
-| Singular extension | TT move much better | +1 depth for TT move |
+| Singular extension | TT move much better, depth >= 6 | +1 depth for TT move |
+| Recapture extension | capture on same square as previous move | +1 depth |
+| Passed pawn push | pawn pushed to 6th or 7th rank | +1 depth |
 
 ### History Tables
 

@@ -6,9 +6,9 @@ A high-performance UCI chess engine written in Rust, combining a **BitNet 1.58-b
 
 | Metric | Value |
 |--------|-------|
-| **NPS** | ~1.3 million nodes/sec (4 threads) |
-| **Search Depth** | 15+ ply in 60s+1s time control |
-| **Node Efficiency** | 3.6x fewer nodes vs v5.2.0 at same depth |
+| **NPS** | ~1.93 million nodes/sec (4 threads) |
+| **Search Depth** | 15-19 ply in 60s+1s time control |
+| **SEE Pruning** | Full static exchange evaluation with x-ray |
 | **Model** | 22.76M params, GGUF format (28 MB, mmap) |
 | **Quantization** | BitNet 1.58-bit (ternary, dual-bitmask packed) |
 | **KV Cache** | 4-5x speedup for incremental inference |
@@ -19,7 +19,7 @@ A high-performance UCI chess engine written in Rust, combining a **BitNet 1.58-b
 Version     Nodes         NPS          Wall Time
 -------     ----------    ----------   ---------
 v5.2.0      33,900,000    2,180,000    ~15.6s
-v6.0.0       9,285,144    1,312,392     ~7.1s     (2.2x faster)
+v6.0.0      23,358,906    1,931,426    ~12.1s
 ```
 
 ## Key Features
@@ -36,16 +36,21 @@ v6.0.0       9,285,144    1,312,392     ~7.1s     (2.2x faster)
 
 ### Search
 - **Alpha-Beta with PVS** (Principal Variation Search)
-- **Lazy SMP** -- configurable thread count, lock-free shared transposition table
+- **Lazy SMP** -- configurable thread count, varied depth offsets for exploration diversity
 - **Lock-Free TT** -- Hyatt/Mann XOR trick, interleaved cache-line layout, depth-preferred replacement
 - **Aspiration Windows** -- exponential widening on fail high/low
-- **Late Move Reductions** -- pre-computed table, applies to PV and non-PV nodes, history-based adjustments
+- **Late Move Reductions** -- pre-computed table, applies to PV and non-PV nodes, history + SEE adjustments
 - **Razoring**, **Reverse Futility Pruning**, **Null Move Pruning**
-- **Late Move Pruning**, **Futility Pruning**, **SEE Pruning**
-- **Singular Extensions** -- extend TT move when significantly better than alternatives
+- **Late Move Pruning**, **Futility Pruning**
+- **Static Exchange Evaluation (SEE)** -- full exchange analysis with x-ray sliding attacks
+  - Depth-scaled pruning for captures and quiet moves
+  - SEE-based LMR adjustment (+1 reduction for losing captures)
+  - Quiescence SEE pruning (skip all captures with SEE < 0)
+- **Triangular PV Table** -- full principal variation tracking with multi-move PV in UCI output
+- **Extensions** -- singular, recapture (same-square), passed pawn push (6th/7th rank)
 - **Internal Iterative Reduction** when no TT move is found
 - **Repetition Detection** -- search path (2-fold) and game history checking
-- **Quiescence Search** with delta pruning, MVV-LVA ordering, and check extensions
+- **Quiescence Search** with delta pruning, MVV-LVA ordering, SEE pruning, and check extensions
 
 ### Evaluation
 - **Material Counting** -- standard piece values

@@ -81,7 +81,7 @@ UCI "go wtime 60000 ..."
          v
 +---------------------------+
 |  Spawn Lazy SMP Workers   |  Thread 0: full depth
-|  (N threads, shared TT)   |  Thread 1..N-1: depth - 1
+|  (N threads, shared TT)   |  Thread 1..N-1: depth - (1 + i%3)
 +--------+------------------+
          |
          v
@@ -157,9 +157,9 @@ alpha_beta(alpha, beta, depth, ply):
     |
     +-- Pruning (non-PV, non-check positions):
     |   +-- [8]  Razoring (depth <= 3, eval far below alpha)
-    |   +-- [9]  Reverse futility pruning (depth <= 7, eval above beta)
+    |   +-- [9]  Reverse futility pruning (depth <= 9, eval above beta)
     |   +-- [10] Probcut (depth >= 5, shallow search confirms cutoff)
-    |   +-- [11] Null move pruning (R = 3 + depth/4, verify no zugzwang)
+    |   +-- [11] Null move pruning (R = 4 + depth/6, verify no zugzwang)
     |
     +-- [12] Internal iterative reduction (no TT move found)
     +-- [13] Singular extensions (TT move significantly better)
@@ -167,10 +167,17 @@ alpha_beta(alpha, beta, depth, ply):
     +-- Move loop (incremental pick_next_move):
         |
         +-- [14] Late move pruning (quiet moves beyond threshold)
-        +-- [15] Futility pruning (depth <= 6, eval + margin < alpha)
-        +-- [16] SEE pruning (bad captures pruned by static exchange)
+        +-- [15] Futility pruning (depth <= 8, eval + margin < alpha)
+        +-- [16] SEE pruning (depth-scaled thresholds):
+        |       Captures: prune if SEE < -20 * depth
+        |       Quiets:   prune if SEE < -50 * depth (depth <= 8)
         |
         +-- [17] Make move (push search path, update NNUE if active)
+        |
+        +-- Extensions (applied to effective depth):
+        |   +-- Singular extension (+1 for TT move much better)
+        |   +-- Recapture extension (+1 for same-square recapture)
+        |   +-- Passed pawn push (+1 for pawns on 6th/7th rank)
         |
         +-- [18] PVS framework:
         |   +-- First move: full window (-beta, -alpha)
@@ -179,13 +186,14 @@ alpha_beta(alpha, beta, depth, ply):
         |       |   - Pre-computed table (no transcendentals)
         |       |   - Applies to PV and non-PV nodes
         |       |   - Reduced for: PV nodes, killer moves, good history
-        |       |   - Increased for: non-improving positions
+        |       |   - Increased for: non-improving, SEE < 0 captures
         |       +-- Zero-window scout (-alpha-1, -alpha)
         |       +-- If scout fails high: re-search full window
         |
         +-- [19] Unmake move (pop search path)
         |
-        +-- [20] Alpha/beta update
+        +-- [20] Alpha/beta update + PV tracking:
+        |       Copy child PV into parent (triangular PV table)
         +-- [21] Beta cutoff -> update history tables:
                 +-- Killer moves (2 per ply)
                 +-- History heuristic (gravity formula)
@@ -207,9 +215,11 @@ quiescence(alpha, beta, ply):
     +-- If not in check: search only captures + queen promotions
     |
     +-- For each capture (MVV-LVA + capture history order):
-        +-- SEE pruning (skip losing captures)
+        +-- Delta pruning per-move (victim value + 200 < alpha)
+        +-- SEE pruning (skip captures with SEE < 0)
         +-- Recursive quiescence call
         +-- Alpha/beta update
+        +-- TT store on beta cutoff
 ```
 
 ---
@@ -555,7 +565,7 @@ else:
          v              v              v              v
     +---------+    +---------+    +---------+    +---------+
     | Worker 0|    | Worker 1|    | Worker 2|    | Worker 3|
-    | depth=D |    | depth=D |    |depth=D-1|    |depth=D-1|
+    | depth=D |    |depth=D-2|    |depth=D-3|    |depth=D-1|
     |  (main) |    |         |    |         |    |         |
     +---------+    +---------+    +---------+    +---------+
     | Own:     |   | Own:     |   | Own:     |   | Own:     |
@@ -567,7 +577,7 @@ else:
     +---------+    +---------+    +---------+    +---------+
 
     Workers share TT entries implicitly (no synchronization needed).
-    Different search depths cause natural divergence in explored subtrees.
+    Varied depth offsets (1 + i%3) cause natural divergence in subtrees.
     Main thread (Worker 0) controls the iterative deepening loop.
     Result: deepest completed search across all workers is reported.
 ```
@@ -745,13 +755,13 @@ Test Position: 3r2k1/pp3pp1/2p1bn1p/8/4P3/2N2N2/PPP2PPP/3R2K1 w
 
 Configuration      Depth   Nodes       NPS         Time
 --------------     -----   ----------  ----------  --------
-1 thread, d14      14      707,110     722,196     ~1.0s
-4 threads, d20     20      9,285,144   1,312,392   ~7.1s
+4 threads, d20     20      23,358,906  1,931,426   ~12.1s
 4 threads, d20*    20      33,900,000  2,180,000   ~15.6s   (* v5.2.0 baseline)
 
 Improvement from v5.2.0 to v6.0.0:
-    - 3.6x fewer nodes to reach same depth
-    - 2.2x faster wall time
+    - ~1.93M NPS with full SEE and extensions
+    - Full PV lines in UCI info output
+    - SEE pruning, recapture/passed pawn extensions
     - Stronger evaluation (positional terms)
 ```
 
@@ -761,12 +771,16 @@ Improvement from v5.2.0 to v6.0.0:
 +-------------------------------+----------------------------------+
 | Technique                     | Impact                           |
 +-------------------------------+----------------------------------+
-| LMR on PV nodes              | 3.4x node reduction at depth 20 |
+| Static Exchange Evaluation    | Prunes losing captures/quiets    |
+| Triangular PV table           | Full PV lines in UCI output      |
+| Recapture extensions          | +1 depth on same-square recaps   |
+| Passed pawn push extensions   | +1 depth for 6th/7th rank pushes |
+| Varied Lazy SMP offsets       | Better exploration diversity     |
+| LMR on PV nodes              | Node reduction at deep depths    |
 | History gravity (Stockfish)   | Better move ordering convergence |
 | Incremental move picking      | Avoids sorting pruned moves      |
 | Fixed-size search path        | Zero-alloc repetition detection  |
 | NNUE acc skip (when unused)   | +19% NPS                         |
-| Node check interval (8192)    | Reduced polling overhead          |
 | Pre-computed LMR table        | No transcendentals in hot path   |
 | Lock-free TT (XOR trick)     | Zero mutex contention in SMP     |
 +-------------------------------+----------------------------------+

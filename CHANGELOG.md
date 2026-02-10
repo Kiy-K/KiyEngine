@@ -38,6 +38,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Singular Extensions** -- extend TT move when significantly better than alternatives
 - **Continuation History** -- `[prev_piece][prev_to][cur_piece][cur_to]` table for move ordering
 - **Countermove Heuristic** -- records refutation moves for improved quiet move ordering
+- **Static Exchange Evaluation (SEE)** -- full exchange analysis with x-ray sliding attacks
+  - `all_attackers_to()` computes all attackers with x-ray through removed pieces
+  - `see_score()` returns material gain/loss via negamax walk-back
+  - Handles promotions, king safety (can't capture into check), and cheapest-attacker ordering
+- **SEE-Based Pruning** -- depth-scaled thresholds replace crude attacker-vs-victim heuristic
+  - Captures: prune if SEE < -20 × depth
+  - Quiet moves: prune if SEE < -50 × depth (depth ≤ 8)
+  - Quiescence: skip all captures with SEE < 0 (losing exchanges)
+- **SEE-Based LMR** -- captures with negative SEE get +1 additional reduction
+- **Triangular PV Table** -- full principal variation tracking across all plies
+  - `pv_table[ply][i]` stores i-th move in PV starting from ply
+  - PV copied from child to parent on alpha improvement
+  - Full multi-move PV lines in UCI `info` output
+- **Recapture Extensions** -- +1 depth when capturing on the same square as the previous move
+- **Passed Pawn Push Extensions** -- +1 depth for pawns pushed to 6th or 7th rank
+- **Improved Lazy SMP** -- helper threads use varied depth offsets (1, 2, or 3) based on thread
+  index for exploration diversity (Stockfish-inspired)
 - **NNUE Infrastructure** -- accumulator, feature extraction, and network loading in place
   - `use_nnue_eval` flag allows conditional activation (currently disabled)
   - Accumulator updates skipped when NNUE is inactive (+19% NPS savings)
@@ -50,29 +67,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Best move change tracking per iteration for TimeManager feedback
   - Search path reset at start of each iteration
 - **Node Check Interval** increased from 4096 to 8192 (reduced polling overhead)
-- **Aspiration Windows** start at depth >= 4 with exponential widening (was fixed progressive)
+- **Aspiration Windows** start at depth >= 5 with δ=12 and exponential widening
+- **Null Move Reduction** increased to R = 4 + depth/6 (was 3 + depth/6)
+- **Reverse Futility Pruning** extended to depth ≤ 9 with adjusted margins
+- **Futility Pruning** extended to depth ≤ 8 with larger margins
+- **Late Move Pruning** extended to depth ≤ 8 with more aggressive thresholds
+- **History Aging** uses gentler 3/4 decay (was 1/2) to preserve ordering signal
 - **History Table Updates** use gravity formula instead of flat add/clamp
 - **Move Ordering** changed from full sort to score-only with incremental picking
+- **Lazy SMP** helper threads now use varied depth offsets (1-3) instead of uniform depth-1
 - Engine version bumped to 6.0.0
 
 ### Performance
 
-- **3.6x fewer nodes** to reach depth 20 (9.3M vs 33.9M in v5.2.0)
-- **2.2x faster wall time** to reach depth 20 (7.1s vs 15.6s in v5.2.0)
+- **~1.93M NPS** at depth 20 (4 threads, with SEE and extensions active)
+- **Full PV lines** in UCI info output (was single-move only)
 - **+19% NPS** from skipping unused NNUE accumulator updates
-- Depth 15+ reached in 60s+1s time control (4 threads)
+- Depth 15-19 reached in 60s+1s time control (4 threads)
+- SEE pruning cuts losing captures/quiets early, improving tree efficiency
 - Zero-allocation repetition detection (fixed-size array, no Vec)
 - Incremental move picking avoids sorting moves never searched
 
 ### Benchmark (depth 20, 4 threads)
 
-```
+```text
 Position: 3r2k1/pp3pp1/2p1bn1p/8/4P3/2N2N2/PPP2PPP/3R2K1 w
 
 Version     Nodes         NPS          Wall Time
 -------     ----------    ----------   ---------
 v5.2.0      33,900,000    2,180,000    ~15.6s
-v6.0.0       9,285,144    1,312,392     ~7.1s
+v6.0.0      23,358,906    1,931,426    ~12.1s
 ```
 
 ---
