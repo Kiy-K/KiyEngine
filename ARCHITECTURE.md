@@ -23,7 +23,7 @@ This document describes the internal architecture of KiyEngine v6.0.0 -- a high-
 
 ## System Overview
 
-```
+```text
 +---------------------------------------------------------------------+
 |                         KiyEngine v6.0.0                            |
 |                                                                     |
@@ -57,7 +57,7 @@ KiyEngine is composed of five major subsystems:
 
 The following diagram traces a single `go` command from UCI input to `bestmove` output:
 
-```
+```text
 UCI "go wtime 60000 ..."
         |
         v
@@ -112,7 +112,7 @@ UCI "go wtime 60000 ..."
 
 ### Iterative Deepening Loop
 
-```
+```text
 iterative_deepening(max_depth):
     for depth in 1..=max_depth:
         reset search_path
@@ -144,7 +144,7 @@ iterative_deepening(max_depth):
 
 The core search function processes each node through a structured pipeline:
 
-```
+```text
 alpha_beta(alpha, beta, depth, ply):
     |
     +-- [1] Abort check (every 8192 nodes, poll TimeManager)
@@ -196,7 +196,7 @@ alpha_beta(alpha, beta, depth, ply):
 
 ### Quiescence Search
 
-```
+```text
 quiescence(alpha, beta, ply):
     |
     +-- Stand-pat evaluation (static eval as lower bound)
@@ -218,7 +218,7 @@ quiescence(alpha, beta, ply):
 
 ### Model Architecture
 
-```
+```text
 Input: Token sequence [seq_len] (encoded board positions)
                     |
                     v
@@ -269,7 +269,7 @@ Input: Token sequence [seq_len] (encoded board positions)
 
 Each weight is ternary: {-1, 0, +1}, stored as dual bitmasks:
 
-```
+```text
 Original i8 weights:  [+1, -1,  0, +1, -1, -1, +1,  0]
 
 pos_bits (mask):       1    0   0   1    0    0   1   0   = 0x92
@@ -282,7 +282,7 @@ Memory: 2 bits per weight (4x denser than i8)
 
 ### SIMD Dispatch for Packed GEMV
 
-```
+```text
 dispatch_packed_gemv(input, pos_bits, neg_bits):
     |
     +-- CPU supports AVX-512?
@@ -306,7 +306,7 @@ dispatch_packed_gemv(input, pos_bits, neg_bits):
 
 ### KV Cache (Incremental Inference)
 
-```
+```text
 Full inference (first call):
     tokens = [t0, t1, t2, t3]
     Process all 4 tokens through all layers
@@ -330,7 +330,7 @@ Incremental inference (subsequent calls):
 
 ### Evaluation Hierarchy
 
-```
+```text
 +-----------------------------------------------+
 |              Evaluation Stack                  |
 |                                                |
@@ -358,14 +358,14 @@ Incremental inference (subsequent calls):
 
 ### Material Values (centipawns)
 
-```
+```text
 Pawn   = 100    Knight = 320    Bishop = 330
 Rook   = 500    Queen  = 900    King   = 20000
 ```
 
 ### Pawn Structure Detection (Bitboard Operations)
 
-```
+```text
 Passed Pawn (White pawn on e4, rank index 3):
 
     File mask (D+E+F):    Ranks ahead mask:       Combined:
@@ -390,7 +390,7 @@ Passed Pawn (White pawn on e4, rank index 3):
 
 ### Soft/Hard Bound Model
 
-```
+```text
                    Time axis (ms)
     0         optimum_ms              maximum_ms        remaining
     |============|=========================|===============|
@@ -404,7 +404,7 @@ Passed Pawn (White pawn on e4, rank index 3):
 
 ### Dynamic Adjustment Factors
 
-```
+```text
 +---------------------------+-------------------------------------------+
 | Factor                    | Behavior                                  |
 +---------------------------+-------------------------------------------+
@@ -425,7 +425,7 @@ Passed Pawn (White pawn on e4, rank index 3):
 
 ### Time Allocation Flow
 
-```
+```text
 go wtime=60000 btime=60000 winc=1000 binc=1000
     |
     v
@@ -457,7 +457,7 @@ Move ordering is critical for alpha-beta pruning efficiency. Moves are scored bu
 
 ### Priority Scheme
 
-```
+```text
 Priority    Category                    Score Range
 --------    --------                    -----------
    1        TT Move (hash move)         +1,000,000
@@ -476,7 +476,7 @@ Priority    Category                    Score Range
 
 History updates use a gravity formula that prevents table saturation:
 
-```
+```text
 update(entry, bonus):
     entry += bonus - |entry| * bonus / 16384
 
@@ -493,7 +493,7 @@ Effect:
 
 ### Lock-Free Design (Hyatt/Mann XOR Trick)
 
-```
+```text
 Cache Line (16 bytes per entry):
 +------------------+------------------+
 |  key XOR data    |      data        |   2 x AtomicU64
@@ -515,7 +515,7 @@ Load(key):
 
 ### Entry Packing
 
-```
+```text
 data (64 bits):
 +--------+--------+--------+--------+--------+--------+--------+--------+
 | score  | depth  | flag   |      best_move (16 bits)     | unused       |
@@ -527,7 +527,7 @@ flag: 0 = EXACT, 1 = LOWER_BOUND (beta cutoff), 2 = UPPER_BOUND (fail low)
 
 ### Replacement Policy
 
-```
+```text
 if incoming.hash == existing.hash:
     ALWAYS replace (fresher data for same position)
 else:
@@ -540,7 +540,7 @@ else:
 
 ### Lazy SMP
 
-```
+```text
 +-----------------------------------------------------------+
 |                    Shared Resources                        |
 |                                                           |
@@ -574,7 +574,7 @@ else:
 
 ### Thread Communication
 
-```
+```text
 main thread                        worker threads
      |                                  |
      +-- spawn workers ----------------->
@@ -594,7 +594,7 @@ main thread                        worker threads
 
 ### Polyglot Format
 
-```
+```text
 +-------------------------------------------+
 |           Polyglot Book Probe             |
 |                                           |
@@ -626,7 +626,7 @@ Constraints:
 
 ### Command Processing Flow
 
-```
+```text
 stdin
   |
   v
@@ -664,7 +664,7 @@ stdin
 
 ### Position History for Repetition Detection
 
-```
+```text
 "position startpos moves e2e4 e7e5 g1f3 b8c6"
 
 UciHandler maintains:
@@ -685,7 +685,7 @@ Used in is_repetition() to detect 2-fold repetition:
 
 ## Module Map
 
-```
+```text
 KiyEngine/
 |
 +-- src/
@@ -740,7 +740,7 @@ KiyEngine/
 
 ### Benchmark Summary (v6.0.0)
 
-```
+```text
 Test Position: 3r2k1/pp3pp1/2p1bn1p/8/4P3/2N2N2/PPP2PPP/3R2K1 w
 
 Configuration      Depth   Nodes       NPS         Time
@@ -757,7 +757,7 @@ Improvement from v5.2.0 to v6.0.0:
 
 ### Key Optimization Techniques
 
-```
+```text
 +-------------------------------+----------------------------------+
 | Technique                     | Impact                           |
 +-------------------------------+----------------------------------+

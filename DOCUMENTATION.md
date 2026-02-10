@@ -48,7 +48,7 @@ KiyEngine is a high-performance UCI chess engine built in Rust with the followin
 
 ### Inference Pipeline
 
-```
+```text
 Input tokens -> Embedding -> [TransformerBlock x 12] -> ln_f -> PolicyHead / ValueHead
                                        |
                         RMSNorm -> MultiheadAttention (GQA) -> LayerScale -> Residual
@@ -65,7 +65,7 @@ BitLinear weights: dual bitmask packed {pos_bits, neg_bits}
 
 ## Project Structure
 
-```
+```text
 KiyEngine/
 +-- src/
 |   +-- main.rs              Application entry point (UCI loop)
@@ -274,7 +274,7 @@ Passed pawn detection uses zero-loop bitboard computation:
 
 ### Allocation Formula
 
-```
+```text
 time_pool = remaining_time + increment * (mtg - 1) - overhead * mtg
 
 Sudden death (no movestogo):
@@ -289,7 +289,7 @@ Classical (movestogo given):
 
 ### Dynamic Factors (applied at each ID iteration)
 
-```
+```text
 adjusted_time = optimum * falling_eval * time_reduction * instability
 
 falling_eval   = clamp((12 + 2 * (avg_score - cur_score)) / 100, 0.60, 1.70)

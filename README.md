@@ -15,7 +15,7 @@ A high-performance UCI chess engine written in Rust, combining a **BitNet 1.58-b
 
 ### v6.0.0 vs v5.2.0 (depth 20, 4 threads)
 
-```
+```text
 Version     Nodes         NPS          Wall Time
 -------     ----------    ----------   ---------
 v5.2.0      33,900,000    2,180,000    ~15.6s
@@ -106,7 +106,7 @@ Place `kiyengine.gguf` in the same directory as the binary (or alongside `Cargo.
 
 ### Example Session
 
-```
+```text
 uci
 setoption name Hash value 1024
 setoption name Threads value 4
@@ -117,14 +117,14 @@ go wtime 60000 btime 60000 winc 1000 binc 1000
 
 ### Fixed-Time Search
 
-```
+```text
 position fen 3r2k1/pp3pp1/2p1bn1p/8/4P3/2N2N2/PPP2PPP/3R2K1 w - - 0 1
 go movetime 5000
 ```
 
 ## Project Structure
 
-```
+```text
 src/
 +-- main.rs              Entry point (UCI loop)
 +-- lib.rs               Library exports
