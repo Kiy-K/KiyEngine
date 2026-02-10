@@ -3,7 +3,7 @@ use crate::nnue::accumulator::Accumulator;
 use crate::nnue::features;
 use crate::nnue::NnueNetwork;
 use crate::uci::MoveCodec;
-use chess::{BitBoard, Board, ChessMove, Color, MoveGen, Piece};
+use chess::{BitBoard, Board, ChessMove, Color, MoveGen, Piece, Square};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
@@ -32,6 +32,10 @@ static LMR_TABLE: std::sync::LazyLock<[[u8; LMR_MAX_MOVES]; LMR_MAX_DEPTH]> =
         }
         table
     });
+// File mask constants for pawn attack computation in SEE
+const FILE_A_BB: u64 = 0x0101_0101_0101_0101;
+const FILE_H_BB: u64 = 0x8080_8080_8080_8080;
+
 // Điểm số từ Value Head thường là float [-1.0, 1.0].
 // Ta nhân với scale này để ra Centipawn.
 
@@ -341,10 +345,13 @@ impl Searcher {
                             // Lazy SMP: main thread full depth, helpers depth-1
                             let effective_max = if max_depth == 0 { MAX_DEPTH } else { max_depth };
                             let effective_max = effective_max.min(single_move_limit);
+                            // Lazy SMP: main thread full depth, helpers use varied offsets
+                            // for exploration diversity (Stockfish-inspired)
                             let local_max_depth = if is_main {
                                 effective_max
                             } else {
-                                effective_max.saturating_sub(1).max(1)
+                                let offset = 1 + (i % 3) as u8; // 1, 2, or 3
+                                effective_max.saturating_sub(offset).max(1)
                             };
 
                             const MIN_DEPTH: u8 = 3;
@@ -415,10 +422,26 @@ impl Searcher {
                                                 start_time.elapsed().as_secs_f64().max(0.001);
                                             let nps = (worker.nodes as f64 / elapsed) as u64;
 
-                                            let pv_str = if let Some(m) = mv {
-                                                format!("{}", m)
-                                            } else {
-                                                "".to_string()
+                                            // Extract full PV from triangular PV table
+                                            let pv_str = {
+                                                let pv_end = worker.pv_len[0].min(MAX_PLY);
+                                                let mut parts = Vec::with_capacity(pv_end);
+                                                for i in 0..pv_end {
+                                                    if let Some(m) = worker.pv_table[0][i] {
+                                                        parts.push(format!("{}", m));
+                                                    } else {
+                                                        break;
+                                                    }
+                                                }
+                                                if parts.is_empty() {
+                                                    if let Some(m) = mv {
+                                                        format!("{}", m)
+                                                    } else {
+                                                        String::new()
+                                                    }
+                                                } else {
+                                                    parts.join(" ")
+                                                }
                                             };
                                             println!(
                                                 "info depth {} score cp {} nodes {} nps {} pv {}",
@@ -501,6 +524,9 @@ pub struct SearchWorker {
     // Search path hashes for 2-fold repetition during search (fixed-size, zero-alloc)
     search_path: [u64; MAX_PLY],
     search_path_len: usize,
+    // Triangular PV table: pv_table[ply][i] = i-th move in the PV starting at ply
+    pv_table: Box<[[Option<ChessMove>; MAX_PLY]; MAX_PLY]>,
+    pv_len: [usize; MAX_PLY],
 }
 
 impl SearchWorker {
@@ -539,6 +565,8 @@ impl SearchWorker {
             game_hash_history: Vec::new(),
             search_path: [0u64; MAX_PLY],
             search_path_len: 0,
+            pv_table: Box::new([[None; MAX_PLY]; MAX_PLY]),
+            pv_len: [0; MAX_PLY],
         }
     }
 
@@ -734,6 +762,123 @@ impl SearchWorker {
         non_pawn.0 != 0
     }
 
+    // =========================================================================
+    // STATIC EXCHANGE EVALUATION (SEE)
+    // Determines if a capture sequence is winning, losing, or equal.
+    // Foundation for SEE pruning, qsearch pruning, and LMR adjustments.
+    // =========================================================================
+
+    /// Compute all attackers (both colors) to `sq` given current `occupied` bitboard.
+    /// Recomputes sliding attacks to handle x-ray through removed pieces.
+    fn all_attackers_to(&self, sq: Square, occupied: BitBoard) -> BitBoard {
+        let knights = chess::get_knight_moves(sq) & *self.board.pieces(Piece::Knight);
+        let king = chess::get_king_moves(sq) & *self.board.pieces(Piece::King);
+        let bishops_queens = chess::get_bishop_moves(sq, occupied)
+            & (*self.board.pieces(Piece::Bishop) | *self.board.pieces(Piece::Queen));
+        let rooks_queens = chess::get_rook_moves(sq, occupied)
+            & (*self.board.pieces(Piece::Rook) | *self.board.pieces(Piece::Queen));
+
+        // Pawn attackers: reverse the attack direction to find pawns that attack sq
+        let sq_val = BitBoard::from_square(sq).0;
+        let white_pawns = *self.board.pieces(Piece::Pawn) & *self.board.color_combined(Color::White);
+        let black_pawns = *self.board.pieces(Piece::Pawn) & *self.board.color_combined(Color::Black);
+        let wp = BitBoard(((sq_val >> 7) & !FILE_A_BB) | ((sq_val >> 9) & !FILE_H_BB)) & white_pawns;
+        let bp = BitBoard(((sq_val << 7) & !FILE_H_BB) | ((sq_val << 9) & !FILE_A_BB)) & black_pawns;
+
+        (knights | king | bishops_queens | rooks_queens | wp | bp) & occupied
+    }
+
+    /// Static Exchange Evaluation — returns material gain/loss from the exchange.
+    /// Positive = good for the moving side.
+    fn see_score(&self, mv: ChessMove) -> i32 {
+        let from = mv.get_source();
+        let to = mv.get_dest();
+
+        let mut gain = [0i32; 33];
+        let mut d = 0usize;
+
+        let target = self.board.piece_on(to);
+        let attacker = self.board.piece_on(from).unwrap_or(Piece::Pawn);
+
+        // Initial gain: value of captured piece (+ promotion bonus if applicable)
+        gain[0] = if let Some(promo) = mv.get_promotion() {
+            target.map_or(0, see_val) + see_val(promo) - see_val(Piece::Pawn)
+        } else {
+            target.map_or(0, see_val)
+        };
+
+        let mut occupied = *self.board.combined() ^ BitBoard::from_square(from);
+        let mut current_piece = if let Some(promo) = mv.get_promotion() {
+            promo
+        } else {
+            attacker
+        };
+        let mut side = !self.board.side_to_move();
+
+        loop {
+            d += 1;
+            if d >= 32 {
+                break;
+            }
+            gain[d] = see_val(current_piece) - gain[d - 1];
+
+            // Stand pat pruning: if even capturing current piece can't help
+            if (-gain[d - 1]).max(gain[d]) < 0 {
+                break;
+            }
+
+            // Find all attackers of `to` with current occupancy (handles x-ray)
+            let all_att = self.all_attackers_to(to, occupied);
+            let side_att = all_att & *self.board.color_combined(side) & occupied;
+
+            if side_att.0 == 0 {
+                break;
+            }
+
+            // Find cheapest attacker for this side
+            let mut found = false;
+            for &piece in &[
+                Piece::Pawn,
+                Piece::Knight,
+                Piece::Bishop,
+                Piece::Rook,
+                Piece::Queen,
+                Piece::King,
+            ] {
+                let pieces = *self.board.pieces(piece) & side_att;
+                if pieces.0 != 0 {
+                    // King can't capture if opponent still has attackers
+                    if piece == Piece::King {
+                        let opp_att = all_att & *self.board.color_combined(!side) & occupied;
+                        if opp_att.0 != 0 {
+                            break;
+                        }
+                    }
+
+                    let sq_idx = pieces.0.trailing_zeros() as u8;
+                    let sq = unsafe { Square::new(sq_idx) };
+                    current_piece = piece;
+                    occupied ^= BitBoard::from_square(sq);
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                break;
+            }
+            side = !side;
+        }
+
+        // Negamax walk-back
+        while d > 0 {
+            gain[d - 1] = -((-gain[d - 1]).max(gain[d]));
+            d -= 1;
+        }
+
+        gain[0]
+    }
+
     /// Public wrapper for alpha-beta search from root (used by self-play binary).
     pub fn alpha_beta_root(&mut self, depth: u8) -> (i32, Option<ChessMove>) {
         self.nodes = 0;
@@ -754,6 +899,9 @@ impl SearchWorker {
         if ply >= MAX_PLY {
             return (self.fast_eval(ply), None);
         }
+
+        // Initialize PV length for this ply (no PV moves yet)
+        self.pv_len[ply] = ply;
 
         // --- Step 1: Abort check (+ periodic time check every 2048 nodes) ---
         if self.nodes & 8191 == 0 {
@@ -1023,12 +1171,18 @@ impl SearchWorker {
                 }
             }
 
-            // --- Step 15: SEE Pruning for bad captures ---
-            if !is_root && is_cap && !is_promo && depth <= 7 && moves_searched > 0 {
-                let victim = self.board.piece_on(mv.get_dest()).unwrap_or(Piece::Pawn);
-                let attacker = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
-                let see_threshold = if depth <= 4 { 200 } else { 100 };
-                if piece_value(attacker) > piece_value(victim) + see_threshold {
+            // --- Step 15: SEE Pruning for bad captures/quiet moves ---
+            if !is_root && !is_promo && moves_searched > 0 {
+                let see_threshold = if is_cap {
+                    // Captures: prune if SEE is sufficiently negative (depth-scaled)
+                    -20 * (depth as i32)
+                } else if !is_tactical && depth <= 8 {
+                    // Quiet moves: prune if SEE is negative (losing material)
+                    -50 * (depth as i32)
+                } else {
+                    i32::MIN // don't prune
+                };
+                if see_threshold > i32::MIN && self.see_score(mv) < see_threshold {
                     continue;
                 }
             }
@@ -1050,12 +1204,34 @@ impl SearchWorker {
 
             let mut score;
 
-            // Apply singular extension to TT move
-            let ext: u8 = if Some(mv) == tt_move && singular_extension > 0 {
-                1
-            } else {
-                0
-            };
+            // --- Extensions ---
+            let mut ext: u8 = 0;
+
+            // Singular extension (highest priority)
+            if Some(mv) == tt_move && singular_extension > 0 {
+                ext = 1;
+            }
+
+            // Recapture extension: if we're recapturing on the same square
+            if ext == 0 && is_cap && ply >= 1 {
+                let prev_ply = (ply - 1).min(MAX_PLY - 1);
+                if let Some(prev_mv) = self.move_stack[prev_ply] {
+                    if mv.get_dest() == prev_mv.get_dest() {
+                        ext = 1;
+                    }
+                }
+            }
+
+            // Passed pawn push extension: pawn pushed to 6th or 7th rank
+            if ext == 0 && moved_piece == Piece::Pawn {
+                let rank = mv.get_dest().to_index() / 8;
+                if (moved_color == Color::White && rank >= 5)
+                    || (moved_color == Color::Black && rank <= 2)
+                {
+                    ext = 1;
+                }
+            }
+
             let effective_depth = depth - 1 + ext;
 
             // --- Step 17: PVS (Principal Variation Search) ---
@@ -1089,6 +1265,11 @@ impl SearchWorker {
                     // PV nodes get less reduction (proven ~30 Elo gain)
                     if is_pv {
                         r = r.saturating_sub(1);
+                    }
+
+                    // SEE-based LMR: reduce more for moves with negative SEE
+                    if is_cap && self.see_score(mv) < 0 {
+                        r = r.saturating_add(1);
                     }
 
                     // --- History-based LMR adjustment ---
@@ -1172,6 +1353,17 @@ impl SearchWorker {
 
             if score > alpha {
                 alpha = score;
+
+                // PV tracking: record this move and copy child's PV
+                if ply < MAX_PLY {
+                    self.pv_table[ply][ply] = Some(mv);
+                    let child = (ply + 1).min(MAX_PLY - 1);
+                    let child_len = self.pv_len[child].min(MAX_PLY);
+                    for i in child..child_len {
+                        self.pv_table[ply][i] = self.pv_table[child][i];
+                    }
+                    self.pv_len[ply] = child_len;
+                }
 
                 if score >= beta {
                     // --- Step 21: Beta cutoff → update killers, history, countermove, cont_history ---
@@ -1415,6 +1607,10 @@ impl SearchWorker {
                 if stand_pat + piece_value(victim) + 200 < alpha && mv.get_promotion().is_none() {
                     continue;
                 }
+                // SEE pruning in qsearch: skip captures that lose material
+                if mv.get_promotion().is_none() && self.see_score(mv) < 0 {
+                    continue;
+                }
             }
 
             let old_board = self.board;
@@ -1587,6 +1783,19 @@ impl SearchWorker {
 }
 
 fn piece_value(piece: Piece) -> i32 {
+    match piece {
+        Piece::Pawn => 100,
+        Piece::Knight => 320,
+        Piece::Bishop => 330,
+        Piece::Rook => 500,
+        Piece::Queen => 900,
+        Piece::King => 20000,
+    }
+}
+
+/// SEE piece values (used exclusively by Static Exchange Evaluation)
+#[inline]
+fn see_val(piece: Piece) -> i32 {
     match piece {
         Piece::Pawn => 100,
         Piece::Knight => 320,
