@@ -1,0 +1,12 @@
+[package]
+name = "kiyengine-nnue-trainer"
+version = "0.1.0"
+edition = "2021"
+description = "NNUE trainer for KiyEngine using Bullet framework"
+
+[dependencies]
+bullet_lib = { git = "https://github.com/jw1912/bullet", features = ["cuda"] }
+
+[[bin]]
+name = "train"
+path = "src/main.rs"

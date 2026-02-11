@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KiyEngine — 1.58-bit Chess Engine</title>
+  <meta name="description" content="KiyEngine: The world's first 1.58-bit BitNet chess engine. Download binaries, model weights, and learn more.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>♚</text></svg>">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0a0a0f;
+      --bg-card: #12121a;
+      --bg-card-hover: #1a1a28;
+      --border: #2a2a3a;
+      --text: #e4e4ef;
+      --text-dim: #8888a0;
+      --accent: #7c6aff;
+      --accent-glow: rgba(124, 106, 255, 0.25);
+      --green: #3ecf8e;
+      --orange: #f5a623;
+      --red: #ef4444;
+      --radius: 12px;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Nav ── */
+    nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(10, 10, 15, 0.85);
+      backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 2rem;
+    }
+    nav .inner {
+      max-width: 1100px; margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      height: 60px;
+    }
+    nav .logo { font-weight: 700; font-size: 1.15rem; color: var(--accent); text-decoration: none; }
+    nav .logo span { color: var(--text); }
+    nav .links { display: flex; gap: 1.5rem; }
+    nav .links a {
+      color: var(--text-dim); text-decoration: none; font-size: 0.9rem;
+      transition: color 0.2s;
+    }
+    nav .links a:hover { color: var(--text); }
+
+    /* ── Hero ── */
+    .hero {
+      min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      text-align: center; padding: 6rem 2rem 4rem;
+      background: radial-gradient(ellipse at 50% 0%, var(--accent-glow) 0%, transparent 60%);
+    }
+    .hero h1 { font-size: clamp(2.5rem, 6vw, 4.5rem); font-weight: 800; letter-spacing: -0.02em; line-height: 1.1; }
+    .hero h1 .accent { color: var(--accent); }
+    .hero .tagline {
+      font-size: clamp(1rem, 2.5vw, 1.35rem); color: var(--text-dim);
+      margin-top: 1rem; max-width: 600px; margin-left: auto; margin-right: auto;
+    }
+    .hero .badges { display: flex; gap: 0.75rem; justify-content: center; flex-wrap: wrap; margin-top: 2rem; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 0.4rem;
+      padding: 0.35rem 0.85rem; border-radius: 999px; font-size: 0.8rem; font-weight: 600;
+      border: 1px solid var(--border); background: var(--bg-card);
+    }
+    .badge.purple { border-color: var(--accent); color: var(--accent); }
+    .badge.green { border-color: var(--green); color: var(--green); }
+    .badge.orange { border-color: var(--orange); color: var(--orange); }
+    .hero .cta { margin-top: 2.5rem; display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; }
+    .btn {
+      display: inline-flex; align-items: center; gap: 0.5rem;
+      padding: 0.75rem 1.75rem; border-radius: var(--radius); font-size: 0.95rem;
+      font-weight: 600; text-decoration: none; transition: all 0.2s;
+      cursor: pointer; border: none;
+    }
+    .btn-primary {
+      background: var(--accent); color: #fff;
+      box-shadow: 0 0 24px var(--accent-glow);
+    }
+    .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 0 40px var(--accent-glow); }
+    .btn-secondary {
+      background: transparent; color: var(--text); border: 1px solid var(--border);
+    }
+    .btn-secondary:hover { border-color: var(--text-dim); background: var(--bg-card); }
+
+    /* ── Sections ── */
+    section { max-width: 1100px; margin: 0 auto; padding: 5rem 2rem; }
+    .section-title {
+      font-size: 2rem; font-weight: 700; margin-bottom: 0.5rem;
+    }
+    .section-subtitle { color: var(--text-dim); font-size: 1.05rem; margin-bottom: 2.5rem; }
+
+    /* ── Download Cards ── */
+    .download-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1.5rem;
+    }
+    .dl-card {
+      background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 2rem; transition: all 0.25s;
+    }
+    .dl-card:hover { border-color: var(--accent); background: var(--bg-card-hover); transform: translateY(-3px); }
+    .dl-card .icon { font-size: 2rem; margin-bottom: 1rem; }
+    .dl-card h3 { font-size: 1.2rem; margin-bottom: 0.35rem; }
+    .dl-card p { color: var(--text-dim); font-size: 0.9rem; margin-bottom: 1.25rem; }
+    .dl-card .meta { font-size: 0.8rem; color: var(--text-dim); margin-top: 0.75rem; }
+    .dl-card .btn { width: 100%; justify-content: center; }
+
+    /* ── Stats Grid ── */
+    .stats-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1.5rem; margin-bottom: 3rem;
+    }
+    .stat-card {
+      background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 1.5rem; text-align: center;
+    }
+    .stat-card .value { font-size: 2rem; font-weight: 800; color: var(--accent); }
+    .stat-card .label { font-size: 0.85rem; color: var(--text-dim); margin-top: 0.25rem; }
+
+    /* ── Features ── */
+    .features-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1.5rem;
+    }
+    .feature-card {
+      background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 1.75rem;
+    }
+    .feature-card h3 { font-size: 1.1rem; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.5rem; }
+    .feature-card p { color: var(--text-dim); font-size: 0.9rem; }
+
+    /* ── Setup ── */
+    .setup-steps { max-width: 700px; }
+    .step {
+      display: flex; gap: 1.25rem; margin-bottom: 2rem;
+    }
+    .step-num {
+      flex-shrink: 0; width: 36px; height: 36px; border-radius: 50%;
+      background: var(--accent); color: #fff; font-weight: 700; font-size: 0.9rem;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .step-content h3 { font-size: 1.05rem; margin-bottom: 0.25rem; }
+    .step-content p { color: var(--text-dim); font-size: 0.9rem; }
+    code {
+      background: #1e1e2e; padding: 0.15rem 0.5rem; border-radius: 6px;
+      font-size: 0.85rem; font-family: 'SF Mono', 'Fira Code', monospace;
+      color: var(--green);
+    }
+
+    /* ── Footer ── */
+    footer {
+      border-top: 1px solid var(--border); padding: 2rem;
+      text-align: center; color: var(--text-dim); font-size: 0.85rem;
+    }
+    footer a { color: var(--accent); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+
+    /* ── Lichess Banner ── */
+    .lichess-banner {
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 2rem; text-align: center; margin-top: 3rem;
+    }
+    .lichess-banner h3 { font-size: 1.3rem; margin-bottom: 0.5rem; }
+    .lichess-banner p { color: var(--text-dim); margin-bottom: 1.25rem; }
+
+    /* ── Responsive ── */
+    @media (max-width: 640px) {
+      nav .links { gap: 1rem; }
+      .hero { padding-top: 5rem; }
+      section { padding: 3rem 1.25rem; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Nav -->
+  <nav>
+    <div class="inner">
+      <a href="#" class="logo">♚ Kiy<span>Engine</span></a>
+      <div class="links">
+        <a href="#downloads">Downloads</a>
+        <a href="#features">Features</a>
+        <a href="#setup">Setup</a>
+        <a href="https://github.com/Kiy-K/KiyEngine" target="_blank">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="hero">
+    <div>
+      <h1>The <span class="accent">1.58-bit</span><br>Chess Engine</h1>
+      <p class="tagline">
+        KiyEngine uses BitNet ternary neural networks for move evaluation.
+        The entire model weights are just {-1, 0, +1}. Tiny. Fast. Unique.
+      </p>
+      <div class="badges">
+        <span class="badge purple">BitNet 1.58-bit</span>
+        <span class="badge green">~1.9M NPS</span>
+        <span class="badge orange">UCI Compatible</span>
+      </div>
+      <div class="cta">
+        <a href="#downloads" class="btn btn-primary">↓ Download</a>
+        <a href="https://github.com/Kiy-K/KiyEngine" target="_blank" class="btn btn-secondary">View Source</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Stats -->
+  <section>
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="value">1.58</div>
+        <div class="label">Bits per weight</div>
+      </div>
+      <div class="stat-card">
+        <div class="value">1.9M</div>
+        <div class="label">Nodes per second (4T)</div>
+      </div>
+      <div class="stat-card">
+        <div class="value">15-19</div>
+        <div class="label">Search depth (60s+1s)</div>
+      </div>
+      <div class="stat-card">
+        <div class="value">Rust</div>
+        <div class="label">Written in</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Downloads -->
+  <section id="downloads">
+    <h2 class="section-title">Downloads</h2>
+    <p class="section-subtitle">Grab the latest release — binaries include model weights and opening books.</p>
+    <div class="download-grid">
+
+      <div class="dl-card">
+        <div class="icon">🐧</div>
+        <h3>Linux x86_64</h3>
+        <p>Compiled with <code>target-cpu=x86-64-v3</code>. Requires AVX2. Stripped binary + model weights.</p>
+        <a id="dl-linux" href="https://github.com/Kiy-K/KiyEngine/releases/latest" class="btn btn-primary">Download .tar.gz</a>
+        <div class="meta" id="meta-linux">Loading release info...</div>
+      </div>
+
+      <div class="dl-card">
+        <div class="icon">🪟</div>
+        <h3>Windows x86_64</h3>
+        <p>Native Windows build. Run from command line or load in a UCI-compatible chess GUI.</p>
+        <a id="dl-windows" href="https://github.com/Kiy-K/KiyEngine/releases/latest" class="btn btn-primary">Download .exe</a>
+        <div class="meta" id="meta-windows">Loading release info...</div>
+      </div>
+
+      <div class="dl-card">
+        <div class="icon">🧠</div>
+        <h3>Model Weights</h3>
+        <p>BitNet GGUF model + NNUE weights. Included in binary packages, or download separately.</p>
+        <a href="https://github.com/Kiy-K/KiyEngine/releases/latest" class="btn btn-secondary">All Release Assets</a>
+        <div class="meta">kiyengine.gguf + kiyengine.nnue</div>
+      </div>
+
+    </div>
+
+    <!-- Lichess -->
+    <div class="lichess-banner">
+      <h3>♟ Play KiyEngine on Lichess</h3>
+      <p>Challenge the 1.58-bit engine live. It never resigns! 💀</p>
+      <a href="https://lichess.org/@/KiyEngine" target="_blank" class="btn btn-primary">Challenge on Lichess</a>
+    </div>
+  </section>
+
+  <!-- Features -->
+  <section id="features">
+    <h2 class="section-title">Features</h2>
+    <p class="section-subtitle">What makes KiyEngine different.</p>
+    <div class="features-grid">
+      <div class="feature-card">
+        <h3>⚡ BitNet Inference</h3>
+        <p>Ternary {-1, 0, +1} weights eliminate floating-point multiply. Just additions and subtractions at the core.</p>
+      </div>
+      <div class="feature-card">
+        <h3>🔍 Alpha-Beta Search</h3>
+        <p>Full iterative deepening with aspiration windows, null move pruning, LMR, SEE pruning, and PV tracking.</p>
+      </div>
+      <div class="feature-card">
+        <h3>🧵 Lazy SMP</h3>
+        <p>Multi-threaded parallel search with shared transposition table. Helper threads use varied depth offsets.</p>
+      </div>
+      <div class="feature-card">
+        <h3>📖 Opening Book</h3>
+        <p>Built-in binary opening book with position hashing for fast lookup. Plays known theory before switching to search.</p>
+      </div>
+      <div class="feature-card">
+        <h3>⏱ Smart Time Management</h3>
+        <p>Stockfish-inspired soft/hard bounds with dynamic adjustment for falling eval and best-move instability.</p>
+      </div>
+      <div class="feature-card">
+        <h3>🔌 Full UCI Protocol</h3>
+        <p>Compatible with Arena, Cutechess, lichess-bot, and any UCI chess GUI. Hash, Threads, MultiPV, and more.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Setup -->
+  <section id="setup">
+    <h2 class="section-title">Quick Start</h2>
+    <p class="section-subtitle">Get KiyEngine running in under a minute.</p>
+    <div class="setup-steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <div class="step-content">
+          <h3>Download</h3>
+          <p>Grab the binary for your platform from the <a href="#downloads" style="color:var(--accent)">downloads section</a> above.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div class="step-content">
+          <h3>Extract (Linux)</h3>
+          <p>Run <code>tar -xzf kiyengine-linux-x86_64.tar.gz</code> and <code>chmod +x kiyengine</code></p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <div class="step-content">
+          <h3>Run</h3>
+          <p>Launch <code>./kiyengine</code> (Linux) or <code>kiyengine.exe</code> (Windows). It speaks UCI — type <code>uci</code> to verify.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">4</div>
+        <div class="step-content">
+          <h3>Use with a GUI</h3>
+          <p>Load as a UCI engine in <a href="https://cutechess.com/" target="_blank" style="color:var(--accent)">Cutechess</a>, Arena, or <a href="https://github.com/lichess-bot-devs/lichess-bot" target="_blank" style="color:var(--accent)">lichess-bot</a>.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Build from source -->
+  <section>
+    <h2 class="section-title">Build from Source</h2>
+    <p class="section-subtitle">Requires Rust 1.75+ and a C compiler for candle/libtorch.</p>
+    <div class="setup-steps">
+      <div class="step">
+        <div class="step-num">$</div>
+        <div class="step-content">
+          <p><code>git clone https://github.com/Kiy-K/KiyEngine.git</code></p>
+          <p style="margin-top:0.5rem"><code>cd KiyEngine && cargo build --release</code></p>
+          <p style="margin-top:0.5rem"><code>./target/release/kiy_engine_v5_alpha</code></p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer>
+    <p>
+      KiyEngine &copy; 2025-2026 <a href="https://github.com/Kiy-K">Kiy-Khoi</a>.
+      Open source under MIT license.
+      <br>
+      <a href="https://github.com/Kiy-K/KiyEngine">GitHub</a> &middot;
+      <a href="https://lichess.org/@/KiyEngine">Lichess</a> &middot;
+      <a href="https://github.com/Kiy-K/KiyEngine/releases">Releases</a>
+    </p>
+  </footer>
+
+  <!-- Auto-fetch latest release info -->
+  <script>
+    (async function() {
+      try {
+        const res = await fetch('https://api.github.com/repos/Kiy-K/KiyEngine/releases/latest');
+        if (!res.ok) return;
+        const data = await res.json();
+        const tag = data.tag_name;
+        const date = new Date(data.published_at).toLocaleDateString('en-US', {
+          year: 'numeric', month: 'short', day: 'numeric'
+        });
+
+        for (const asset of data.assets) {
+          const name = asset.name.toLowerCase();
+          const size = (asset.size / (1024 * 1024)).toFixed(1) + ' MB';
+          const url = asset.browser_download_url;
+
+          if (name.includes('linux') && name.endsWith('.tar.gz')) {
+            document.getElementById('dl-linux').href = url;
+            document.getElementById('meta-linux').textContent = `${tag} · ${size} · ${date} · ${asset.download_count} downloads`;
+          } else if (name.includes('windows') && name.endsWith('.exe')) {
+            document.getElementById('dl-windows').href = url;
+            document.getElementById('meta-windows').textContent = `${tag} · ${size} · ${date} · ${asset.download_count} downloads`;
+          }
+        }
+      } catch (e) {
+        // Silently fail — links still point to /releases/latest
+      }
+    })();
+  </script>
+
+</body>
+</html>

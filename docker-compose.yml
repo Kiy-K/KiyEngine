@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  kiyengine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kiyengine:6.0.0
+    container_name: kiyengine
+    stdin_open: true
+    tty: true
+    volumes:
+      # Mount model and book files from the host if not baked into the image
+      - ./kiyengine.gguf:/engine/kiyengine.gguf:ro
+      - ./book1.bin:/engine/book1.bin:ro
+      - ./book2.bin:/engine/book2.bin:ro
+    # No port mapping needed -- the engine uses stdin/stdout (UCI protocol).
+    # Connect interactively:  docker compose run kiyengine
+    # Or pipe commands:       echo "uci" | docker compose run -T kiyengine

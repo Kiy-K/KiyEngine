@@ -1,0 +1,11 @@
+target/
+.git/
+.gitignore
+*.pgn
+*.log
+*.md
+!README.md
+scripts/
+tests/
+.vscode/
+.idea/

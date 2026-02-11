@@ -7,6 +7,7 @@ pub mod book;
 pub mod constants;
 pub mod engine;
 pub mod eval;
+pub mod nnue;
 pub mod search;
 pub mod simd;
 pub mod uci;

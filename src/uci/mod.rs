@@ -156,6 +156,8 @@ pub struct UciHandler {
     analysis_mode: bool,
     multipv: usize,
     show_wdl: bool,
+    debug_mode: bool,
+    ponder_mode: bool,
     /// KV cache for incremental NN inference (persists across moves)
     kv_cache: Arc<parking_lot::Mutex<KVCache>>,
 }
@@ -164,7 +166,22 @@ impl UciHandler {
     pub fn new() -> anyhow::Result<Self> {
         let engine = Arc::new(Engine::new()?);
         let tt = Arc::new(TranspositionTable::new(512));
-        let searcher = Searcher::new(Arc::clone(&engine), Arc::clone(&tt));
+        let mut searcher = Searcher::new(Arc::clone(&engine), Arc::clone(&tt));
+
+        // Try loading NNUE evaluation network
+        let nnue_path = crate::nnue::DEFAULT_NNUE_PATH;
+        if std::path::Path::new(nnue_path).exists() {
+            match crate::nnue::NnueNetwork::load(nnue_path) {
+                Ok(net) => {
+                    println!("info string NNUE loaded: {}", nnue_path);
+                    searcher.nnue = Some(std::sync::Arc::new(net));
+                }
+                Err(e) => {
+                    eprintln!("info string NNUE load failed: {}", e);
+                }
+            }
+        }
+
         let book = OpeningBook::load(&["src/book/book1.bin", "src/book/book2.bin"]);
         let (tx, rx) = mpsc::channel();
 
@@ -187,6 +204,8 @@ impl UciHandler {
             analysis_mode: false,
             multipv: 1,
             show_wdl: false,
+            debug_mode: false,
+            ponder_mode: false,
             kv_cache: Arc::new(parking_lot::Mutex::new(KVCache::new(num_layers))),
         })
     }
@@ -215,7 +234,16 @@ impl UciHandler {
                 println!("option name Analysis Mode type check default false");
                 println!("option name MultiPV type spin default 1 min 1 max 500");
                 println!("option name UCI_ShowWDL type check default false");
+                println!("option name UCI_Ponder type check default false");
+                println!("option name Clear Hash type button");
                 println!("uciok");
+            }
+            Some("debug") => {
+                if parts.get(1) == Some(&"on") {
+                    self.debug_mode = true;
+                } else if parts.get(1) == Some(&"off") {
+                    self.debug_mode = false;
+                }
             }
             Some("isready") => {
                 println!("readyok");
@@ -236,8 +264,16 @@ impl UciHandler {
             Some("stop") => {
                 self.stop_flag.store(true, Ordering::SeqCst);
             }
+            Some("ponderhit") => {
+                // Switch from pondering to normal search timing
+                self.ponder_mode = false;
+                // The search is already running; just let time management take over
+            }
             Some("setoption") => {
                 self.handle_setoption(&parts[1..]);
+            }
+            Some("d") => {
+                self.display_board();
             }
             Some("quit") => {
                 std::process::exit(0);
@@ -247,6 +283,11 @@ impl UciHandler {
     }
 
     fn handle_setoption(&mut self, parts: &[&str]) {
+        if parts.len() < 2 || parts[0] != "name" {
+            return;
+        }
+
+        // Find the "value" keyword to split name and value
         let mut value_idx = 0;
         for (i, &part) in parts.iter().enumerate() {
             if part == "value" {
@@ -255,16 +296,24 @@ impl UciHandler {
             }
         }
 
-        if value_idx == 0 || value_idx == parts.len() - 1 {
-            return;
-        }
-
-        if parts[0] != "name" {
+        // Button-type options have no "value" keyword
+        if value_idx == 0 {
+            let name = parts[1..].join(" ").to_lowercase();
+            match name.as_str() {
+                "clear hash" => {
+                    self.tt.clear();
+                }
+                _ => {}
+            }
             return;
         }
 
         let name = parts[1..value_idx].join(" ").to_lowercase();
-        let value = parts[(value_idx + 1)..].join(" ");
+        let value = if value_idx + 1 < parts.len() {
+            parts[(value_idx + 1)..].join(" ")
+        } else {
+            return;
+        };
 
         match name.as_str() {
             "hash" => {
@@ -293,8 +342,21 @@ impl UciHandler {
             "uci_showwdl" => {
                 self.show_wdl = value == "true";
             }
+            "uci_ponder" => {
+                self.ponder_mode = value == "true";
+            }
             _ => {}
         }
+    }
+
+    fn display_board(&self) {
+        // Print board in a human-readable format
+        let fen = format!("{}", self.board);
+        println!("\n {}", fen);
+        println!(" Side to move: {:?}", self.board.side_to_move());
+        println!(" Hash: {:016x}", self.board.get_hash());
+        println!(" Checkers: {:?}", self.board.checkers());
+        println!();
     }
 
     fn handle_position(&mut self, parts: &[&str]) {
@@ -376,6 +438,12 @@ impl UciHandler {
         let mut binc: u32 = 0;
         let mut movestogo: u32 = 0;
         let mut depth: u8 = 0;
+        let mut movetime: u32 = 0;
+        let mut _nodes: u64 = 0;
+        let mut _mate: u32 = 0;
+        let mut infinite = false;
+        let mut _ponder = false;
+        let mut _searchmoves: Vec<ChessMove> = Vec::new();
 
         let mut i = 0;
         while i < parts.len() {
@@ -416,14 +484,63 @@ impl UciHandler {
                     }
                     i += 2;
                 }
+                "nodes" => {
+                    if let Some(v) = parts.get(i + 1).and_then(|s| s.parse().ok()) {
+                        _nodes = v;
+                    }
+                    i += 2;
+                }
+                "mate" => {
+                    if let Some(v) = parts.get(i + 1).and_then(|s| s.parse().ok()) {
+                        _mate = v;
+                    }
+                    i += 2;
+                }
+                "movetime" => {
+                    if let Some(v) = parts.get(i + 1).and_then(|s| s.parse().ok()) {
+                        movetime = v;
+                    }
+                    i += 2;
+                }
                 "infinite" => {
-                    depth = 0;
+                    infinite = true;
                     i += 1;
+                }
+                "ponder" => {
+                    _ponder = true;
+                    i += 1;
+                }
+                "searchmoves" => {
+                    // Collect all subsequent move strings until next keyword or end
+                    i += 1;
+                    while i < parts.len() {
+                        if let Some(mv) = Self::parse_move(parts[i], &self.board) {
+                            _searchmoves.push(mv);
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
                 }
                 _ => {
                     i += 1;
                 }
             }
+        }
+
+        // Handle movetime: convert to wtime/btime with movestogo=1
+        if movetime > 0 {
+            wtime = movetime;
+            btime = movetime;
+            winc = 0;
+            binc = 0;
+            movestogo = 1;
+        }
+
+        // Handle infinite: set very large time so search runs until "stop"
+        if infinite {
+            wtime = u32::MAX / 2;
+            btime = u32::MAX / 2;
         }
 
         self.stop_flag.store(false, Ordering::SeqCst);
