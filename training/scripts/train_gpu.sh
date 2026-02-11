@@ -23,6 +23,9 @@
 
 set -euo pipefail
 
+# ── Ensure cargo is in PATH ──
+source "$HOME/.cargo/env" 2>/dev/null || true
+
 # ── Defaults ──
 EPOCHS=150
 START_LR=0.001
