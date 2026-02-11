@@ -82,8 +82,8 @@ echo ""
 echo "[Step 4] Converting to bulletformat..."
 
 if [ -f "$BULLET_UTILS" ]; then
-    "$BULLET_UTILS" text-to-bullet "$DATA_DIR/train_split.txt" "$DATA_DIR/train.bullet"
-    "$BULLET_UTILS" text-to-bullet "$DATA_DIR/test_split.txt" "$DATA_DIR/test.bullet"
+    "$BULLET_UTILS" convert --from text --input "$DATA_DIR/train_split.txt" --output "$DATA_DIR/train.bullet" --threads 4
+    "$BULLET_UTILS" convert --from text --input "$DATA_DIR/test_split.txt" --output "$DATA_DIR/test.bullet" --threads 4
     echo "  Created: $DATA_DIR/train.bullet"
     echo "  Created: $DATA_DIR/test.bullet"
 else
