@@ -2,8 +2,8 @@
 //! v5.2.0 KiyNet_Ultimate benchmark
 
 use candle_core::Device;
-use kiy_engine_v5_alpha::constants::DEFAULT_MODEL_PATH;
-use kiy_engine_v5_alpha::engine::Engine;
+use kiy_engine::constants::DEFAULT_MODEL_PATH;
+use kiy_engine::engine::Engine;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

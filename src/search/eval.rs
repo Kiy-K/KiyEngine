@@ -28,7 +28,11 @@ const ADJACENT_FILES: [u64; 8] = [
 // Passed pawn bonus by rank (from White's perspective, rank 1-8 index 0-7)
 const PASSED_PAWN_BONUS: [i32; 8] = [0, 5, 10, 20, 35, 60, 100, 0];
 
-/// Enhanced material + PST + positional evaluation
+// Pawn shield masks: squares directly in front of king (2 ranks deep)
+// These are relative masks applied based on king position
+const PAWN_SHIELD_BONUS: i32 = 10; // per pawn in the shield zone
+
+/// Enhanced material + tapered PST + king safety + mobility evaluation
 pub fn evaluate(board: &Board, _ply: usize) -> i32 {
     let mut score = 0;
     let material = [
@@ -43,8 +47,12 @@ pub fn evaluate(board: &Board, _ply: usize) -> i32 {
     let black_bb = *board.color_combined(Color::Black);
     let white_pawns = board.pieces(Piece::Pawn) & white_bb;
     let black_pawns = board.pieces(Piece::Pawn) & black_bb;
+    let occupied = *board.combined();
 
-    // --- Material + PST ---
+    // Compute game phase for tapered eval
+    let phase = PST::game_phase(board);
+
+    // --- Material + Tapered PST ---
     for &color in &[Color::White, Color::Black] {
         let mult = if color == Color::White { 1 } else { -1 };
         let color_bb = board.color_combined(color);
@@ -53,11 +61,11 @@ pub fn evaluate(board: &Board, _ply: usize) -> i32 {
             let bb = board.pieces(piece) & color_bb;
             for sq in bb {
                 score += val * mult;
-                score += PST::get_score(piece, sq, color) * mult;
+                score += PST::get_score_tapered(piece, sq, color, phase) * mult;
             }
         }
         let ksq = board.king_square(color);
-        score += PST::get_score(Piece::King, ksq, color) * mult;
+        score += PST::get_score_tapered(Piece::King, ksq, color, phase) * mult;
     }
 
     // --- Bishop pair bonus (30cp) ---
@@ -96,6 +104,18 @@ pub fn evaluate(board: &Board, _ply: usize) -> i32 {
             }
         }
     }
+
+    // --- King Safety: Pawn Shield ---
+    // Only relevant in midgame (phase > 8)
+    if phase > 8 {
+        score += king_pawn_shield(board, Color::White, white_pawns);
+        score -= king_pawn_shield(board, Color::Black, black_pawns);
+    }
+
+    // --- Piece Mobility (lightweight) ---
+    // Knight and Bishop mobility based on attack squares (excluding own pieces)
+    score += mobility_score(board, Color::White, occupied, white_bb);
+    score -= mobility_score(board, Color::Black, occupied, black_bb);
 
     // --- Pawn structure: passed pawns, doubled, isolated ---
     for sq in white_pawns {
@@ -159,4 +179,80 @@ pub fn evaluate(board: &Board, _ply: usize) -> i32 {
     } else {
         -score
     }
+}
+
+/// King pawn shield evaluation: bonus for pawns in front of the castled king
+#[inline]
+fn king_pawn_shield(board: &Board, color: Color, our_pawns: BitBoard) -> i32 {
+    let ksq = board.king_square(color);
+    let k_file = ksq.to_index() % 8;
+    let k_rank = ksq.to_index() / 8;
+
+    // Only evaluate pawn shield if king is on flanks (typical castled position)
+    if k_file >= 2 && k_file <= 5 {
+        return 0;
+    }
+
+    let mut shield = 0i32;
+    // Check 3 files around king (king file, and both adjacent if they exist)
+    let start_file = if k_file > 0 { k_file - 1 } else { 0 };
+    let end_file = if k_file < 7 { k_file + 1 } else { 7 };
+
+    for f in start_file..=end_file {
+        // Check 1-2 ranks ahead of king for friendly pawns
+        let ahead1 = if color == Color::White {
+            if k_rank < 7 { Some((k_rank + 1) * 8 + f) } else { None }
+        } else {
+            if k_rank > 0 { Some((k_rank - 1) * 8 + f) } else { None }
+        };
+        let ahead2 = if color == Color::White {
+            if k_rank < 6 { Some((k_rank + 2) * 8 + f) } else { None }
+        } else {
+            if k_rank > 1 { Some((k_rank - 2) * 8 + f) } else { None }
+        };
+
+        if let Some(sq_idx) = ahead1 {
+            if sq_idx < 64 && (our_pawns & BitBoard(1u64 << sq_idx)).0 != 0 {
+                shield += PAWN_SHIELD_BONUS;
+            }
+        }
+        if let Some(sq_idx) = ahead2 {
+            if sq_idx < 64 && (our_pawns & BitBoard(1u64 << sq_idx)).0 != 0 {
+                shield += PAWN_SHIELD_BONUS / 2; // Half bonus for rank+2
+            }
+        }
+    }
+    shield
+}
+
+/// Lightweight piece mobility: count attack squares for knights and bishops
+#[inline]
+fn mobility_score(board: &Board, color: Color, occupied: BitBoard, our_bb: BitBoard) -> i32 {
+    let mut mob = 0i32;
+
+    // Knight mobility: 2cp per accessible square
+    let knights = *board.pieces(Piece::Knight) & *board.color_combined(color);
+    for sq in knights {
+        let attacks = chess::get_knight_moves(sq);
+        let accessible = (attacks & !our_bb).0.count_ones() as i32;
+        mob += accessible * 2;
+    }
+
+    // Bishop mobility: 3cp per accessible square (bishops benefit more from open diagonals)
+    let bishops = *board.pieces(Piece::Bishop) & *board.color_combined(color);
+    for sq in bishops {
+        let attacks = chess::get_bishop_moves(sq, occupied);
+        let accessible = (attacks & !our_bb).0.count_ones() as i32;
+        mob += accessible * 3;
+    }
+
+    // Rook mobility: 2cp per accessible square
+    let rooks = *board.pieces(Piece::Rook) & *board.color_combined(color);
+    for sq in rooks {
+        let attacks = chess::get_rook_moves(sq, occupied);
+        let accessible = (attacks & !our_bb).0.count_ones() as i32;
+        mob += accessible * 2;
+    }
+
+    mob
 }

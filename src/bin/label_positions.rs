@@ -8,8 +8,8 @@
 //! Usage: cargo run --release --bin label_positions -- --positions 200000 --output data/train.bin
 
 use chess::{Board, ChessMove, MoveGen};
-use kiy_engine_v5_alpha::engine::Engine;
-use kiy_engine_v5_alpha::uci::MoveCodec;
+use kiy_engine::engine::Engine;
+use kiy_engine::uci::MoveCodec;
 use std::io::{BufWriter, Write};
 
 fn main() -> anyhow::Result<()> {

@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
     println!();
 
     // Load GGUF file
-    let gguf = kiy_engine_v5_alpha::engine::gguf::GgufFile::from_path(model_path)?;
+    let gguf = kiy_engine::engine::gguf::GgufFile::from_path(model_path)?;
 
     // Display header info
     println!("📁 File: {}", model_path);

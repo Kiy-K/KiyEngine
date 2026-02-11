@@ -1,7 +1,7 @@
 use chess::{Board, ChessMove};
-use kiy_engine_v5_alpha::engine::Engine;
-use kiy_engine_v5_alpha::search::lazy_smp::Searcher;
-use kiy_engine_v5_alpha::search::tt::AtomicTT;
+use kiy_engine::engine::Engine;
+use kiy_engine::search::lazy_smp::Searcher;
+use kiy_engine::search::tt::AtomicTT;
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};

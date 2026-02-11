@@ -10,7 +10,10 @@ permissions:
   contents: write
 
 env:
-  BINARY_NAME: kiy_engine_v5_alpha
+  # Tên binary gốc trong Cargo.toml
+  CRATE_BIN_NAME: kiy_engine_v5_alpha
+  # Tên binary muốn xuất bản (cho chuyên nghiệp)
+  RELEASE_BIN_NAME: kiyengine
 
 jobs:
   build:
@@ -27,11 +30,13 @@ jobs:
             target_name: linux-x86_64
             artifact_name: kiyengine-linux-x86_64
             binary_ext: ""
+            archive_ext: ".tar.gz"
             rustflags: "-C target-cpu=x86-64-v3"
           - os: windows-latest
             target_name: windows-x86_64
             artifact_name: kiyengine-windows-x86_64
             binary_ext: ".exe"
+            archive_ext: ".zip"
             rustflags: "-C target-cpu=x86-64-v3"
 
     steps:
@@ -50,24 +55,39 @@ jobs:
 
       - name: Strip binary (Linux)
         if: matrix.os == 'ubuntu-latest'
-        run: strip target/release/${{ env.BINARY_NAME }}${{ matrix.binary_ext }}
+        run: strip target/release/${{ env.CRATE_BIN_NAME }}${{ matrix.binary_ext }}
 
-      - name: Package artifact
+      - name: Prepare Assets
         run: |
           mkdir -p dist
-          cp target/release/${{ env.BINARY_NAME }}${{ matrix.binary_ext }} dist/kiyengine${{ matrix.binary_ext }}
-          # Include model weights and opening books (bypass Git LFS issues)
+          # Copy binary chính và đổi tên
+          cp target/release/${{ env.CRATE_BIN_NAME }}${{ matrix.binary_ext }} dist/${{ env.RELEASE_BIN_NAME }}${{ matrix.binary_ext }}
+          
+          # Copy các file đi kèm (nếu có)
           if [ -f kiyengine.gguf ]; then cp kiyengine.gguf dist/; fi
           if [ -f kiyengine.nnue ]; then cp kiyengine.nnue dist/; fi
-          if [ -f src/book/book1.bin ]; then cp src/book/book1.bin dist/; fi
-          if [ -f src/book/book2.bin ]; then cp src/book/book2.bin dist/; fi
-          cd dist && tar -czvf ../${{ matrix.artifact_name }}.tar.gz *
+          
+          # Copy sách khai cuộc (mở rộng tìm kiếm)
+          find . -maxdepth 2 -name "*.bin" -exec cp {} dist/ \;
 
-      - name: Upload artifact
+      - name: Package Archive
+        run: |
+          cd dist
+          if [ "${{ matrix.os }}" == "windows-latest" ]; then
+            7z a ../${{ matrix.artifact_name }}.zip *
+            # Copy riêng file exe ra ngoài để upload bản lẻ
+            cp ${{ env.RELEASE_BIN_NAME }}${{ matrix.binary_ext }} ../${{ matrix.RELEASE_BIN_NAME }}-windows-standalone.exe
+          else
+            tar -czvf ../${{ matrix.artifact_name }}.tar.gz *
+          fi
+
+      - name: Upload Artifacts to Action
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_name }}.tar.gz
+          path: |
+            ${{ matrix.artifact_name }}${{ matrix.archive_ext }}
+            *.exe
 
   release:
     name: Create GitHub Release
@@ -82,17 +102,28 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: release_assets
-          pattern: kiyengine-*
           merge-multiple: true
-
-      - name: List files (debug)
-        run: ls -lhR release_assets
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: release_assets/*
+          files: |
+            release_assets/*.zip
+            release_assets/*.tar.gz
+            release_assets/*.exe
           name: KiyEngine ${{ github.ref_name }}
+          body: |
+            ## 🚀 KiyEngine ${{ github.ref_name }} - "The Assassin"
+            
+            Bản cập nhật tối ưu hóa hiệu năng và sửa lỗi quản lý thời gian.
+            
+            ### 📦 Assets
+            - **Windows:** Tải file `.zip` (đầy đủ model/book) hoặc file `.exe` lẻ.
+            - **Linux:** Dùng file `.tar.gz`.
+            
+            ### 🛠️ Yêu cầu phần cứng
+            - CPU hỗ trợ **AVX2** (x86-64-v3).
+            - Model GGUF 2-bit (Ternary).
           draft: false
           prerelease: false
           generate_release_notes: true
