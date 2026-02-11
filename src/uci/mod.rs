@@ -179,6 +179,20 @@ impl UciHandler {
             }
         }
 
+        // Try auto-loading Syzygy tablebases from default directory
+        const DEFAULT_SYZYGY_PATH: &str = "syzygy";
+        if std::path::Path::new(DEFAULT_SYZYGY_PATH).is_dir() {
+            match SyzygyTB::new(DEFAULT_SYZYGY_PATH) {
+                Ok(tb) => {
+                    println!("info string Syzygy TB loaded: {} (max {} pieces)", DEFAULT_SYZYGY_PATH, tb.max_pieces());
+                    searcher.syzygy = Some(std::sync::Arc::new(tb));
+                }
+                Err(e) => {
+                    eprintln!("info string Syzygy TB load failed: {}", e);
+                }
+            }
+        }
+
         let book = OpeningBook::load(&["src/book/book1.bin", "src/book/book2.bin"]);
         let (tx, rx) = mpsc::channel();
 
@@ -233,7 +247,7 @@ impl UciHandler {
                 println!("option name UCI_ShowWDL type check default false");
                 println!("option name UCI_Ponder type check default false");
                 println!("option name Clear Hash type button");
-                println!("option name SyzygyPath type string default <empty>");
+                println!("option name SyzygyPath type string default syzygy");
                 println!("uciok");
             }
             Some("debug") => {
