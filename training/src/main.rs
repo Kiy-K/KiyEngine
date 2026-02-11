@@ -124,7 +124,7 @@ fn main() {
             SavedFormat::id("l1w").round().quantise::<i8>(64).transpose(),
             SavedFormat::id("l1b").round().quantise::<i32>(255 * 64),
             // L2: per-bucket output layer, i16 weights
-            // Transpose for row-major layout: l2w[bucket * 2*L1_SIZE + j]
+            // Transpose for row-major layout: l2w[bucket * L1_SIZE + j]
             SavedFormat::id("l2w").round().quantise::<i16>(64).transpose(),
             SavedFormat::id("l2b").round().quantise::<i16>(255 * 64),
         ])
@@ -141,9 +141,9 @@ fn main() {
             // L1: shared hidden layer (2*HIDDEN → L1_SIZE)
             let l1 = builder.new_affine("l1", 2 * HIDDEN_SIZE, L1_SIZE);
 
-            // L2: per-bucket output layer (2*L1_SIZE → NUM_OUTPUT_BUCKETS)
-            // CReLU doubles L1 output, so L2 input is 2*L1_SIZE
-            let l2 = builder.new_affine("l2", 2 * L1_SIZE, NUM_OUTPUT_BUCKETS);
+            // L2: per-bucket output layer (L1_SIZE → NUM_OUTPUT_BUCKETS)
+            // Bullet CReLU = Clipped ReLU (no dimension doubling)
+            let l2 = builder.new_affine("l2", L1_SIZE, NUM_OUTPUT_BUCKETS);
 
             // Forward pass: FT → SCReLU → concat → L1 → CReLU → L2 → select
             let stm_hidden = l0.forward(stm_inputs).screlu();

@@ -11,7 +11,7 @@ Bullet's quantised.bin layout for v5 deep network:
   l0b: i16[HIDDEN]                              (FT biases)
   l1w: i8[L1_SIZE * 2 * HIDDEN]               (L1 weights, transposed = row-major)
   l1b: i32[L1_SIZE]                             (L1 biases, in QA*Q1 scale)
-  l2w: i16[NUM_BUCKETS * 2 * L1_SIZE]         (L2 weights, transposed = row-major)
+  l2w: i16[NUM_BUCKETS * L1_SIZE]              (L2 weights, transposed = row-major)
   l2b: i16[NUM_BUCKETS]                         (L2 biases, in QA*Q2 scale)
 
 KiyEngine KYNN v5 format:
@@ -25,7 +25,7 @@ KiyEngine KYNN v5 format:
   ft_biases: i16[hidden_size] LE
   l1_weights: i8[l1_size * 2 * hidden_size]
   l1_biases: i32[l1_size] LE
-  l2_weights: i16[num_output_buckets * 2 * l1_size] LE
+  l2_weights: i16[num_output_buckets * l1_size] LE
   l2_biases: i16[num_output_buckets] LE
 
 Note on weight layout:
@@ -46,6 +46,21 @@ def convert_v5(input_path: str, output_path: str, hidden_size: int = 512,
                l1_size: int = 16, num_output_buckets: int = 8, num_input_buckets: int = 10):
     """Convert Bullet quantised.bin to KYNN v5 (deep network) format."""
     data = open(input_path, "rb").read()
+
+    # Validate file size before parsing
+    expected = (num_input_buckets * NUM_FEATURES * hidden_size * 2  # l0w i16
+                + hidden_size * 2                                    # l0b i16
+                + l1_size * 2 * hidden_size                          # l1w i8
+                + l1_size * 4                                        # l1b i32
+                + num_output_buckets * l1_size * 2                   # l2w i16
+                + num_output_buckets * 2)                             # l2b i16
+    if len(data) < expected:
+        print(f"ERROR: quantised.bin too small for v5 format.")
+        print(f"  Got {len(data)} bytes, need >= {expected} bytes.")
+        print(f"  Config: hidden={hidden_size}, l1={l1_size}, in_buckets={num_input_buckets}, out_buckets={num_output_buckets}")
+        print(f"  Did you train with the deep architecture (L1→CReLU→L2)?")
+        sys.exit(1)
+
     offset = 0
 
     # FT weights: i16
@@ -73,7 +88,7 @@ def convert_v5(input_path: str, output_path: str, hidden_size: int = 512,
     offset += l1_b_bytes
 
     # L2 weights: i16 (already transposed in save_format)
-    l2_w_count = num_output_buckets * 2 * l1_size
+    l2_w_count = num_output_buckets * l1_size
     l2_w_bytes = l2_w_count * 2
     l2_weights = np.frombuffer(data[offset:offset + l2_w_bytes], dtype=np.int16).copy()
     offset += l2_w_bytes

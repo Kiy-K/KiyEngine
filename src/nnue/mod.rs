@@ -96,8 +96,8 @@ pub struct NnueNetwork {
     /// L1 hidden layer biases (v5): [l1_size] (i32, in QA*Q1 scale)
     pub l1_biases: Vec<i32>,
 
-    /// L2 output weights (v5, per-bucket): [num_buckets * 2 * l1_size] (i16)
-    /// After CReLU doubles L1 output: 2*l1_size inputs per bucket
+    /// L2 output weights (v5, per-bucket): [num_buckets * l1_size] (i16)
+    /// CReLU is Clipped ReLU (no dimension doubling): l1_size inputs per bucket
     pub l2_weights: Vec<i16>,
 
     /// L2 output biases (v5, per-bucket): [num_buckets] (i16, in QA*Q2 scale)
@@ -166,7 +166,7 @@ impl NnueNetwork {
     /// Quantization flow:
     /// - SCReLU: v = clamp(acc, 0, QA), output = v*v/QA → [0, QA=255]
     /// - L1 (i8 weights, shared): accumulate in i32, biases in QA*Q1 scale
-    /// - CReLU (rescaled): clamp(±l1/Q1, 0, QA) → [0, 255], doubles dimension
+    /// - CReLU (Clipped ReLU): clamp(l1/Q1, 0, QA) → [0, 255], NO dim doubling
     /// - L2 (i16 weights, per-bucket): accumulate in i32, biases in QA*QB scale
     /// - Dequant: output * SCALE / (QA * QB)
     #[inline]
@@ -201,19 +201,16 @@ impl NnueNetwork {
             l1_out[j] = sum;
         }
 
-        // Step 2: CReLU (rescaled) — doubles L1 output dimension
-        // positive[j] = clamp(l1/Q1, 0, QA), negative[j] = clamp(-l1/Q1, 0, QA)
-        let mut crelu = [0i32; 128]; // max 2 * l1_size
+        // Step 2: CReLU (Clipped ReLU) — clamp to [0, QA], NO dimension doubling
+        let mut crelu = [0i32; 64]; // max l1_size
         for j in 0..l1s {
             crelu[j] = (l1_out[j] / Q1).clamp(0, qa);
-            crelu[l1s + j] = (-l1_out[j] / Q1).clamp(0, qa);
         }
 
         // Step 3: L2 — per-bucket output
-        let l2_in_size = 2 * l1s;
-        let l2_w_base = bucket * l2_in_size;
+        let l2_w_base = bucket * l1s;
         let mut output = self.l2_biases[bucket] as i64;
-        for j in 0..l2_in_size {
+        for j in 0..l1s {
             output += crelu[j] as i64 * self.l2_weights[l2_w_base + j] as i64;
         }
 
@@ -516,8 +513,8 @@ impl NnueNetwork {
             let l1_weights = read_i8_vec(&mut cursor, l1_w_count)?;
             let l1_biases = read_i32_vec(&mut cursor, l1_size)?;
 
-            // L2: per-bucket, i16 weights (CReLU doubles L1 output)
-            let l2_w_count = num_buckets * 2 * l1_size;
+            // L2: per-bucket, i16 weights (CReLU = Clipped ReLU, no dim doubling)
+            let l2_w_count = num_buckets * l1_size;
             let l2_weights = read_i16_vec(&mut cursor, l2_w_count)?;
             let l2_biases = read_i16_vec(&mut cursor, num_buckets)?;
 
@@ -594,7 +591,7 @@ impl NnueNetwork {
         let mut ft_biases = vec![0i16; hidden_size];
         let mut l1_weights = vec![0i8; l1_size * 2 * hidden_size];
         let l1_biases = vec![0i32; l1_size];
-        let mut l2_weights = vec![0i16; num_buckets * 2 * l1_size];
+        let mut l2_weights = vec![0i16; num_buckets * l1_size];
         let l2_biases = vec![0i16; num_buckets];
 
         let mut seed: u64 = 0xCAFEBABE;
