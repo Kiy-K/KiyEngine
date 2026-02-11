@@ -5,7 +5,8 @@ edition = "2021"
 description = "NNUE trainer for KiyEngine using Bullet framework (CPU or GPU)"
 
 [dependencies]
-bullet_lib = { git = "https://github.com/jw1912/bullet", default-features = false }
+bullet_lib = { git = "https://github.com/jw1912/bullet", rev = "3ce1393f", default-features = false }
+acyclib = { git = "https://github.com/jw1912/bullet", rev = "3ce1393f" }
 
 [features]
 default = ["cpu"]

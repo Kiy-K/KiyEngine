@@ -31,6 +31,8 @@ use bullet_lib::{
     value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
 };
 
+use acyclib::graph::{GraphNodeId, GraphNodeIdTy};
+
 const HIDDEN_SIZE: usize = 512;
 const NUM_OUTPUT_BUCKETS: usize = 8;
 
@@ -94,15 +96,11 @@ fn main() {
     println!();
 
     // Build the network with king-bucketed inputs + factoriser
-    let mut builder = ValueTrainerBuilder::default()
+    let builder = ValueTrainerBuilder::default()
         .dual_perspective()
         .optimiser(AdamW)
         .inputs(ChessBucketsMirrored::new(BUCKET_LAYOUT))
         .output_buckets(MaterialCount::<NUM_OUTPUT_BUCKETS>);
-
-    // CPU backend needs explicit thread count; GPU backend handles parallelism
-    #[cfg(not(feature = "cuda"))]
-    { builder = builder.use_threads(4); }
 
     let mut trainer = builder
         .save_format(&[
@@ -110,8 +108,11 @@ fn main() {
             // This produces a single (NUM_INPUT_BUCKETS * 768, HIDDEN_SIZE) weight matrix
             // where each bucket's 768 rows include the shared factoriser contribution.
             SavedFormat::id("l0w")
-                .transform(|store, weights| {
-                    let factoriser = store.get("l0f").values.repeat(NUM_INPUT_BUCKETS);
+                .add_transform(|graph, _id, weights| {
+                    let f_idx = graph.weight_idx("l0f").unwrap();
+                    let f_id = GraphNodeId::new(f_idx, GraphNodeIdTy::Values);
+                    let factoriser_base: Vec<f32> = graph.get(f_id).unwrap().borrow().get_dense_vals().unwrap();
+                    let factoriser: Vec<f32> = factoriser_base.repeat(NUM_INPUT_BUCKETS);
                     weights.into_iter().zip(factoriser).map(|(a, b)| a + b).collect()
                 })
                 .round()
