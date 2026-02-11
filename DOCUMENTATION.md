@@ -180,7 +180,7 @@ Centralized constants to avoid magic numbers:
 cargo build --release
 
 # Run engine (UCI mode)
-cargo run --release --bin kiy_engine_v5_alpha
+cargo run --release --bin kiyengine
 
 # Run model benchmarks
 cargo run --release --bin model_benchmark

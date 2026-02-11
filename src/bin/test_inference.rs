@@ -1,4 +1,4 @@
-use kiy_engine_v5_alpha::engine::Engine;
+use kiyengine::engine::Engine;
 
 fn main() -> anyhow::Result<()> {
     println!("Loading engine...");

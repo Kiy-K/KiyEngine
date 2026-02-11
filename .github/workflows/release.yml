@@ -4,15 +4,18 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+env:
+  BINARY_NAME: kiyengine
+
 jobs:
   build:
-    name: Build on ${{ matrix.os }}
+    name: Build ${{ matrix.target_name }}
     runs-on: ${{ matrix.os }}
-    # Ép dùng Bash shell để lệnh cp/tar chạy giống nhau trên cả Win và Linux
     defaults:
       run:
         shell: bash
@@ -21,15 +24,16 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact_name: kiy_engine_linux
-            asset_name: kiy_engine_v5_alpha_linux.tar.gz
-            binary_name: kiy_engine_v5_alpha
+            target_name: linux-x86_64
+            artifact_name: kiyengine-linux
+            binary_ext: ""
+            rustflags: "-C target-cpu=x86-64-v3"
           - os: windows-latest
-            artifact_name: kiy_engine_windows
-            asset_name: kiy_engine_v5_alpha_windows.exe
-            binary_name: kiy_engine_v5_alpha.exe
+            target_name: windows-x86_64
+            artifact_name: kiyengine-windows
+            binary_ext: ".exe"
+            rustflags: "-C target-cpu=x86-64-v3"
 
-    # [FIX] Steps phải nằm ở đây (ngang hàng strategy), không được thọt vào trong
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -40,53 +44,57 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build release
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release
 
-      - name: Package Linux artifact
+      - name: Strip binary (Linux)
         if: matrix.os == 'ubuntu-latest'
-        run: |
-          tar -czvf ${{ matrix.asset_name }} -C target/release ${{ matrix.binary_name }}
+        run: strip target/release/${{ env.BINARY_NAME }}${{ matrix.binary_ext }}
 
-      - name: Package Windows artifact
-        if: matrix.os == 'windows-latest'
-        # Dùng cp của bash để copy và đổi tên file luôn
+      - name: Package artifact
         run: |
-          cp target/release/${{ matrix.binary_name }} ./${{ matrix.asset_name }}
+          mkdir -p dist
+          cp target/release/${{ env.BINARY_NAME }}${{ matrix.binary_ext }} dist/kiyengine${{ matrix.binary_ext }}
+          # Version note next to binary
+          echo "KiyEngine ${{ github.ref_name || 'dev' }} — ${{ matrix.target_name }} — Built $(date -u +%Y-%m-%d)" > dist/VERSION.txt
+          # Include model weights and opening books
+          if [ -f kiyengine.gguf ]; then cp kiyengine.gguf dist/; fi
+          if [ -f kiyengine.nnue ]; then cp kiyengine.nnue dist/; fi
+          if [ -f src/book/book1.bin ]; then cp src/book/book1.bin dist/; fi
+          if [ -f src/book/book2.bin ]; then cp src/book/book2.bin dist/; fi
+          cd dist && tar -czvf ../kiyengine-${{ matrix.target_name }}.tar.gz *
 
-      - name: Upload Artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.asset_name }}
-
-      # [THEO YÊU CẦU] Xóa cache build sau khi xong việc
-      - name: Clean up Build Cache
-        run: cargo clean
+          path: kiyengine-${{ matrix.target_name }}.tar.gz
 
   release:
     name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Download tất cả artifact từ job trên về chung 1 thư mục
-      - name: Download All Artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: release_assets
-          pattern: kiy_engine_*
-          merge-multiple: true # Quan trọng: Gom hết file vào 1 chỗ, không chia folder con
+          pattern: kiyengine-*
+          merge-multiple: true
 
-      - name: List files (Debug)
-        run: ls -R release_assets
+      - name: List files (debug)
+        run: ls -lhR release_assets
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: release_assets/*
-          name: KiyEngine Release ${{ github.ref_name }}
+          name: KiyEngine ${{ github.ref_name }}
           draft: false
           prerelease: false
           generate_release_notes: true

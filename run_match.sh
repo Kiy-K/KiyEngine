@@ -2,7 +2,7 @@
 set -e
 
 # Configuration
-ENGINE_BIN="/home/khoi/Workspace/KiyEngine/target/release/kiy_engine_v5_alpha"
+ENGINE_BIN="/home/khoi/Workspace/KiyEngine/target/release/kiyengine"
 CUTECHESS="/home/khoi/cutechess/build/cutechess-cli"
 STOCKFISH="/usr/games/stockfish"
 MODEL_FILE="/home/khoi/Workspace/KiyEngine/kiyengine.gguf"

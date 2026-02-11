@@ -89,7 +89,11 @@ impl TranspositionTable {
         }
     }
 
-    pub fn resize(&self, _mb: usize) {
+    pub fn resize(&self, mb: usize) {
+        // Cannot truly reallocate through &self (would need &mut self or interior mutability).
+        // For now, clear existing entries. The TT is pre-sized at construction;
+        // to change size, recreate the TT via UciHandler.
+        let _ = mb;
         self.clear();
     }
 
@@ -247,6 +251,7 @@ impl Searcher {
         stop_flag: Arc<AtomicBool>,
         tx: mpsc::Sender<String>,
         kv_cache: Option<Arc<parking_lot::Mutex<KVCache>>>,
+        position_history: Vec<u64>,
     ) {
         let engine = Arc::clone(&self.engine);
         let tt = Arc::clone(&self.tt);
@@ -264,6 +269,8 @@ impl Searcher {
                 move_overhead,
                 is_white,
             ));
+
+            let pos_hist = Arc::new(position_history);
 
             // Pre-compute NN policy ONCE, then share across all threads
             // Use KV cache if available for incremental inference
@@ -295,12 +302,13 @@ impl Searcher {
                 let tx_clone = if i == 0 { Some(tx.clone()) } else { None };
                 let is_main = i == 0;
                 let policy_clone = Arc::clone(&shared_policy);
+                let pos_hist_clone = Arc::clone(&pos_hist);
 
                 handles.push(
                     std::thread::Builder::new()
                         .stack_size(64 * 1024 * 1024) // 64MB stack for deep recursion
                         .spawn(move || {
-                            let mut worker = SearchWorker::new(tt_clone, board_clone, stop_clone);
+                            let mut worker = SearchWorker::new(tt_clone, board_clone, stop_clone, pos_hist_clone);
                             let mut best_move = None;
                             let mut last_score = 0;
                             let mut stability: u32 = 0; // Best-move stability counter
@@ -316,12 +324,21 @@ impl Searcher {
                                 worker.time_manager = Some(Arc::clone(&tm_clone));
                             }
 
-                            // Lazy SMP: Thread chính chạy full depth, Thread phụ chạy depth-1 để feed TT
+                            // Lazy SMP: Varied depth offsets per helper thread (Stockfish-style)
+                            // Thread 0 (main): full depth
+                            // Thread 1: depth-1, Thread 2: depth+0, Thread 3: depth-2, etc.
                             let effective_max = if max_depth == 0 { MAX_DEPTH } else { max_depth };
                             let local_max_depth = if is_main {
                                 effective_max
                             } else {
-                                effective_max.saturating_sub(1).max(1)
+                                // Alternate: even helpers search same depth, odd helpers search depth-1 or depth-2
+                                let offset = match i % 4 {
+                                    1 => 1,
+                                    2 => 0, // Same depth as main (different move ordering due to TT races)
+                                    3 => 2,
+                                    _ => 1,
+                                };
+                                effective_max.saturating_sub(offset).max(1)
                             };
 
                             let depth_only = max_depth > 0 && wtime == 0 && btime == 0;
@@ -385,14 +402,11 @@ impl Searcher {
                                                 start_time.elapsed().as_secs_f64().max(0.001);
                                             let nps = (worker.nodes as f64 / elapsed) as u64;
 
-                                            let pv_str = if let Some(m) = mv {
-                                                format!("{}", m)
-                                            } else {
-                                                "".to_string()
-                                            };
+                                            let pv_str = worker.extract_pv(&worker.board.clone(), depth as usize);
+                                            let elapsed_ms = (elapsed * 1000.0) as u64;
                                             println!(
-                                                "info depth {} score cp {} nodes {} nps {} pv {}",
-                                                depth, score, worker.nodes, nps, pv_str
+                                                "info depth {} score cp {} nodes {} nps {} time {} pv {}",
+                                                depth, score, worker.nodes, nps, elapsed_ms, pv_str
                                             );
                                         }
                                         break;
@@ -461,10 +475,13 @@ pub struct SearchWorker {
     // Cached NN results — computed once, reused across all ID iterations
     cached_root_policy: Option<Vec<f32>>,
     cached_root_value: f32,
+    // Repetition detection: game history (from UCI position command) + search path
+    game_history: Arc<Vec<u64>>,
+    search_path: Vec<u64>,
 }
 
 impl SearchWorker {
-    pub fn new(tt: Arc<TranspositionTable>, board: Board, stop_flag: Arc<AtomicBool>) -> Self {
+    pub fn new(tt: Arc<TranspositionTable>, board: Board, stop_flag: Arc<AtomicBool>, game_history: Arc<Vec<u64>>) -> Self {
         Self {
             tt,
             board,
@@ -481,7 +498,65 @@ impl SearchWorker {
             piece_stack: [0; MAX_PLY],
             cached_root_policy: None,
             cached_root_value: 0.0,
+            game_history,
+            search_path: Vec::with_capacity(MAX_PLY),
         }
+    }
+
+    /// Check for repetition: returns true if current position hash has been seen
+    /// in the game history (from UCI) or in the current search path.
+    #[inline]
+    fn is_repetition(&self, hash: u64) -> bool {
+        // Check search path (current search tree — any repeat is a draw)
+        for &h in self.search_path.iter().rev() {
+            if h == hash {
+                return true;
+            }
+        }
+        // Check game history (positions from UCI `position` command)
+        // 2 occurrences in history means this would be the 3rd → draw
+        let mut count = 0;
+        for &h in self.game_history.iter() {
+            if h == hash {
+                count += 1;
+                if count >= 2 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Extract principal variation from TT (up to `max_len` moves).
+    fn extract_pv(&self, root_board: &Board, max_len: usize) -> String {
+        let mut pv = String::new();
+        let mut board = *root_board;
+        let mut seen = Vec::with_capacity(max_len);
+        for _ in 0..max_len {
+            let hash = board.get_hash();
+            if seen.contains(&hash) {
+                break; // Prevent TT PV cycles
+            }
+            seen.push(hash);
+            if let Some(entry) = self.tt.get(hash) {
+                if let Some(mv) = entry.best_move {
+                    if board.legal(mv) {
+                        if !pv.is_empty() {
+                            pv.push(' ');
+                        }
+                        pv.push_str(&format!("{}", mv));
+                        board = board.make_move_new(mv);
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        pv
     }
 
     /// Age history tables: halve all scores to prevent stale values from dominating.
@@ -607,6 +682,14 @@ impl SearchWorker {
         let is_pv = beta - alpha > 1;
         let is_root = ply == 0;
 
+        // --- Step 1b: Repetition detection ---
+        if !is_root {
+            let hash = self.board.get_hash();
+            if self.is_repetition(hash) {
+                return (0, None); // Draw by repetition
+            }
+        }
+
         // --- Step 2: Check extension ---
         let in_check = self.board.checkers().0 != 0;
         if in_check && depth < MAX_PLY as u8 {
@@ -725,6 +808,7 @@ impl SearchWorker {
             if let Some(null_board) = self.board.null_move() {
                 let old_board = self.board;
                 self.board = null_board;
+                self.search_path.push(self.board.get_hash());
 
                 // Adaptive reduction: R = 3 + depth/6, capped
                 let r = 3 + (depth / 6).min(3);
@@ -733,6 +817,7 @@ impl SearchWorker {
                 let null_score = -val;
 
                 self.board = old_board;
+                self.search_path.pop();
 
                 if self.stop_flag.load(Ordering::Relaxed) {
                     return (0, None);
@@ -796,9 +881,11 @@ impl SearchWorker {
                 }
                 let old_board = self.board;
                 self.board = old_board.make_move_new(*mv);
+                self.search_path.push(self.board.get_hash());
                 let (val, _) = self.alpha_beta(-se_beta, -se_beta + 1, se_depth, ply + 1);
                 let score = -val;
                 self.board = old_board;
+                self.search_path.pop();
 
                 if self.stop_flag.load(Ordering::Relaxed) {
                     return (0, None);
@@ -862,6 +949,7 @@ impl SearchWorker {
             let moved_color = self.board.side_to_move();
             let old_board = self.board;
             self.board = self.board.make_move_new(mv);
+            self.search_path.push(self.board.get_hash());
 
             // Record move/piece in stacks for continuation history
             self.move_stack[ply_idx] = Some(mv);
@@ -965,6 +1053,7 @@ impl SearchWorker {
 
             // --- Step 19: Undo move ---
             self.board = old_board;
+            self.search_path.pop();
 
             if self.stop_flag.load(Ordering::Relaxed) {
                 return (0, None);

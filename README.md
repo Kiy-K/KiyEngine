@@ -58,7 +58,7 @@ cd KiyEngine
 cargo build --release
 ```
 
-The release binary is at `./target/release/kiy_engine_v5_alpha`.
+The release binary is at `./target/release/kiyengine`.
 
 Place `kiyengine.gguf` in the same directory as the binary (or alongside `Cargo.toml` for development).
 

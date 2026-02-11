@@ -207,7 +207,7 @@ impl UciHandler {
         let parts: Vec<&str> = command.split_whitespace().collect();
         match parts.get(0).copied() {
             Some("uci") => {
-                println!("id name KiyEngine V5 Alpha-Beta");
+                println!("id name KiyEngine V6.0.0");
                 println!("id author Khoi");
                 println!("option name Hash type spin default 512 min 64 max 65536");
                 println!("option name Threads type spin default 4 min 1 max 256");
@@ -449,6 +449,7 @@ impl UciHandler {
             Arc::clone(&self.stop_flag),
             self.tx_move.clone(),
             Some(Arc::clone(&self.kv_cache)),
+            self.position_history.clone(),
         );
     }
 }
