@@ -345,7 +345,7 @@ pub mod lazy_smp;
 pub mod syzygy;
 pub mod time;
 pub mod tt;
-use self::syzygy::SyzygyTB;
+use self::syzygy::{SyzygyTB, TbWdl};
 use self::time::TimeManager;
 
 // =============================================================================
@@ -489,6 +489,20 @@ impl Searcher {
 
                             // Initialize NNUE accumulator at root (ply 0)
                             worker.nnue_refresh(0);
+
+                            // --- Root Syzygy TB probe ---
+                            // If position is in TB range, play the best DTZ move immediately
+                            if is_main {
+                                if let Some((tb_move, tb_score)) = worker.probe_root_tb() {
+                                    let _ = tx_clone.as_ref().unwrap().send(format!(
+                                        "info depth 1 score cp {} nodes 0 nps 0 tbhits {} pv {}",
+                                        tb_score, worker.tb_hits, tb_move
+                                    ));
+                                    let _ = tx_clone.unwrap().send(format!("bestmove {}", tb_move));
+                                    worker.stop_flag.store(true, Ordering::Relaxed);
+                                    return;
+                                }
+                            }
 
                             // Wire time manager for in-search abort checks
                             let depth_only = max_depth > 0 && wtime == 0 && btime == 0;
@@ -855,6 +869,61 @@ impl SearchWorker {
         if let Some((ref pol_vec, value)) = *shared {
             self.cached_root_policy = Some(pol_vec.clone());
             self.cached_root_value = value;
+        }
+    }
+
+    // =========================================================================
+    // ROOT SYZYGY TB PROBE — find best move by WDL then DTZ at root.
+    // =========================================================================
+    fn probe_root_tb(&mut self) -> Option<(ChessMove, i32)> {
+        let tb = self.syzygy.as_ref()?;
+        if !tb.can_probe(&self.board) {
+            return None;
+        }
+
+        let mut best_move: Option<ChessMove> = None;
+        let mut best_rank: i32 = -1;
+        let mut best_dtz_key: i32 = i32::MIN;
+
+        let moves = MoveGen::new_legal(&self.board);
+        for mv in moves {
+            let new_board = self.board.make_move_new(mv);
+            // Probe WDL from opponent's perspective, negate to get ours
+            let child_wdl = match tb.probe_wdl(&new_board) {
+                Some(w) => w,
+                None => continue,
+            };
+            let our_wdl = child_wdl.negate();
+            let rank = our_wdl.rank();
+
+            // DTZ for tiebreaking within same WDL
+            let child_dtz = tb.probe_dtz(&new_board).map(|r| r.dtz).unwrap_or(0);
+            let dtz_key = match our_wdl {
+                TbWdl::Win | TbWdl::CursedWin => -child_dtz.abs(), // prefer faster win
+                TbWdl::Loss | TbWdl::BlessedLoss => child_dtz.abs(), // prefer slower loss
+                TbWdl::Draw => 0,
+            };
+
+            if rank > best_rank || (rank == best_rank && dtz_key > best_dtz_key) {
+                best_move = Some(mv);
+                best_rank = rank;
+                best_dtz_key = dtz_key;
+            }
+        }
+
+        if let Some(mv) = best_move {
+            self.tb_hits += 1;
+            let wdl = match best_rank {
+                4 => TbWdl::Win,
+                3 => TbWdl::CursedWin,
+                2 => TbWdl::Draw,
+                1 => TbWdl::BlessedLoss,
+                _ => TbWdl::Loss,
+            };
+            let score = syzygy::wdl_to_score(wdl, 0);
+            Some((mv, score))
+        } else {
+            None
         }
     }
 

@@ -34,6 +34,32 @@ pub struct TbResult {
     pub dtz: i32,
 }
 
+impl TbWdl {
+    /// Rank for comparison: higher is better for the side to move.
+    #[inline]
+    pub fn rank(self) -> i32 {
+        match self {
+            TbWdl::Win => 4,
+            TbWdl::CursedWin => 3,
+            TbWdl::Draw => 2,
+            TbWdl::BlessedLoss => 1,
+            TbWdl::Loss => 0,
+        }
+    }
+
+    /// Negate WDL (swap perspective: Win↔Loss, CursedWin↔BlessedLoss).
+    #[inline]
+    pub fn negate(self) -> TbWdl {
+        match self {
+            TbWdl::Win => TbWdl::Loss,
+            TbWdl::CursedWin => TbWdl::BlessedLoss,
+            TbWdl::Draw => TbWdl::Draw,
+            TbWdl::BlessedLoss => TbWdl::CursedWin,
+            TbWdl::Loss => TbWdl::Win,
+        }
+    }
+}
+
 impl SyzygyTB {
     /// Create a new Syzygy tablebase instance and load tables from a directory.
     pub fn new<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
