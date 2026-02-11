@@ -118,9 +118,10 @@ TRAIN_BIN="target/release/train"
 if [ ! -f "$TRAIN_BIN" ]; then
     echo "Building trainer..."
     if grep -q 'cuda' Cargo.toml && command -v nvidia-smi &> /dev/null; then
-        cargo build --release --features cuda 2>&1 | tail -3
+        # cpu and cuda are mutually exclusive in Bullet — must disable default (cpu) first
+        cargo build --release --no-default-features --features cuda 2>&1 | tail -5
     else
-        cargo build --release 2>&1 | tail -3
+        cargo build --release 2>&1 | tail -5
     fi
 fi
 

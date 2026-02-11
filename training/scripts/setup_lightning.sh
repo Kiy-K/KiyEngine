@@ -98,11 +98,12 @@ echo "[6/7] Building KiyEngine NNUE trainer with CUDA backend..."
 cd "$TRAINING_DIR"
 
 # Check if Cargo.toml has cuda feature, if not, we'll use CPU with threads
-if grep -q 'cuda' Cargo.toml 2>/dev/null; then
-    echo "  Building with --features cuda..."
-    cargo build --release --features cuda 2>&1 | tail -5
+# NOTE: cpu and cuda are mutually exclusive in Bullet — must disable default (cpu) first
+if grep -q 'cuda' Cargo.toml 2>/dev/null && command -v nvidia-smi &> /dev/null; then
+    echo "  Building with CUDA backend..."
+    cargo build --release --no-default-features --features cuda 2>&1 | tail -5
 else
-    echo "  No cuda feature in Cargo.toml. Building CPU backend..."
+    echo "  Building with CPU backend..."
     cargo build --release 2>&1 | tail -5
 fi
 
