@@ -69,6 +69,21 @@ pub const DEFAULT_NNUE_PATH: &str = "kiyengine.nnue";
 // NETWORK
 // ============================================================================
 
+/// Horizontal sum of 8 × i32 lanes in an __m256i → scalar i32.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum_i32_avx2(v: __m256i) -> i32 {
+    let hi128 = _mm256_extracti128_si256(v, 1);
+    let lo128 = _mm256_castsi256_si128(v);
+    let sum128 = _mm_add_epi32(lo128, hi128);
+    let hi64 = _mm_shuffle_epi32(sum128, 0b_01_00_11_10);
+    let sum64 = _mm_add_epi32(sum128, hi64);
+    let hi32 = _mm_shuffle_epi32(sum64, 0b_00_00_00_01);
+    let total = _mm_add_epi32(sum64, hi32);
+    _mm_cvtsi128_si32(total)
+}
+
 /// NNUE network weights (quantized, loaded from binary file).
 ///
 /// v5 (deep): FT → SCReLU → L1(shared) → CReLU → L2(per-bucket) → select
@@ -148,6 +163,12 @@ impl NnueNetwork {
         };
 
         if self.has_deep_layers() {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx2") {
+                    return unsafe { self.evaluate_deep_avx2(us, them, bucket) };
+                }
+            }
             return self.evaluate_deep_scalar(us, them, bucket);
         }
 
@@ -215,6 +236,142 @@ impl NnueNetwork {
         }
 
         // Step 4: Dequant — output is in QA*QB scale
+        let result = output * SCALE as i64 / (qa as i64 * QB as i64);
+        result as i32
+    }
+
+    /// AVX2-optimized deep network evaluate (v5).
+    ///
+    /// Strategy (Stockfish-inspired):
+    /// 1. Pre-compute SCReLU into i16 buffer: clamp(v,0,QA)²/QA → [0,255]
+    ///    Uses exact integer division: (v² * 257 + 256) >> 16
+    /// 2. L1 matmul: madd_epi16(screlu_i16, widen(l1_weight_i8)) → i32, 4 outputs at a time
+    /// 3. CReLU + L2 scalar (only 16 values, not worth SIMD)
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn evaluate_deep_avx2(&self, us: &[i16], them: &[i16], bucket: usize) -> i32 {
+        let hs = self.hidden_size;
+        let l1s = self.l1_size;
+        let in_size = 2 * hs;
+
+        let zero = _mm256_setzero_si256();
+        let qa_vec = _mm256_set1_epi16(QA);
+        let one16 = _mm256_set1_epi16(1);
+
+        // ── Step 1: Pre-compute SCReLU into aligned i16 buffer ──
+        // SCReLU(v) = clamp(v,0,QA)²/QA → [0,255]
+        //
+        // All-i16 "div-255" trick (avoids expensive i32 widening):
+        //   v_sq = mullo_epi16(v, v)           — u16 bit pattern, no overflow (255²=65025<65536)
+        //   result = (v_sq + (v_sq >> 8) + 1) >> 8  — exact truncated division by 255
+        #[repr(align(64))]
+        struct AlignedBuf([i16; 1024]);
+        let mut screlu_buf = AlignedBuf([0i16; 1024]);
+
+        // Process "us" perspective
+        let mut i = 0;
+        while i < hs {
+            let v = _mm256_load_si256(us.as_ptr().add(i) as *const __m256i);
+            let clamped = _mm256_min_epi16(_mm256_max_epi16(v, zero), qa_vec);
+            let v_sq = _mm256_mullo_epi16(clamped, clamped);
+            let v_sq_hi = _mm256_srli_epi16(v_sq, 8);
+            let temp = _mm256_add_epi16(_mm256_add_epi16(v_sq, v_sq_hi), one16);
+            let result = _mm256_srli_epi16(temp, 8);
+            _mm256_store_si256(screlu_buf.0.as_mut_ptr().add(i) as *mut __m256i, result);
+            i += 16;
+        }
+
+        // Process "them" perspective
+        i = 0;
+        while i < hs {
+            let v = _mm256_load_si256(them.as_ptr().add(i) as *const __m256i);
+            let clamped = _mm256_min_epi16(_mm256_max_epi16(v, zero), qa_vec);
+            let v_sq = _mm256_mullo_epi16(clamped, clamped);
+            let v_sq_hi = _mm256_srli_epi16(v_sq, 8);
+            let temp = _mm256_add_epi16(_mm256_add_epi16(v_sq, v_sq_hi), one16);
+            let result = _mm256_srli_epi16(temp, 8);
+            _mm256_store_si256(screlu_buf.0.as_mut_ptr().add(hs + i) as *mut __m256i, result);
+            i += 16;
+        }
+
+        // ── Step 2: L1 matmul — 4 outputs at a time, reuse SCReLU buffer ──
+        // madd_epi16(screlu_i16, widen(w_i8)) → i32 dot product
+        // Max per pair: 255*128 + 255*128 = 65280, fits i32
+        // Over 512 pairs (1024 inputs): 512 * 65280 = 33.4M, fits i32 ✓
+        let mut l1_out = [0i32; 64];
+
+        let mut j = 0;
+        while j + 4 <= l1s {
+            let mut sum0 = _mm256_setzero_si256();
+            let mut sum1 = _mm256_setzero_si256();
+            let mut sum2 = _mm256_setzero_si256();
+            let mut sum3 = _mm256_setzero_si256();
+
+            let mut k = 0;
+            while k < in_size {
+                let s = _mm256_load_si256(screlu_buf.0.as_ptr().add(k) as *const __m256i);
+
+                let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                    self.l1_weights.as_ptr().add((j + 0) * in_size + k) as *const __m128i,
+                ));
+                let w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                    self.l1_weights.as_ptr().add((j + 1) * in_size + k) as *const __m128i,
+                ));
+                let w2 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                    self.l1_weights.as_ptr().add((j + 2) * in_size + k) as *const __m128i,
+                ));
+                let w3 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                    self.l1_weights.as_ptr().add((j + 3) * in_size + k) as *const __m128i,
+                ));
+
+                sum0 = _mm256_add_epi32(sum0, _mm256_madd_epi16(s, w0));
+                sum1 = _mm256_add_epi32(sum1, _mm256_madd_epi16(s, w1));
+                sum2 = _mm256_add_epi32(sum2, _mm256_madd_epi16(s, w2));
+                sum3 = _mm256_add_epi32(sum3, _mm256_madd_epi16(s, w3));
+
+                k += 16;
+            }
+
+            // Horizontal sum each __m256i → scalar i32
+            l1_out[j + 0] = hsum_i32_avx2(sum0) + self.l1_biases[j + 0];
+            l1_out[j + 1] = hsum_i32_avx2(sum1) + self.l1_biases[j + 1];
+            l1_out[j + 2] = hsum_i32_avx2(sum2) + self.l1_biases[j + 2];
+            l1_out[j + 3] = hsum_i32_avx2(sum3) + self.l1_biases[j + 3];
+
+            j += 4;
+        }
+
+        // Handle remaining outputs (l1_size not divisible by 4)
+        while j < l1s {
+            let mut sum = _mm256_setzero_si256();
+            let mut k = 0;
+            while k < in_size {
+                let s = _mm256_load_si256(screlu_buf.0.as_ptr().add(k) as *const __m256i);
+                let w = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                    self.l1_weights.as_ptr().add(j * in_size + k) as *const __m128i,
+                ));
+                sum = _mm256_add_epi32(sum, _mm256_madd_epi16(s, w));
+                k += 16;
+            }
+            l1_out[j] = hsum_i32_avx2(sum) + self.l1_biases[j];
+            j += 1;
+        }
+
+        // ── Step 3: CReLU (scalar — only 16 values) ──
+        let qa = QA as i32;
+        let mut crelu = [0i32; 64];
+        for idx in 0..l1s {
+            crelu[idx] = (l1_out[idx] / Q1).clamp(0, qa);
+        }
+
+        // ── Step 4: L2 per-bucket output (scalar — only 16 values) ──
+        let l2_w_base = bucket * l1s;
+        let mut output = self.l2_biases[bucket] as i64;
+        for idx in 0..l1s {
+            output += crelu[idx] as i64 * self.l2_weights[l2_w_base + idx] as i64;
+        }
+
+        // ── Step 5: Dequant ──
         let result = output * SCALE as i64 / (qa as i64 * QB as i64);
         result as i32
     }
@@ -297,16 +454,9 @@ impl NnueNetwork {
             i += 16;
         }
 
-        // Horizontal sum: sum0 + sum1 → 8 x i32 → scalar
+        // Horizontal sum: sum0 + sum1 → scalar
         let combined = _mm256_add_epi32(sum0, sum1);
-        let hi128 = _mm256_extracti128_si256(combined, 1);
-        let lo128 = _mm256_castsi256_si128(combined);
-        let sum128 = _mm_add_epi32(lo128, hi128);
-        let hi64 = _mm_shuffle_epi32(sum128, 0b_01_00_11_10);
-        let sum64 = _mm_add_epi32(sum128, hi64);
-        let hi32 = _mm_shuffle_epi32(sum64, 0b_00_00_00_01);
-        let total = _mm_add_epi32(sum64, hi32);
-        let dot = _mm_cvtsi128_si32(total) as i64;
+        let dot = hsum_i32_avx2(combined) as i64;
 
         // Bullet dequantization: (sum/QA + bias) * SCALE / (QA * QB)
         let qa = QA as i64;
