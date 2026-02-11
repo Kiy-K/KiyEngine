@@ -3,15 +3,12 @@
 use crate::book::OpeningBook;
 use crate::engine::{Engine, KVCache};
 use crate::search::{Searcher, TranspositionTable};
+use crate::search::syzygy::SyzygyTB;
 use chess::{Board, ChessMove, MoveGen, Square};
 use std::io::{self, BufRead};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-
-pub mod mcts_handler;
-
-pub use mcts_handler::MCTSUciHandler;
 
 pub struct MoveCodec;
 
@@ -236,6 +233,7 @@ impl UciHandler {
                 println!("option name UCI_ShowWDL type check default false");
                 println!("option name UCI_Ponder type check default false");
                 println!("option name Clear Hash type button");
+                println!("option name SyzygyPath type string default <empty>");
                 println!("uciok");
             }
             Some("debug") => {
@@ -344,6 +342,19 @@ impl UciHandler {
             }
             "uci_ponder" => {
                 self.ponder_mode = value == "true";
+            }
+            "syzygypath" => {
+                if !value.is_empty() && value != "<empty>" {
+                    match SyzygyTB::new(&value) {
+                        Ok(tb) => {
+                            println!("info string Syzygy TB loaded: {} (max {} pieces)", value, tb.max_pieces());
+                            self.searcher.syzygy = Some(std::sync::Arc::new(tb));
+                        }
+                        Err(e) => {
+                            eprintln!("info string Syzygy TB load failed: {}", e);
+                        }
+                    }
+                }
             }
             _ => {}
         }

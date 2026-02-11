@@ -58,12 +58,17 @@ fn main() {
 
     // Build the network: (768 → 512)×2 → SCReLU → 8 output buckets
     // Output bucket selected by MaterialCount (total pieces → bucket index)
-    let mut trainer = ValueTrainerBuilder::default()
+    let mut builder = ValueTrainerBuilder::default()
         .dual_perspective()
         .optimiser(AdamW)
         .inputs(Chess768)
-        .output_buckets(MaterialCount::<NUM_OUTPUT_BUCKETS>)
-        .use_threads(4)
+        .output_buckets(MaterialCount::<NUM_OUTPUT_BUCKETS>);
+
+    // CPU backend needs explicit thread count; GPU backend handles parallelism
+    #[cfg(not(feature = "cuda"))]
+    { builder = builder.use_threads(4); }
+
+    let mut trainer = builder
         .save_format(&[
             SavedFormat::id("l0w").round().quantise::<i16>(255),
             SavedFormat::id("l0b").round().quantise::<i16>(255),

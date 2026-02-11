@@ -7,8 +7,8 @@
 //! Usage: cargo run --release --bin selfplay -- --games 500 --depth 4 --output train_nnue/data/rl.bin
 
 use chess::{Board, BoardStatus, Color, MoveGen};
-use kiy_engine_v5_alpha::nnue::NnueNetwork;
-use kiy_engine_v5_alpha::search::{SearchWorker, TranspositionTable};
+use kiy_engine::nnue::NnueNetwork;
+use kiy_engine::search::{SearchWorker, TranspositionTable};
 use std::io::{BufWriter, Write};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -123,6 +123,7 @@ fn main() -> anyhow::Result<()> {
                 board,
                 Arc::clone(&stop_flag),
                 Some(Arc::clone(&nnue)),
+                None, // No Syzygy TB for selfplay
             );
             worker.nnue_refresh(0);
 

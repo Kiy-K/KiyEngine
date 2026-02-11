@@ -234,8 +234,10 @@ impl TranspositionTable {
 // Module eval local (fallback)
 pub mod eval;
 pub mod lazy_smp;
+pub mod syzygy;
 pub mod time;
 pub mod tt;
+use self::syzygy::SyzygyTB;
 use self::time::TimeManager;
 
 // =============================================================================
@@ -248,6 +250,7 @@ pub struct Searcher {
     pub threads: usize,
     pub move_overhead: u32,
     pub nnue: Option<Arc<NnueNetwork>>,
+    pub syzygy: Option<Arc<SyzygyTB>>,
 }
 
 impl Searcher {
@@ -258,6 +261,7 @@ impl Searcher {
             threads: 4,
             move_overhead: 60, // Default 60ms overhead
             nnue: None,
+            syzygy: None,
         }
     }
 
@@ -282,6 +286,7 @@ impl Searcher {
         let move_overhead = self.move_overhead;
         let is_white = board.side_to_move() == Color::White;
         let nnue = self.nnue.clone();
+        let syzygy = self.syzygy.clone();
 
         let ply = move_history.len() as u32;
         let pos_hist = Arc::new(position_history);
@@ -351,6 +356,7 @@ impl Searcher {
                 let is_main = i == 0;
                 let policy_clone = Arc::clone(&shared_policy);
                 let nnue_clone = nnue.clone();
+                let syzygy_clone = syzygy.clone();
                 let pos_hist_clone = Arc::clone(&pos_hist);
 
                 handles.push(
@@ -358,7 +364,7 @@ impl Searcher {
                         .stack_size(64 * 1024 * 1024) // 64MB stack for deep recursion
                         .spawn(move || {
                             let mut worker =
-                                SearchWorker::new(tt_clone, board_clone, stop_clone, nnue_clone);
+                                SearchWorker::new(tt_clone, board_clone, stop_clone, nnue_clone, syzygy_clone);
                             worker.set_game_history((*pos_hist_clone).clone());
                             let mut best_move = None;
                             let mut last_score = 0;
@@ -492,9 +498,14 @@ impl Searcher {
                                                     parts.join(" ")
                                                 }
                                             };
+                                            let tb_str = if worker.tb_hits > 0 {
+                                                format!(" tbhits {}", worker.tb_hits)
+                                            } else {
+                                                String::new()
+                                            };
                                             println!(
-                                                "info depth {} score cp {} nodes {} nps {} pv {}",
-                                                depth, score, worker.nodes, nps, pv_str
+                                                "info depth {} score cp {} nodes {} nps {}{} pv {}",
+                                                depth, score, worker.nodes, nps, tb_str, pv_str
                                             );
                                         }
                                         break;
@@ -580,6 +591,10 @@ pub struct SearchWorker {
     // Triangular PV table: pv_table[ply][i] = i-th move in the PV starting at ply
     pv_table: Box<[[Option<ChessMove>; MAX_PLY]; MAX_PLY]>,
     pv_len: [usize; MAX_PLY],
+    // Syzygy tablebase (optional)
+    syzygy: Option<Arc<SyzygyTB>>,
+    // TB hit counter
+    pub tb_hits: u64,
 }
 
 impl SearchWorker {
@@ -588,6 +603,7 @@ impl SearchWorker {
         board: Board,
         stop_flag: Arc<AtomicBool>,
         nnue: Option<Arc<NnueNetwork>>,
+        syzygy: Option<Arc<SyzygyTB>>,
     ) -> Self {
         let nnue_acc = if let Some(ref net) = nnue {
             (0..MAX_PLY)
@@ -622,6 +638,8 @@ impl SearchWorker {
             search_path_len: 0,
             pv_table: Box::new([[None; MAX_PLY]; MAX_PLY]),
             pv_len: [0; MAX_PLY],
+            syzygy,
+            tb_hits: 0,
         }
     }
 
@@ -1111,6 +1129,21 @@ impl SearchWorker {
             return (0, None); // Draw by repetition
         }
 
+        // --- Step 1c: Syzygy tablebase probe ---
+        // At non-root nodes, if piece count is within TB range, get exact WDL score.
+        // At root, we still search to find the best move but use TB to bound scores.
+        if !is_root {
+            if let Some(ref tb) = self.syzygy {
+                if tb.can_probe(&self.board) {
+                    if let Some(wdl) = tb.probe_wdl(&self.board) {
+                        self.tb_hits += 1;
+                        let tb_score = syzygy::wdl_to_score(wdl, ply);
+                        return (tb_score, None);
+                    }
+                }
+            }
+        }
+
         // --- Step 2: Check extension ---
         let in_check = self.board.checkers().0 != 0;
         if in_check && depth < MAX_PLY as u8 {
@@ -1474,11 +1507,26 @@ impl SearchWorker {
             }
 
             // Passed pawn push extension: pawn pushed to 6th or 7th rank
+            // In endgame (≤12 pieces), extend more aggressively to see promotions
             if ext == 0 && moved_piece == Piece::Pawn {
                 let rank = mv.get_dest().to_index() / 8;
-                if (moved_color == Color::White && rank >= 5)
-                    || (moved_color == Color::Black && rank <= 2)
-                {
+                let piece_count = self.board.combined().0.count_ones();
+                let is_endgame = piece_count <= 12;
+
+                let is_7th = (moved_color == Color::White && rank == 6)
+                    || (moved_color == Color::Black && rank == 1);
+                let is_6th = (moved_color == Color::White && rank == 5)
+                    || (moved_color == Color::Black && rank == 2);
+                let is_5th = (moved_color == Color::White && rank == 4)
+                    || (moved_color == Color::Black && rank == 3);
+
+                if is_7th {
+                    // 7th rank push: extend by 2 in endgame, 1 otherwise
+                    ext = if is_endgame { 2 } else { 1 };
+                } else if is_6th {
+                    ext = 1;
+                } else if is_5th && is_endgame {
+                    // 5th rank push in endgame: extend by 1 to help see promotion plans
                     ext = 1;
                 }
             }
