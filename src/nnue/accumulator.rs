@@ -58,8 +58,7 @@ impl Accumulator {
 
     /// Full refresh: compute accumulator from scratch by scanning the board.
     ///
-    /// acc[i] = bias[i] + sum(ft_weights[active_feature][i]) for all active features
-    /// Also computes PSQT shortcut scores if the network has PSQT weights.
+    /// Automatically uses king-bucketed features if the network has input buckets > 1.
     pub fn refresh(&mut self, board: &Board, net: &NnueNetwork) {
         let hs = net.hidden_size;
         let nb = net.num_buckets;
@@ -75,8 +74,12 @@ impl Accumulator {
             self.psqt_black[..nb].fill(0);
         }
 
-        // Extract active features
-        let (white_feats, black_feats, count) = features::extract_features(board);
+        // Extract active features (king-bucketed or legacy)
+        let (white_feats, black_feats, count) = if net.has_king_buckets() {
+            features::extract_features_bucketed(board)
+        } else {
+            features::extract_features(board)
+        };
 
         // Add each active feature's column to the accumulator
         for idx in 0..count {
@@ -214,6 +217,10 @@ impl AccumulatorStack {
     /// Incrementally update accumulator at child_ply from parent_ply using delta.
     /// Falls back to full refresh if delta is None.
     ///
+    /// For king-bucketed networks: if the king moved for a perspective, that
+    /// perspective's accumulator is fully refreshed (bucket changed), while the
+    /// other perspective is incrementally updated.
+    ///
     /// Uses split_at_mut for zero-copy parent→child update (no Vec clone).
     pub fn update_or_refresh(
         &mut self,
@@ -225,7 +232,18 @@ impl AccumulatorStack {
     ) {
         if let Some(d) = delta {
             if parent_ply < child_ply && self.stack[parent_ply].computed {
-                // Zero-copy split borrow: parent immutable, child mutable
+                let king_bucketed = net.has_king_buckets();
+                let need_white_refresh = king_bucketed && d.white_king_moved;
+                let need_black_refresh = king_bucketed && d.black_king_moved;
+
+                if need_white_refresh || need_black_refresh {
+                    // King moved in a king-bucketed network: full refresh
+                    // (king bucket changed, ALL features must be recomputed for that perspective)
+                    self.stack[child_ply].refresh(board, net);
+                    return;
+                }
+
+                // Normal incremental update (no king move or non-bucketed network)
                 let (left, right) = self.stack.split_at_mut(child_ply);
                 let parent = &left[parent_ply];
                 let child = &mut right[0];

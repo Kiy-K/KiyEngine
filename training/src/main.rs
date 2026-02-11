@@ -1,15 +1,28 @@
-//! KiyEngine NNUE Trainer
+//! KiyEngine NNUE Trainer — Stockfish-style Architecture
 //!
-//! Architecture: (768 → 512)×2 → SCReLU → 1 (with material output buckets)
+//! Architecture: (HalfKAv2_hm → 512)×2 → SCReLU → 8 output buckets
+//!
+//! Key improvements over basic Chess768:
+//! - King-bucketed inputs (ChessBucketsMirrored): 10 king buckets with horizontal mirroring
+//!   so the network learns different piece values depending on king position.
+//! - Input factoriser: shared 768→HIDDEN weights added to each bucket's weights,
+//!   enabling generalisation across king positions while still specialising.
+//! - MaterialCount output buckets: 8 buckets for different material phases.
+//!
 //! Framework: Bullet (https://github.com/jw1912/bullet)
-//! Data: Lichess broadcast games converted to bulletformat
 //!
 //! Usage:
 //!   cargo run --release -- --data <path_to_data> [--test <path_to_test>]
 
 use bullet_lib::{
-    game::{inputs::Chess768, outputs::MaterialCount},
-    nn::optimiser::AdamW,
+    game::{
+        inputs::{ChessBucketsMirrored, get_num_buckets},
+        outputs::MaterialCount,
+    },
+    nn::{
+        InitSettings, Shape,
+        optimiser::{AdamW, AdamWParams},
+    },
     trainer::{
         save::SavedFormat,
         schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
@@ -20,6 +33,29 @@ use bullet_lib::{
 
 const HIDDEN_SIZE: usize = 512;
 const NUM_OUTPUT_BUCKETS: usize = 8;
+
+/// King bucket layout: maps 32 half-board squares (horizontally mirrored) to 10 buckets.
+/// Mirroring: if king is on files e-h (file >= 4), the entire board is horizontally mirrored,
+/// so we only need the left half (files a-d, 32 squares). Squares are indexed:
+///   rank 1: 0-3, rank 2: 4-7, ..., rank 8: 28-31
+///
+/// Layout rationale (following Stockfish conventions):
+///   - Rank 1 corners are distinct (castling rights matter)
+///   - Central ranks are grouped (king in centre behaves similarly)
+///   - Upper ranks grouped (king rarely there in middlegame)
+#[rustfmt::skip]
+const BUCKET_LAYOUT: [usize; 32] = [
+    0, 1, 2, 3,
+    4, 4, 5, 5,
+    6, 6, 6, 6,
+    7, 7, 7, 7,
+    8, 8, 8, 8,
+    8, 8, 8, 8,
+    9, 9, 9, 9,
+    9, 9, 9, 9,
+];
+
+const NUM_INPUT_BUCKETS: usize = get_num_buckets(&BUCKET_LAYOUT);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -47,8 +83,9 @@ fn main() {
         }
     }
 
-    println!("=== KiyEngine NNUE Trainer ===");
-    println!("Architecture: (768 → {})×2 → SCReLU → {} output buckets", HIDDEN_SIZE, NUM_OUTPUT_BUCKETS);
+    println!("=== KiyEngine NNUE Trainer (Stockfish-style Architecture) ===");
+    println!("Architecture: (HalfKAv2_hm[{}kb] → {})×2 → SCReLU → {} output buckets",
+             NUM_INPUT_BUCKETS, HIDDEN_SIZE, NUM_OUTPUT_BUCKETS);
     println!("Data:         {}", data_path);
     println!("Net ID:       {}", net_id);
     println!("Epochs:       {}", epochs);
@@ -56,12 +93,11 @@ fn main() {
     println!("Batch size:   {}", batch_size);
     println!();
 
-    // Build the network: (768 → 512)×2 → SCReLU → 8 output buckets
-    // Output bucket selected by MaterialCount (total pieces → bucket index)
+    // Build the network with king-bucketed inputs + factoriser
     let mut builder = ValueTrainerBuilder::default()
         .dual_perspective()
         .optimiser(AdamW)
-        .inputs(Chess768)
+        .inputs(ChessBucketsMirrored::new(BUCKET_LAYOUT))
         .output_buckets(MaterialCount::<NUM_OUTPUT_BUCKETS>);
 
     // CPU backend needs explicit thread count; GPU backend handles parallelism
@@ -70,7 +106,16 @@ fn main() {
 
     let mut trainer = builder
         .save_format(&[
-            SavedFormat::id("l0w").round().quantise::<i16>(255),
+            // Merge factoriser weights into l0w before quantisation:
+            // This produces a single (NUM_INPUT_BUCKETS * 768, HIDDEN_SIZE) weight matrix
+            // where each bucket's 768 rows include the shared factoriser contribution.
+            SavedFormat::id("l0w")
+                .transform(|store, weights| {
+                    let factoriser = store.get("l0f").values.repeat(NUM_INPUT_BUCKETS);
+                    weights.into_iter().zip(factoriser).map(|(a, b)| a + b).collect()
+                })
+                .round()
+                .quantise::<i16>(255),
             SavedFormat::id("l0b").round().quantise::<i16>(255),
             // Transpose l1w for fast CPU inference (row-major per bucket)
             SavedFormat::id("l1w").round().quantise::<i16>(64).transpose(),
@@ -78,14 +123,29 @@ fn main() {
         ])
         .loss_fn(|output, target| output.sigmoid().squared_error(target))
         .build(|builder, stm_inputs, ntm_inputs, output_buckets| {
-            let l0 = builder.new_affine("l0", 768, HIDDEN_SIZE);
+            // Input factoriser: shared 768→HIDDEN weights added to every bucket.
+            // This helps the network generalise across king positions (Bullet convention).
+            let l0f = builder.new_weights("l0f", Shape::new(HIDDEN_SIZE, 768), InitSettings::Zeroed);
+            let expanded_factoriser = l0f.repeat(NUM_INPUT_BUCKETS);
+
+            // Feature transformer: (NUM_INPUT_BUCKETS * 768) → HIDDEN per perspective
+            let mut l0 = builder.new_affine("l0", 768 * NUM_INPUT_BUCKETS, HIDDEN_SIZE);
+            l0.weights = l0.weights + expanded_factoriser;
+
+            // Output layer: 2*HIDDEN → NUM_OUTPUT_BUCKETS
             let l1 = builder.new_affine("l1", 2 * HIDDEN_SIZE, NUM_OUTPUT_BUCKETS);
 
+            // Inference: dual perspective with SCReLU activation
             let stm_hidden = l0.forward(stm_inputs).screlu();
             let ntm_hidden = l0.forward(ntm_inputs).screlu();
             let hidden_layer = stm_hidden.concat(ntm_hidden);
             l1.forward(hidden_layer).select(output_buckets)
         });
+
+    // Stricter weight clipping for factorised inputs (prevents overflow in i16)
+    let stricter_clipping = AdamWParams { max_weight: 0.99, min_weight: -0.99, ..Default::default() };
+    trainer.optimiser.set_params_for_weight("l0w", stricter_clipping);
+    trainer.optimiser.set_params_for_weight("l0f", stricter_clipping);
 
     // Training schedule
     let final_lr = start_lr * 0.3f32.powi(5);
@@ -118,5 +178,5 @@ fn main() {
 
     println!("\n=== Training complete! ===");
     println!("Checkpoints saved to: checkpoints/");
-    println!("To use in KiyEngine, copy the quantized .bin file to the engine directory as kiyengine.nnue");
+    println!("Convert with: python3 scripts/convert_to_kynn.py checkpoints/<best>/quantised.bin");
 }

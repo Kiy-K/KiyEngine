@@ -46,10 +46,11 @@ pub const SCALE: i32 = 400;
 /// Magic bytes for NNUE binary file format
 pub const NNUE_MAGIC: &[u8; 4] = b"KYNN";
 
-/// Current NNUE format version (v3: output buckets + PSQT shortcut)
-pub const NNUE_VERSION: u32 = 3;
-/// Also accept v2 files (single bucket, no PSQT)
+/// Current NNUE format version (v4: king-bucketed inputs + output buckets)
+pub const NNUE_VERSION: u32 = 4;
+/// Also accept v2/v3 files for backward compatibility
 const NNUE_VERSION_V2: u32 = 2;
+const NNUE_VERSION_V3: u32 = 3;
 
 /// Number of output buckets (piece-count based)
 pub const NUM_BUCKETS: usize = 8;
@@ -63,12 +64,16 @@ pub const DEFAULT_NNUE_PATH: &str = "kiyengine.nnue";
 
 /// NNUE network weights (quantized, loaded from binary file).
 ///
-/// Architecture: (768 → hidden_size)×2 → SCReLU → 2*hidden_size → 1
-/// With output buckets: each bucket has its own output weights and bias.
-/// Bucket selected by: (total_pieces - 2) / 4
+/// Architecture: (HalfKAv2 → hidden_size)×2 → SCReLU → 2*hidden_size → num_output_buckets
+///
+/// v4 (king-bucketed): feature transformer is (num_input_buckets * 768) × hidden_size
+/// v2/v3 (legacy): feature transformer is 768 × hidden_size (no king buckets)
+///
+/// Output bucket selected by: (total_pieces - 2) / 4
 pub struct NnueNetwork {
-    /// Feature transformer weights: [NUM_FEATURES * hidden_size] (i16, row-major)
+    /// Feature transformer weights: [num_input_buckets * 768 * hidden_size] (i16, row-major)
     /// ft_weights[feature * hidden_size + i] = weight for feature → neuron i
+    /// For king-bucketed: feature = king_bucket * 768 + base_feature
     pub ft_weights: Vec<i16>,
 
     /// Feature transformer biases: [hidden_size] (i16)
@@ -81,9 +86,7 @@ pub struct NnueNetwork {
     /// Output layer bias per bucket: [num_buckets] (i16)
     pub output_biases: Vec<i16>,
 
-    /// PSQT weights from feature transformer: [NUM_FEATURES * num_buckets] (i16)
-    /// psqt_weights[feature * num_buckets + bucket]
-    /// Empty if no PSQT shortcut.
+    /// PSQT weights (legacy v3 only, empty for v4)
     pub psqt_weights: Vec<i16>,
 
     /// Hidden layer size (typically 256 or 512)
@@ -91,6 +94,9 @@ pub struct NnueNetwork {
 
     /// Number of output buckets (1 = legacy, 8 = standard)
     pub num_buckets: usize,
+
+    /// Number of input (king) buckets (1 = legacy Chess768, 10 = HalfKAv2_hm)
+    pub num_input_buckets: usize,
 }
 
 impl NnueNetwork {
@@ -272,11 +278,12 @@ impl NnueNetwork {
         let mut buf4 = [0u8; 4];
         cursor.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != NNUE_VERSION && version != NNUE_VERSION_V2 {
+        if version != NNUE_VERSION && version != NNUE_VERSION_V3 && version != NNUE_VERSION_V2 {
             anyhow::bail!(
-                "Unsupported NNUE version: {} (expected {} or {})",
+                "Unsupported NNUE version: {} (expected {}, {}, or {})",
                 version,
                 NNUE_VERSION_V2,
+                NNUE_VERSION_V3,
                 NNUE_VERSION
             );
         }
@@ -295,7 +302,7 @@ impl NnueNetwork {
         }
 
         if version == NNUE_VERSION_V2 {
-            // --- V2: single bucket, no PSQT ---
+            // --- V2: single bucket, no PSQT, no king buckets ---
             let ft_count = NUM_FEATURES * hidden_size;
             let ft_weights = read_i16_vec(&mut cursor, ft_count)?;
             let ft_biases = read_i16_vec(&mut cursor, hidden_size)?;
@@ -320,9 +327,10 @@ impl NnueNetwork {
                 psqt_weights: Vec::new(),
                 hidden_size,
                 num_buckets: 1,
+                num_input_buckets: 1,
             })
-        } else {
-            // --- V3: output buckets + optional PSQT ---
+        } else if version == NNUE_VERSION_V3 {
+            // --- V3: output buckets + optional PSQT, no king buckets ---
             cursor.read_exact(&mut buf4)?;
             let num_buckets = u32::from_le_bytes(buf4) as usize;
 
@@ -359,6 +367,46 @@ impl NnueNetwork {
                 psqt_weights,
                 hidden_size,
                 num_buckets,
+                num_input_buckets: 1,
+            })
+        } else {
+            // --- V4: king-bucketed inputs + output buckets ---
+            cursor.read_exact(&mut buf4)?;
+            let num_buckets = u32::from_le_bytes(buf4) as usize;
+
+            cursor.read_exact(&mut buf4)?;
+            let num_input_buckets = u32::from_le_bytes(buf4) as usize;
+
+            let ft_count = num_input_buckets * NUM_FEATURES * hidden_size;
+            let ft_weights = read_i16_vec(&mut cursor, ft_count)?;
+            let ft_biases = read_i16_vec(&mut cursor, hidden_size)?;
+
+            // Output weights: [num_buckets * 2 * hidden_size]
+            let output_weights = read_i16_vec(&mut cursor, num_buckets * 2 * hidden_size)?;
+
+            // Output biases: [num_buckets]
+            let output_biases = read_i16_vec(&mut cursor, num_buckets)?;
+
+            let total_bytes = ft_count * 2 + hidden_size * 2
+                + num_buckets * 2 * hidden_size * 2
+                + num_buckets * 2;
+            println!(
+                "  NNUE v4 loaded: hidden_size={}, input_buckets={}, output_buckets={}, total={:.1}KB",
+                hidden_size,
+                num_input_buckets,
+                num_buckets,
+                total_bytes as f64 / 1024.0,
+            );
+
+            Ok(Self {
+                ft_weights,
+                ft_biases,
+                output_weights,
+                output_biases,
+                psqt_weights: Vec::new(),
+                hidden_size,
+                num_buckets,
+                num_input_buckets,
             })
         }
     }
@@ -395,39 +443,36 @@ impl NnueNetwork {
             psqt_weights: Vec::new(),
             hidden_size,
             num_buckets,
+            num_input_buckets: 1,
         }
     }
 
-    /// Serialize network to v3 binary format.
+    /// Whether this network uses king-bucketed features (v4+)
+    #[inline]
+    pub fn has_king_buckets(&self) -> bool {
+        self.num_input_buckets > 1
+    }
+
+    /// Serialize network to v4 binary format.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let ft_count = NUM_FEATURES * self.hidden_size;
-        let psqt_count = NUM_FEATURES * self.num_buckets;
+        let ft_count = self.num_input_buckets * NUM_FEATURES * self.hidden_size;
         let out_count = self.num_buckets * 2 * self.hidden_size;
-        let total_size = 4 + 4 + 4 + 4 + ft_count * 2 + self.hidden_size * 2
-            + psqt_count * 2 + out_count * 2 + self.num_buckets * 2;
+        // header: magic(4) + version(4) + hidden(4) + out_buckets(4) + in_buckets(4)
+        let total_size = 20 + ft_count * 2 + self.hidden_size * 2
+            + out_count * 2 + self.num_buckets * 2;
         let mut buf = Vec::with_capacity(total_size);
 
         buf.extend_from_slice(NNUE_MAGIC);
         buf.extend_from_slice(&NNUE_VERSION.to_le_bytes());
         buf.extend_from_slice(&(self.hidden_size as u32).to_le_bytes());
         buf.extend_from_slice(&(self.num_buckets as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.num_input_buckets as u32).to_le_bytes());
 
         for &w in &self.ft_weights {
             buf.extend_from_slice(&w.to_le_bytes());
         }
         for &b in &self.ft_biases {
             buf.extend_from_slice(&b.to_le_bytes());
-        }
-        // PSQT weights (may be empty for num_buckets=1)
-        if self.psqt_weights.is_empty() {
-            // Write zeros for PSQT if not trained
-            for _ in 0..psqt_count {
-                buf.extend_from_slice(&0i16.to_le_bytes());
-            }
-        } else {
-            for &w in &self.psqt_weights {
-                buf.extend_from_slice(&w.to_le_bytes());
-            }
         }
         for &w in &self.output_weights {
             buf.extend_from_slice(&w.to_le_bytes());

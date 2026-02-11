@@ -1002,6 +1002,8 @@ impl SearchWorker {
 
     /// Incrementally update NNUE accumulator at ply+1 from ply after a move.
     /// Falls back to marking child as uncomputed (lazy refresh will handle it).
+    ///
+    /// For king-bucketed networks: king moves trigger a full refresh (bucket changes).
     fn nnue_make_move(&mut self, mv: ChessMove, ply: usize) {
         if !self.use_nnue_eval {
             return;
@@ -1016,11 +1018,28 @@ impl SearchWorker {
             }
 
             if self.nnue_acc[parent_idx].computed {
-                if let Some(delta) = features::compute_delta(&self.board, mv) {
+                // Use bucketed or legacy delta computation based on network type
+                let delta = if net.has_king_buckets() {
+                    let wk = self.board.king_square(chess::Color::White).to_index();
+                    let bk = self.board.king_square(chess::Color::Black).to_index();
+                    features::compute_delta_bucketed(&self.board, mv, wk, bk)
+                } else {
+                    features::compute_delta(&self.board, mv)
+                };
+
+                if let Some(ref d) = delta {
+                    // For king-bucketed networks, king moves need full refresh
+                    if net.has_king_buckets() && (d.white_king_moved || d.black_king_moved) {
+                        // We can't do incremental update because the bucket changed.
+                        // Mark as uncomputed — lazy refresh will handle it after board.make_move.
+                        self.nnue_acc[child_idx].computed = false;
+                        return;
+                    }
+
                     let (left, right) = self.nnue_acc.split_at_mut(child_idx);
                     let parent = &left[parent_idx];
                     let child = &mut right[0];
-                    child.update_from(parent, &delta, net);
+                    child.update_from(parent, d, net);
                     return;
                 }
             }
