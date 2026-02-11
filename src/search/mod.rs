@@ -129,16 +129,14 @@ pub struct TTEntry {
 }
 
 // =============================================================================
-// LOCK-FREE TRANSPOSITION TABLE (Hyatt/Mann XOR trick)
+// LOCK-FREE 3-WAY BUCKETED TRANSPOSITION TABLE (Hyatt/Mann XOR trick)
 // =============================================================================
 //
-// Each slot is 16 bytes: two AtomicU64 values.
-//   slot[0] = key ^ data   (verification word)
-//   slot[1] = data          (packed entry)
+// Each bucket has 3 entries (48 bytes total, fits in a cache line).
+// Each entry is 16 bytes: two AtomicU64 values (key ^ data, data).
 //
-// On read:  load both, compute key = slot[0] ^ slot[1], verify against hash.
-// On write: store key ^ data, then data.
-// Race conditions produce corrupt keys that fail verification → harmless.
+// On read:  scan all 3 entries, return first hash match.
+// On write: find best replacement target using age+depth scoring.
 //
 // Data packing (64 bits):
 //   bits  0-5:  from square (6 bits)
@@ -147,80 +145,127 @@ pub struct TTEntry {
 //   bits 16-31: score (i16)
 //   bits 32-39: depth (u8)
 //   bits 40-41: flag (2 bits: 0=Exact,1=Lower,2=Upper)
+//   bits 42-57: static eval (i16)
+//   bits 58-62: generation (5 bits, 0-31 wrapping)
 //   bit  63:    always set (sentinel — distinguishes from empty)
 
+const TT_WAYS: usize = 3;
+
 pub struct TranspositionTable {
-    // Interleaved layout: [key0, data0, key1, data1, ...]
-    // Key and data for same slot are adjacent → same cache line.
+    // Layout: [key0, data0, key1, data1, key2, data2, ...] per bucket
+    // 3 entries × 2 u64 = 6 AtomicU64 per bucket
     slots: Vec<AtomicU64>,
+    #[allow(dead_code)]
+    num_buckets: usize,
     mask: usize,
+    generation: AtomicU64,
 }
 
 impl TranspositionTable {
     pub fn new(size_mb: usize) -> Self {
         let size_mb = size_mb.max(64);
         let bytes = size_mb * 1024 * 1024;
-        // Each entry = 2 × 8 bytes = 16 bytes, interleaved in one Vec
-        let num_entries = (bytes / 16).next_power_of_two();
-        let slots = (0..num_entries * 2).map(|_| AtomicU64::new(0)).collect();
+        // Each bucket = 3 entries × 16 bytes = 48 bytes
+        let num_buckets = (bytes / (TT_WAYS * 16)).next_power_of_two();
+        let slots = (0..num_buckets * TT_WAYS * 2)
+            .map(|_| AtomicU64::new(0))
+            .collect();
         Self {
             slots,
-            mask: num_entries - 1,
+            num_buckets,
+            mask: num_buckets - 1,
+            generation: AtomicU64::new(0),
         }
     }
 
+    /// Increment generation counter — call at the start of each new search.
+    pub fn new_search(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn resize(&self, _mb: usize) {
-        // Note: proper resize requires recreating the Arc<TranspositionTable>.
-        // For now, just clear to avoid stale entries. UCI handler should recreate
-        // the table for actual size changes.
         self.clear();
     }
 
     #[inline(always)]
     pub fn get(&self, hash: u64) -> Option<TTEntry> {
-        let idx = (hash as usize) & self.mask;
-        let base = idx * 2;
-        let d = self.slots[base + 1].load(Ordering::Relaxed);
-        if d == 0 {
-            return None;
+        let bucket = (hash as usize) & self.mask;
+        let base = bucket * TT_WAYS * 2;
+        // Scan all 3 entries in the bucket
+        for i in 0..TT_WAYS {
+            let slot = base + i * 2;
+            let d = self.slots[slot + 1].load(Ordering::Relaxed);
+            if d == 0 {
+                continue;
+            }
+            let k = self.slots[slot].load(Ordering::Relaxed);
+            if k ^ d == hash {
+                return Self::unpack(hash, d);
+            }
         }
-        let k = self.slots[base].load(Ordering::Relaxed);
-        if k ^ d != hash {
-            return None;
-        }
-        Self::unpack(hash, d)
+        None
     }
 
     #[inline(always)]
     pub fn store(&self, entry: TTEntry) {
-        let idx = (entry.hash as usize) & self.mask;
-        let base = idx * 2;
-        let new_data = Self::pack(&entry);
+        let bucket = (entry.hash as usize) & self.mask;
+        let base = bucket * TT_WAYS * 2;
+        let tt_gen = (self.generation.load(Ordering::Relaxed) & 0x1F) as u8;
+        let new_data = Self::pack(&entry, tt_gen);
 
-        // Depth-preferred replacement: keep deeper entries from other positions
-        let old_data = self.slots[base + 1].load(Ordering::Relaxed);
-        if old_data != 0 {
-            let old_key = self.slots[base].load(Ordering::Relaxed);
-            let old_hash = old_key ^ old_data;
-            if old_hash != entry.hash {
-                let old_depth = ((old_data >> 32) & 0xFF) as u8;
-                if entry.depth < old_depth {
-                    return;
-                }
+        // Find the best replacement target among the 3 entries:
+        // Priority: 1) same hash (always replace), 2) empty slot, 3) worst score
+        // Replacement score: lower = more replaceable
+        //   score = 4 * depth - 4 * gen_age (stale entries are cheap to replace)
+        let mut worst_idx = 0usize;
+        let mut worst_score = i32::MAX;
+
+        for i in 0..TT_WAYS {
+            let slot = base + i * 2;
+            let d = self.slots[slot + 1].load(Ordering::Relaxed);
+
+            // Empty slot — use immediately
+            if d == 0 {
+                self.slots[slot].store(entry.hash ^ new_data, Ordering::Relaxed);
+                self.slots[slot + 1].store(new_data, Ordering::Relaxed);
+                return;
+            }
+
+            let k = self.slots[slot].load(Ordering::Relaxed);
+            let old_hash = k ^ d;
+
+            // Same position — always replace
+            if old_hash == entry.hash {
+                self.slots[slot].store(entry.hash ^ new_data, Ordering::Relaxed);
+                self.slots[slot + 1].store(new_data, Ordering::Relaxed);
+                return;
+            }
+
+            // Compute replacement score: depth favored, but stale entries penalized
+            let old_depth = ((d >> 32) & 0xFF) as i32;
+            let old_gen = ((d >> 58) & 0x1F) as i32;
+            let gen_age = ((tt_gen as i32) - old_gen + 32) & 0x1F; // wrapping distance
+            let score = 4 * old_depth - 4 * gen_age;
+            if score < worst_score {
+                worst_score = score;
+                worst_idx = i;
             }
         }
 
-        self.slots[base].store(entry.hash ^ new_data, Ordering::Relaxed);
-        self.slots[base + 1].store(new_data, Ordering::Relaxed);
+        // Replace the worst entry
+        let slot = base + worst_idx * 2;
+        self.slots[slot].store(entry.hash ^ new_data, Ordering::Relaxed);
+        self.slots[slot + 1].store(new_data, Ordering::Relaxed);
     }
 
     pub fn clear(&self) {
         for slot in self.slots.iter() {
             slot.store(0, Ordering::Relaxed);
         }
+        self.generation.store(0, Ordering::Relaxed);
     }
 
-    fn pack(entry: &TTEntry) -> u64 {
+    fn pack(entry: &TTEntry, tt_gen: u8) -> u64 {
         let mut d: u64 = 0;
         if let Some(mv) = entry.best_move {
             let from = mv.get_source().to_int() as u64;
@@ -246,6 +291,8 @@ impl TranspositionTable {
         // Pack static eval into bits 42-57 (16 bits, i16)
         let eval_u16 = entry.static_eval.clamp(-32768, 32767) as i16 as u16;
         d |= (eval_u16 as u64) << 42;
+        // Pack generation into bits 58-62 (5 bits)
+        d |= ((tt_gen & 0x1F) as u64) << 58;
         d |= 1u64 << 63; // sentinel: never zero
         d
     }
@@ -351,6 +398,9 @@ impl Searcher {
 
         let ply = move_history.len() as u32;
         let pos_hist = Arc::new(position_history);
+
+        // Increment TT generation so stale entries get replaced
+        tt.new_search();
 
         std::thread::spawn(move || {
             let time_manager = Arc::new(TimeManager::new(
@@ -1443,9 +1493,9 @@ impl SearchWorker {
         }
         let num_moves = moves.len();
 
-        // --- Step 12b: Singular Extensions (Stockfish restricted SE) ---
+        // --- Step 12b: Singular Extensions (Stockfish-style excluded-move search) ---
         // If TT move exists at sufficient depth with a lower-bound, test if it's singular
-        // by searching *only the second-best move* at reduced depth.
+        // by searching ALL non-TT moves at reduced depth with a lowered beta.
         // If no alternative beats se_beta, the TT move is "singular" → extend it.
         let mut singular_extension: i8 = 0;
         if !is_root
@@ -1460,34 +1510,40 @@ impl SearchWorker {
             let se_beta = tt_sc - 2 * (depth as i32);
             let se_depth = (depth - 1) / 2;
 
-            // Search only the best non-TT move at reduced depth
-            let mut se_score = -INFINITY;
+            // Excluded-move search: search ALL non-TT moves at reduced depth
+            let mut se_best = -INFINITY;
             for mi in 0..moves.len() {
+                moves.pick_move(mi);
                 let (mv, _) = moves.get(mi);
                 if Some(mv) == tt_move {
                     continue;
                 }
                 let old_board = self.board;
+                self.search_path_push(self.board.get_hash());
                 self.nnue_make_move(mv, ply);
                 self.board = old_board.make_move_new(mv);
                 let (val, _) = self.alpha_beta(-se_beta, -se_beta + 1, se_depth, ply + 1);
                 let score = -val;
                 self.board = old_board;
+                self.search_path_pop();
 
                 if self.stop_flag.load(Ordering::Relaxed) {
                     return (0, None);
                 }
 
-                se_score = score;
-                // Only test the top-ranked non-TT move (restricted SE)
-                break;
+                if score > se_best {
+                    se_best = score;
+                    if se_best >= se_beta {
+                        break; // No need to continue, singularity disproved
+                    }
+                }
             }
 
-            if se_score < se_beta {
+            if se_best < se_beta {
                 singular_extension = 1;
-            } else if se_score >= beta {
-                // Multi-cut: if the non-TT move also beats beta, prune
-                return (se_score, None);
+            } else if se_best >= beta {
+                // Multi-cut: if a non-TT move also beats beta, prune
+                return (se_best, None);
             }
         }
 
@@ -2021,12 +2077,14 @@ impl SearchWorker {
             }
 
             let old_board = self.board;
+            self.search_path_push(self.board.get_hash());
             self.nnue_make_move(mv, ply);
             self.board = self.board.make_move_new(mv);
 
             let score = -self.quiescence(-beta, -alpha, ply + 1);
 
             self.board = old_board;
+            self.search_path_pop();
 
             if score > best_score {
                 best_score = score;
@@ -2065,7 +2123,7 @@ impl SearchWorker {
             static_eval: stand_pat,
         });
 
-        alpha
+        best_score
     }
 
     // =========================================================================
