@@ -20,5 +20,6 @@ match_results.pgn
 # Legacy v4 model (use kiyengine.gguf instead)
 kiyengine.safetensors
 
-# Syzygy endgame tablebases (939MB, not tracked in git)
+# Syzygy endgame tablebases (not tracked in git)
 syzygy/
+syzygy.tar.zst

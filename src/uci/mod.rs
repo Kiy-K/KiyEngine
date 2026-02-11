@@ -10,6 +10,21 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
+/// Extract syzygy.tar.zst archive to the current directory.
+/// Returns the number of files extracted.
+fn extract_syzygy_archive(archive_path: &str) -> anyhow::Result<usize> {
+    let file = std::fs::File::open(archive_path)?;
+    let decoder = zstd::Decoder::new(file)?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut count = 0usize;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        entry.unpack_in(".")?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 pub struct MoveCodec;
 
 impl MoveCodec {
@@ -180,7 +195,18 @@ impl UciHandler {
         }
 
         // Try auto-loading Syzygy tablebases from default directory
+        // If syzygy/ doesn't exist but syzygy.tar.zst does, extract it first
         const DEFAULT_SYZYGY_PATH: &str = "syzygy";
+        const DEFAULT_SYZYGY_ARCHIVE: &str = "syzygy.tar.zst";
+        if !std::path::Path::new(DEFAULT_SYZYGY_PATH).is_dir()
+            && std::path::Path::new(DEFAULT_SYZYGY_ARCHIVE).exists()
+        {
+            println!("info string Extracting {} ...", DEFAULT_SYZYGY_ARCHIVE);
+            match extract_syzygy_archive(DEFAULT_SYZYGY_ARCHIVE) {
+                Ok(count) => println!("info string Extracted {} files to {}/", count, DEFAULT_SYZYGY_PATH),
+                Err(e) => eprintln!("info string Syzygy extract failed: {}", e),
+            }
+        }
         if std::path::Path::new(DEFAULT_SYZYGY_PATH).is_dir() {
             match SyzygyTB::new(DEFAULT_SYZYGY_PATH) {
                 Ok(tb) => {

@@ -18,6 +18,8 @@ bytemuck = "1.14"
 rayon = "1.8"
 shakmaty = "0.30.0"
 shakmaty-syzygy = { version = "0.28", features = ["mmap"] }
+tar = "0.4"
+zstd = "0.13"
 
 [features]
 noise = []
