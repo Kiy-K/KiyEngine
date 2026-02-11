@@ -1,5 +1,5 @@
 // src/engine/model.rs
-//! v5.2.0 ChessModel: High-level inference API delegating to Engine
+//! ChessModel: High-level inference API delegating to Engine
 //!
 //! Provides InferenceOutput with argmax/softmax convenience.
 

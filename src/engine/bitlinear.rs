@@ -1,7 +1,7 @@
 // src/engine/bitlinear.rs
 //! BitNet 1.58-bit linear layer with bit-packed ternary weights
 //!
-//! v5.2.0: Ternary weights {-1, 0, +1} stored as F16 in GGUF, packed to dual bitmasks
+//! Ternary weights {-1, 0, +1} stored as F16 in GGUF, packed to dual bitmasks
 //! (pos_bits + neg_bits) at load time for 4× memory reduction over i8.
 //! Uses SIMD-optimized packed GEMV (AVX-512/AVX2/NEON) for single-token inference.
 //! Sequences use F32 matmul with cached transposed weights (candle's tiled GEMM).
@@ -108,7 +108,7 @@ pub struct BitLinear {
 impl BitLinear {
     /// Load BitLinear from VarBuilder using explicit weight and norm key names.
     ///
-    /// v5.2.0: Ternary weights stored as F16 in GGUF are packed to i8 at load time.
+    /// Ternary weights stored as F16 in GGUF are packed to i8 at load time.
     /// The norm weight key is the RMSNorm weight inside the BitLinear layer.
     pub fn load_from_vb(
         weight_key: &str,

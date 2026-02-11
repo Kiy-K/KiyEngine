@@ -1,4 +1,4 @@
-//! # KiyEngine V5 - GGUF Format with BitNet Evaluation
+//! # KiyEngine - GGUF Format with BitNet Evaluation
 //!
 //! A high-performance AI chess engine with hybrid evaluation system
 //! combining fast material/PST evaluation with deep BitNet inference.

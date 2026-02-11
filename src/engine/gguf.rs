@@ -1,5 +1,5 @@
 // src/engine/gguf.rs
-//! GGUF (GGML Universal File) format parser and loader for KiyEngine V5
+//! GGUF (GGML Universal File) format parser and loader for KiyEngine
 //!
 //! Supports fast memory-mapped loading of BitNet 1.58-bit quantized models.
 

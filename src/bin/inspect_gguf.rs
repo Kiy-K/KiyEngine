@@ -10,7 +10,7 @@ fn main() -> anyhow::Result<()> {
     let model_path = args.get(1).map(|s| s.as_str()).unwrap_or("kiyengine.gguf");
 
     println!("╔══════════════════════════════════════════════════════════════════╗");
-    println!("║           KiyEngine V5 - GGUF Model Inspector                   ║");
+    println!("║           KiyEngine - GGUF Model Inspector                       ║");
     println!("╚══════════════════════════════════════════════════════════════════╝");
     println!();
 

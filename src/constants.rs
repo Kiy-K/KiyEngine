@@ -8,7 +8,7 @@ pub const ENGINE_NAME: &str = "KiyEngine";
 pub const ENGINE_VERSION: &str = "6.0.0";
 pub const ENGINE_AUTHOR: &str = "Khoi";
 
-/// Default model file path for V5 (GGUF format)
+/// Default model file path (GGUF format)
 pub const DEFAULT_MODEL_PATH: &str = "kiyengine.gguf";
 /// Legacy v4 model path (safetensors)
 pub const LEGACY_MODEL_PATH: &str = "kiyengine.safetensors";

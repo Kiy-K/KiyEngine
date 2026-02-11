@@ -1,5 +1,5 @@
 // src/engine/tests.rs
-//! v5.2.0 tests for the KiyNet_Ultimate neural network engine
+//! Tests for the KiyNet neural network engine
 
 #[cfg(test)]
 mod tests {

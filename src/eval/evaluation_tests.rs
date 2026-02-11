@@ -1,5 +1,5 @@
 // src/eval/evaluation_tests.rs
-//! v5.2.0 Chess position evaluation tests
+//! Chess position evaluation tests
 
 #[cfg(test)]
 mod tests {

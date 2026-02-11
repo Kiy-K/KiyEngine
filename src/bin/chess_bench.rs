@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
         ("UNDERPROMO", "k7/P7/8/8/8/8/8/K7 w - - 0 1"),
     ];
 
-    println!("=== KiyEngine V5 Alpha - Extensive Standard Test ===");
+    println!("=== KiyEngine - Extensive Standard Test ===");
 
     for (name, fen) in test_positions {
         println!("\nTesting Position: {}", name);

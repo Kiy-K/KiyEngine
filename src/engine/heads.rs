@@ -1,7 +1,7 @@
 // src/engine/heads.rs
-//! v6.0.0 Neural network heads for policy and value prediction
+//! Neural network heads for policy and value prediction
 //!
-//! V6: ALL head weights are BitLinear (ternary with RMSNorm).
+//! All head weights are BitLinear (ternary with RMSNorm).
 //! PolicyHead: BitLinear(d_model, vocab_size) — SIMD GEMV for single token
 //! ValueHead: BitLinear(d_model, 256) -> SiLU -> BitLinear(256, 1) -> Tanh
 //!

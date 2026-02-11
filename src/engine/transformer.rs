@@ -1,5 +1,5 @@
 // src/engine/transformer.rs
-//! v6.0.0 KiyNet_V6 Transformer components:
+//! KiyNet Transformer components:
 //! - GQA MultiheadAttention (separate BitLinear Q/K/V/O + RoPE)
 //! - LayerScale (learnable per-channel scaling)
 //! - BitSwiGLU (gated MLP with ternary BitLinear layers)

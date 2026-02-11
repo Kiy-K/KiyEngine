@@ -54,7 +54,7 @@ impl MCTSUciHandler {
         let parts: Vec<&str> = command.split_whitespace().collect();
         match parts.get(0).copied() {
             Some("uci") => {
-                println!("id name KiyEngine V5 MCTS");
+                println!("id name KiyEngine MCTS");
                 println!("id author Khoi");
                 println!("option name Hash type spin default 512 min 1 max 65536");
                 println!("option name Threads type spin default 4 min 1 max 256");

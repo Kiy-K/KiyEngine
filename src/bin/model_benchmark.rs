@@ -1,5 +1,5 @@
 // src/bin/model_benchmark.rs
-//! v5.2.0 KiyNet_Ultimate benchmark
+//! KiyNet model benchmark
 
 use candle_core::Device;
 use kiyengine::constants::DEFAULT_MODEL_PATH;
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 fn main() -> anyhow::Result<()> {
     println!("========================================");
-    println!("KiyEngine Model Benchmark Suite v5.2.0");
+    println!("KiyEngine Model Benchmark Suite");
     println!("========================================\n");
 
     let device = Device::Cpu;
