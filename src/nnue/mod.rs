@@ -115,7 +115,7 @@ impl NnueNetwork {
     /// 4. Scale to centipawns
     ///
     /// Returns evaluation in centipawns from side-to-move's perspective.
-    #[inline]
+    #[inline(always)]
     pub fn evaluate(&self, acc: &Accumulator, stm: Color, board: &Board) -> i32 {
         debug_assert!(acc.computed, "Accumulator not computed");
 
@@ -185,7 +185,7 @@ impl NnueNetwork {
         // Process "us" perspective
         let mut i = 0;
         while i < hs {
-            let acc = _mm256_loadu_si256(us.as_ptr().add(i) as *const __m256i);
+            let acc = _mm256_load_si256(us.as_ptr().add(i) as *const __m256i);
             let wgt = _mm256_loadu_si256(self.output_weights.as_ptr().add(w_offset + i) as *const __m256i);
 
             let clamped = _mm256_min_epi16(_mm256_max_epi16(acc, zero), qa_vec);
@@ -200,7 +200,7 @@ impl NnueNetwork {
         // Process "them" perspective
         i = 0;
         while i < hs {
-            let acc = _mm256_loadu_si256(them.as_ptr().add(i) as *const __m256i);
+            let acc = _mm256_load_si256(them.as_ptr().add(i) as *const __m256i);
             let wgt =
                 _mm256_loadu_si256(self.output_weights.as_ptr().add(w_offset + hs + i) as *const __m256i);
 
@@ -284,6 +284,15 @@ impl NnueNetwork {
         // Read hidden_size
         cursor.read_exact(&mut buf4)?;
         let hidden_size = u32::from_le_bytes(buf4) as usize;
+
+        // Accumulator uses fixed-size arrays for performance — assert match
+        if hidden_size != accumulator::HIDDEN_SIZE {
+            anyhow::bail!(
+                "NNUE hidden_size {} does not match compiled HIDDEN_SIZE {}",
+                hidden_size,
+                accumulator::HIDDEN_SIZE
+            );
+        }
 
         if version == NNUE_VERSION_V2 {
             // --- V2: single bucket, no PSQT ---
@@ -469,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_serialize_deserialize() {
-        let net = NnueNetwork::random(64);
+        let net = NnueNetwork::random(accumulator::HIDDEN_SIZE);
         let bytes = net.to_bytes();
         let net2 = NnueNetwork::from_bytes(&bytes).unwrap();
 

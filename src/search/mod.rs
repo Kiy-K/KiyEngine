@@ -16,6 +16,67 @@ const INFINITY: i32 = 32_000;
 const MAX_PLY: usize = 128;
 const MAX_DEPTH: u8 = 64;
 
+/// Maximum number of legal moves in any chess position (theoretical max is 218).
+const MAX_MOVES: usize = 256;
+
+/// Stack-allocated scored move list — eliminates per-node heap allocation.
+/// This is THE critical optimization for NPS: no malloc/free per search node.
+struct MoveList {
+    moves: [(ChessMove, i32); MAX_MOVES],
+    len: usize,
+}
+
+impl MoveList {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            // Safety: ChessMove is Copy and zero-init is fine for scored pairs
+            moves: [(ChessMove::default(), 0i32); MAX_MOVES],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, mv: ChessMove, score: i32) {
+        debug_assert!(self.len < MAX_MOVES);
+        unsafe {
+            *self.moves.get_unchecked_mut(self.len) = (mv, score);
+        }
+        self.len += 1;
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Incremental move picker: swap highest-scored move to position `idx`.
+    #[inline]
+    fn pick_move(&mut self, idx: usize) {
+        let mut best_idx = idx;
+        let mut best_score = self.moves[idx].1;
+        for i in (idx + 1)..self.len {
+            if self.moves[i].1 > best_score {
+                best_score = self.moves[i].1;
+                best_idx = i;
+            }
+        }
+        if best_idx != idx {
+            self.moves.swap(idx, best_idx);
+        }
+    }
+
+    #[inline]
+    fn get(&self, idx: usize) -> (ChessMove, i32) {
+        self.moves[idx]
+    }
+}
+
 /// Sentinel value meaning "no static eval stored in TT"
 const NONE_EVAL: i32 = i32::MIN;
 
@@ -346,6 +407,7 @@ impl Searcher {
             };
 
             let mut handles = vec![];
+            let global_nodes = Arc::new(AtomicU64::new(0));
 
             for i in 0..num_threads {
                 let tt_clone = Arc::clone(&tt);
@@ -358,13 +420,14 @@ impl Searcher {
                 let nnue_clone = nnue.clone();
                 let syzygy_clone = syzygy.clone();
                 let pos_hist_clone = Arc::clone(&pos_hist);
+                let nodes_clone = Arc::clone(&global_nodes);
 
                 handles.push(
                     std::thread::Builder::new()
                         .stack_size(64 * 1024 * 1024) // 64MB stack for deep recursion
                         .spawn(move || {
                             let mut worker =
-                                SearchWorker::new(tt_clone, board_clone, stop_clone, nnue_clone, syzygy_clone);
+                                SearchWorker::with_shared_nodes(tt_clone, board_clone, stop_clone, nnue_clone, syzygy_clone, nodes_clone);
                             worker.set_game_history((*pos_hist_clone).clone());
                             let mut best_move = None;
                             let mut last_score = 0;
@@ -475,7 +538,10 @@ impl Searcher {
 
                                             let elapsed =
                                                 start_time.elapsed().as_secs_f64().max(0.001);
-                                            let nps = (worker.nodes as f64 / elapsed) as u64;
+                                            // Use shared counter for accurate multi-thread NPS
+                                            let total_nodes = worker.shared_nodes.load(Ordering::Relaxed)
+                                                + (worker.nodes & 4095); // add unflushed remainder
+                                            let nps = (total_nodes as f64 / elapsed) as u64;
 
                                             // Extract full PV from triangular PV table
                                             let pv_str = {
@@ -555,6 +621,8 @@ pub struct SearchWorker {
     stop_flag: Arc<AtomicBool>,
     time_manager: Option<Arc<TimeManager>>,
     pub nodes: u64,
+    /// Shared atomic node counter across all SMP workers for accurate NPS
+    shared_nodes: Arc<AtomicU64>,
     killers: [[Option<ChessMove>; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
     // Countermove heuristic: indexed by [prev_from][prev_to]
@@ -605,6 +673,17 @@ impl SearchWorker {
         nnue: Option<Arc<NnueNetwork>>,
         syzygy: Option<Arc<SyzygyTB>>,
     ) -> Self {
+        Self::with_shared_nodes(tt, board, stop_flag, nnue, syzygy, Arc::new(AtomicU64::new(0)))
+    }
+
+    pub fn with_shared_nodes(
+        tt: Arc<TranspositionTable>,
+        board: Board,
+        stop_flag: Arc<AtomicBool>,
+        nnue: Option<Arc<NnueNetwork>>,
+        syzygy: Option<Arc<SyzygyTB>>,
+        shared_nodes: Arc<AtomicU64>,
+    ) -> Self {
         let nnue_acc = if let Some(ref net) = nnue {
             (0..MAX_PLY)
                 .map(|_| Accumulator::new(net.hidden_size))
@@ -618,6 +697,7 @@ impl SearchWorker {
             stop_flag,
             time_manager: None,
             nodes: 0,
+            shared_nodes,
             killers: [[None; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
             countermove: [[None; 64]; 64],
@@ -727,7 +807,7 @@ impl SearchWorker {
     // =========================================================================
     // RAW NNUE EVAL — pure network output, no adjustments.
     // =========================================================================
-    #[inline]
+    #[inline(always)]
     fn raw_nnue_eval(&mut self, ply: usize) -> i32 {
         if self.use_nnue_eval {
             if let Some(ref net) = self.nnue {
@@ -749,14 +829,14 @@ impl SearchWorker {
     // 2. Correction histories (pawn structure + material config learning)
     // 3. Material scaling (reduce eval in drawish low-material positions)
     // =========================================================================
-    #[inline]
+    #[inline(always)]
     fn fast_eval(&mut self, ply: usize) -> i32 {
         let raw = self.raw_nnue_eval(ply);
         self.adjust_eval(raw)
     }
 
     /// Apply Stockfish-style eval adjustments to a raw NNUE score.
-    #[inline]
+    #[inline(always)]
     fn adjust_eval(&self, raw: i32) -> i32 {
         let mut eval = raw;
 
@@ -791,15 +871,32 @@ impl SearchWorker {
 
     /// Compute a simple material configuration hash for correction history.
     /// Combines piece counts into a hash value.
-    #[inline]
+    #[inline(always)]
     fn material_hash(&self) -> u64 {
+        let white = *self.board.color_combined(Color::White);
+        let black = *self.board.color_combined(Color::Black);
         let mut h: u64 = 0;
-        for &piece in &[Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen] {
-            let w = (*self.board.pieces(piece) & *self.board.color_combined(Color::White)).0.count_ones() as u64;
-            let b = (*self.board.pieces(piece) & *self.board.color_combined(Color::Black)).0.count_ones() as u64;
-            h = h.wrapping_mul(13).wrapping_add(w);
-            h = h.wrapping_mul(13).wrapping_add(b);
-        }
+        // Unrolled for zero-overhead piece counting
+        let wp = (*self.board.pieces(Piece::Pawn) & white).0.count_ones() as u64;
+        let bp = (*self.board.pieces(Piece::Pawn) & black).0.count_ones() as u64;
+        h = h.wrapping_mul(13).wrapping_add(wp);
+        h = h.wrapping_mul(13).wrapping_add(bp);
+        let wn = (*self.board.pieces(Piece::Knight) & white).0.count_ones() as u64;
+        let bn = (*self.board.pieces(Piece::Knight) & black).0.count_ones() as u64;
+        h = h.wrapping_mul(13).wrapping_add(wn);
+        h = h.wrapping_mul(13).wrapping_add(bn);
+        let wb = (*self.board.pieces(Piece::Bishop) & white).0.count_ones() as u64;
+        let bb = (*self.board.pieces(Piece::Bishop) & black).0.count_ones() as u64;
+        h = h.wrapping_mul(13).wrapping_add(wb);
+        h = h.wrapping_mul(13).wrapping_add(bb);
+        let wr = (*self.board.pieces(Piece::Rook) & white).0.count_ones() as u64;
+        let br = (*self.board.pieces(Piece::Rook) & black).0.count_ones() as u64;
+        h = h.wrapping_mul(13).wrapping_add(wr);
+        h = h.wrapping_mul(13).wrapping_add(br);
+        let wq = (*self.board.pieces(Piece::Queen) & white).0.count_ones() as u64;
+        let bq = (*self.board.pieces(Piece::Queen) & black).0.count_ones() as u64;
+        h = h.wrapping_mul(13).wrapping_add(wq);
+        h = h.wrapping_mul(13).wrapping_add(bq);
         h
     }
 
@@ -892,15 +989,10 @@ impl SearchWorker {
 
             if parent_idx < child_idx && self.nnue_acc[parent_idx].computed {
                 let (left, right) = self.nnue_acc.split_at_mut(child_idx);
-                right[0].white.copy_from_slice(&left[parent_idx].white);
-                right[0].black.copy_from_slice(&left[parent_idx].black);
-                // Copy PSQT state too
-                if !left[parent_idx].psqt_white.is_empty() {
-                    right[0].psqt_white.resize(left[parent_idx].psqt_white.len(), 0);
-                    right[0].psqt_white.copy_from_slice(&left[parent_idx].psqt_white);
-                    right[0].psqt_black.resize(left[parent_idx].psqt_black.len(), 0);
-                    right[0].psqt_black.copy_from_slice(&left[parent_idx].psqt_black);
-                }
+                right[0].white = left[parent_idx].white;
+                right[0].black = left[parent_idx].black;
+                right[0].psqt_white = left[parent_idx].psqt_white;
+                right[0].psqt_black = left[parent_idx].psqt_black;
                 right[0].computed = true;
             } else {
                 self.nnue_acc[child_idx].computed = false;
@@ -1202,6 +1294,10 @@ impl SearchWorker {
             return (self.quiescence(alpha, beta, ply), None);
         }
         self.nodes += 1;
+        // Periodically flush to shared counter (every 4096 nodes, low contention)
+        if self.nodes & 4095 == 0 {
+            self.shared_nodes.fetch_add(4096, Ordering::Relaxed);
+        }
 
         // --- Step 6: Static Evaluation for pruning ---
         // Use TT cached static eval if available (avoids redundant NNUE computation)
@@ -1345,6 +1441,7 @@ impl SearchWorker {
                 (0, None)
             };
         }
+        let num_moves = moves.len();
 
         // --- Step 12b: Singular Extensions (Stockfish restricted SE) ---
         // If TT move exists at sufficient depth with a lower-bound, test if it's singular
@@ -1365,13 +1462,14 @@ impl SearchWorker {
 
             // Search only the best non-TT move at reduced depth
             let mut se_score = -INFINITY;
-            for (mv, _) in &moves {
-                if Some(*mv) == tt_move {
+            for mi in 0..moves.len() {
+                let (mv, _) = moves.get(mi);
+                if Some(mv) == tt_move {
                     continue;
                 }
                 let old_board = self.board;
-                self.nnue_make_move(*mv, ply);
-                self.board = old_board.make_move_new(*mv);
+                self.nnue_make_move(mv, ply);
+                self.board = old_board.make_move_new(mv);
                 let (val, _) = self.alpha_beta(-se_beta, -se_beta + 1, se_depth, ply + 1);
                 let score = -val;
                 self.board = old_board;
@@ -1401,9 +1499,9 @@ impl SearchWorker {
         let mut quiets_tried: [Option<ChessMove>; 64] = [None; 64];
         let mut quiets_count = 0usize;
 
-        for move_idx in 0..moves.len() {
-            Self::pick_next_move(&mut moves, move_idx);
-            let mv = moves[move_idx].0;
+        for move_idx in 0..num_moves {
+            moves.pick_move(move_idx);
+            let mv = moves.get(move_idx).0;
             let is_cap = self.is_capture(mv);
             let is_promo = mv.get_promotion().is_some();
             let is_tactical = is_cap || is_promo;
@@ -1800,6 +1898,9 @@ impl SearchWorker {
     // =========================================================================
     fn quiescence(&mut self, mut alpha: i32, beta: i32, ply: usize) -> i32 {
         self.nodes += 1;
+        if self.nodes & 4095 == 0 {
+            self.shared_nodes.fetch_add(4096, Ordering::Relaxed);
+        }
 
         // Abort check: prevent infinite qsearch and respect time limits
         if ply >= MAX_PLY {
@@ -1860,12 +1961,12 @@ impl SearchWorker {
 
         // When in check: search ALL legal moves (must escape check)
         // Otherwise: only search captures
-        let mut scored_moves: Vec<(ChessMove, i32)> = Vec::with_capacity(16);
+        let mut scored_moves = MoveList::new();
 
         if in_check {
             let moves = MoveGen::new_legal(&self.board);
+            let targets = *self.board.color_combined(!self.board.side_to_move());
             for mv in moves {
-                let targets = *self.board.color_combined(!self.board.side_to_move());
                 let is_cap = (targets & BitBoard::from_square(mv.get_dest())).0 != 0;
                 let mut score: i32 = 0;
                 if is_cap {
@@ -1873,7 +1974,7 @@ impl SearchWorker {
                     let attacker = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
                     score = piece_value(victim) * 10 - piece_value(attacker) + 50_000;
                 }
-                scored_moves.push((mv, score));
+                scored_moves.push(mv, score);
             }
             // If no legal moves in check → checkmate
             if scored_moves.is_empty() {
@@ -1888,14 +1989,13 @@ impl SearchWorker {
                 let victim = self.board.piece_on(mv.get_dest()).unwrap_or(Piece::Pawn);
                 let attacker = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
                 let see_score = piece_value(victim) * 10 - piece_value(attacker);
-                scored_moves.push((mv, see_score));
+                scored_moves.push(mv, see_score);
             }
             // Second pass: non-capture queen promotions (critical for endgames)
-            // Reuse the same MoveGen iterator — set mask to non-capture squares
             moves.set_iterator_mask(!targets & !chess::EMPTY);
             for mv in &mut moves {
                 if mv.get_promotion() == Some(Piece::Queen) {
-                    scored_moves.push((mv, 44_000)); // Just below main search promo score
+                    scored_moves.push(mv, 44_000);
                 }
             }
         }
@@ -1903,9 +2003,10 @@ impl SearchWorker {
         let mut best_move = None;
         let mut best_score = stand_pat;
 
-        for move_idx in 0..scored_moves.len() {
-            Self::pick_next_move(&mut scored_moves, move_idx);
-            let mv = scored_moves[move_idx].0;
+        let num_qmoves = scored_moves.len();
+        for move_idx in 0..num_qmoves {
+            scored_moves.pick_move(move_idx);
+            let mv = scored_moves.get(move_idx).0;
 
             // Delta pruning per-move (skip when in check)
             if !in_check {
@@ -1976,7 +2077,7 @@ impl SearchWorker {
         policy: Option<&[f32]>,
         ply: usize,
         tt_move: Option<ChessMove>,
-    ) -> Vec<(ChessMove, i32)> {
+    ) -> MoveList {
         let ply_idx = ply.min(MAX_PLY - 1);
         let targets = *self.board.color_combined(!self.board.side_to_move());
         let side = if self.board.side_to_move() == Color::White {
@@ -1984,7 +2085,7 @@ impl SearchWorker {
         } else {
             1
         };
-        let mut scored: Vec<(ChessMove, i32)> = Vec::with_capacity(40);
+        let mut scored = MoveList::new();
 
         // Pre-fetch previous move info for countermove + continuation history
         let prev_info: Option<(usize, usize, usize)> = if ply >= 1 {
@@ -2010,23 +2111,19 @@ impl SearchWorker {
             }
 
             // 2. Neural policy score with temperature-scaled softmax (LLM technique)
-            // Raw logits are converted to probabilities via softmax(logit / T)
-            // T=0.8 sharpens the distribution → more decisive move ordering
             if let Some(pol) = policy {
                 let token = MoveCodec::get_policy_index(&mv);
                 if token < pol.len() {
-                    // pol[token] is already a logit; scale by temperature-adjusted weight
-                    // We use the raw value * 20_000 to give strong policy influence
                     score += (pol[token] * 20_000.0) as i32;
                 }
             }
 
             // 3. Captures scored by MVV-LVA + capture history
-            if (targets & BitBoard::from_square(mv.get_dest())).0 != 0 {
+            let dest_bb = BitBoard::from_square(mv.get_dest());
+            if (targets & dest_bb).0 != 0 {
                 let victim = self.board.piece_on(mv.get_dest()).unwrap_or(Piece::Pawn);
                 let attacker = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
                 score += piece_value(victim) * 10 - piece_value(attacker) + 50_000;
-                // Capture history bonus
                 let ai = Self::cap_piece_index(attacker);
                 let vi = Self::cap_piece_index(victim);
                 let to = mv.get_dest().to_index();
@@ -2070,27 +2167,10 @@ impl SearchWorker {
             let to = mv.get_dest().to_index();
             score += self.history[side][from][to];
 
-            scored.push((mv, score));
+            scored.push(mv, score);
         }
 
         scored
-    }
-
-    /// Incremental move picker: swap highest-scored move to position `idx`.
-    /// O(N-idx) per call, but total work is O(k*N) where k << N due to beta cutoffs.
-    #[inline]
-    fn pick_next_move(moves: &mut [(ChessMove, i32)], idx: usize) {
-        let mut best_idx = idx;
-        let mut best_score = moves[idx].1;
-        for i in (idx + 1)..moves.len() {
-            if moves[i].1 > best_score {
-                best_score = moves[i].1;
-                best_idx = i;
-            }
-        }
-        if best_idx != idx {
-            moves.swap(idx, best_idx);
-        }
     }
 }
 

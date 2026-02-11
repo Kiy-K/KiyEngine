@@ -17,35 +17,41 @@ use chess::Board;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+/// Fixed hidden layer size — must match the NNUE file (asserted at load time).
+/// Using a const eliminates heap allocation, bounds checks, and enables aligned SIMD.
+pub const HIDDEN_SIZE: usize = 512;
+
+/// Maximum number of output buckets.
+const MAX_BUCKETS: usize = 8;
+
 /// NNUE accumulator: stores the feature transformer output for both perspectives.
 ///
-/// Each perspective has `hidden_size` i16 values representing the sum of
-/// active feature columns plus the bias vector.
-///
-/// Also tracks PSQT (Piece-Square Table) shortcut scores per bucket
-/// for fast material+positional estimates.
+/// Fixed-size, stack-allocated, 32-byte aligned for AVX2.
+/// No heap allocation — critical for NPS performance.
 #[derive(Clone)]
+#[repr(align(64))]
 pub struct Accumulator {
-    /// White perspective accumulator [hidden_size]
-    pub white: Vec<i16>,
-    /// Black perspective accumulator [hidden_size]
-    pub black: Vec<i16>,
-    /// PSQT scores per bucket for white perspective [num_buckets]
-    pub psqt_white: Vec<i32>,
-    /// PSQT scores per bucket for black perspective [num_buckets]
-    pub psqt_black: Vec<i32>,
+    /// White perspective accumulator [HIDDEN_SIZE]
+    pub white: [i16; HIDDEN_SIZE],
+    /// Black perspective accumulator [HIDDEN_SIZE]
+    pub black: [i16; HIDDEN_SIZE],
+    /// PSQT scores per bucket for white perspective
+    pub psqt_white: [i32; MAX_BUCKETS],
+    /// PSQT scores per bucket for black perspective
+    pub psqt_black: [i32; MAX_BUCKETS],
     /// Whether this accumulator has been computed
     pub computed: bool,
 }
 
 impl Accumulator {
     /// Create an uninitialized accumulator
-    pub fn new(hidden_size: usize) -> Self {
+    #[inline]
+    pub fn new(_hidden_size: usize) -> Self {
         Self {
-            white: vec![0i16; hidden_size],
-            black: vec![0i16; hidden_size],
-            psqt_white: Vec::new(),
-            psqt_black: Vec::new(),
+            white: [0i16; HIDDEN_SIZE],
+            black: [0i16; HIDDEN_SIZE],
+            psqt_white: [0i32; MAX_BUCKETS],
+            psqt_black: [0i32; MAX_BUCKETS],
             computed: false,
         }
     }
@@ -65,10 +71,8 @@ impl Accumulator {
 
         // Initialize PSQT accumulators
         if has_psqt {
-            self.psqt_white.resize(nb, 0);
-            self.psqt_black.resize(nb, 0);
-            self.psqt_white.fill(0);
-            self.psqt_black.fill(0);
+            self.psqt_white[..nb].fill(0);
+            self.psqt_black[..nb].fill(0);
         }
 
         // Extract active features
@@ -119,10 +123,8 @@ impl Accumulator {
 
         // Copy PSQT state
         if has_psqt {
-            self.psqt_white.resize(nb, 0);
-            self.psqt_black.resize(nb, 0);
-            self.psqt_white.copy_from_slice(&parent.psqt_white);
-            self.psqt_black.copy_from_slice(&parent.psqt_black);
+            self.psqt_white[..nb].copy_from_slice(&parent.psqt_white[..nb]);
+            self.psqt_black[..nb].copy_from_slice(&parent.psqt_black[..nb]);
         }
 
         // Subtract removed features
@@ -245,17 +247,17 @@ impl AccumulatorStack {
 // SIMD-VECTORIZED i16 ADD/SUB
 // ============================================================================
 
-/// Vectorized dst[i] += src[i] for i16 slices (AVX2 fast path, scalar fallback).
-#[inline]
+/// Vectorized dst[i] += src[i] for i16 slices.
+/// Uses AVX2 when available, scalar fallback otherwise.
+/// dst must be from an aligned Accumulator; src (ft_weights) is unaligned.
+#[inline(always)]
 fn vec_add_i16(dst: &mut [i16], src: &[i16]) {
     debug_assert_eq!(dst.len(), src.len());
 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            unsafe {
-                return vec_add_i16_avx2(dst, src);
-            }
+            unsafe { return vec_add_i16_avx2(dst, src); }
         }
     }
 
@@ -264,17 +266,15 @@ fn vec_add_i16(dst: &mut [i16], src: &[i16]) {
     }
 }
 
-/// Vectorized dst[i] -= src[i] for i16 slices (AVX2 fast path, scalar fallback).
-#[inline]
+/// Vectorized dst[i] -= src[i] for i16 slices.
+#[inline(always)]
 fn vec_sub_i16(dst: &mut [i16], src: &[i16]) {
     debug_assert_eq!(dst.len(), src.len());
 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            unsafe {
-                return vec_sub_i16_avx2(dst, src);
-            }
+            unsafe { return vec_sub_i16_avx2(dst, src); }
         }
     }
 
@@ -285,38 +285,32 @@ fn vec_sub_i16(dst: &mut [i16], src: &[i16]) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn vec_add_i16_avx2(dst: &mut [i16], src: &[i16]) {
     let n = dst.len();
+    let dst_ptr = dst.as_mut_ptr();
+    let src_ptr = src.as_ptr();
     let mut i = 0;
-    // Process 16 i16 values per iteration (256 bits)
     while i + 16 <= n {
-        let a = _mm256_loadu_si256(dst.as_ptr().add(i) as *const __m256i);
-        let b = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
-        let sum = _mm256_add_epi16(a, b);
-        _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, sum);
+        let a = _mm256_load_si256(dst_ptr.add(i) as *const __m256i);
+        let b = _mm256_loadu_si256(src_ptr.add(i) as *const __m256i);
+        _mm256_store_si256(dst_ptr.add(i) as *mut __m256i, _mm256_add_epi16(a, b));
         i += 16;
-    }
-    // Scalar remainder
-    while i < n {
-        dst[i] = dst[i].wrapping_add(src[i]);
-        i += 1;
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn vec_sub_i16_avx2(dst: &mut [i16], src: &[i16]) {
     let n = dst.len();
+    let dst_ptr = dst.as_mut_ptr();
+    let src_ptr = src.as_ptr();
     let mut i = 0;
     while i + 16 <= n {
-        let a = _mm256_loadu_si256(dst.as_ptr().add(i) as *const __m256i);
-        let b = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
-        let diff = _mm256_sub_epi16(a, b);
-        _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, diff);
+        let a = _mm256_load_si256(dst_ptr.add(i) as *const __m256i);
+        let b = _mm256_loadu_si256(src_ptr.add(i) as *const __m256i);
+        _mm256_store_si256(dst_ptr.add(i) as *mut __m256i, _mm256_sub_epi16(a, b));
         i += 16;
-    }
-    while i < n {
-        dst[i] = dst[i].wrapping_sub(src[i]);
-        i += 1;
     }
 }
