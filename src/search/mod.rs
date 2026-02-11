@@ -1,5 +1,5 @@
 use crate::engine::{Engine, KVCache};
-use crate::nnue::accumulator::Accumulator;
+use crate::nnue::accumulator::{Accumulator, FinnyTable};
 use crate::nnue::features;
 use crate::nnue::NnueNetwork;
 use crate::uci::MoveCodec;
@@ -695,6 +695,8 @@ pub struct SearchWorker {
     // NNUE evaluation (optional — falls back to Material+PST if None)
     nnue: Option<Arc<NnueNetwork>>,
     nnue_acc: Vec<Accumulator>,
+    // Finny Table: per-(king_sq, perspective) accumulator cache for fast refresh
+    finny_table: Option<FinnyTable>,
     // Whether to actually use NNUE for eval (false = skip accumulator updates)
     use_nnue_eval: bool,
     // Correction histories (Stockfish-inspired): learn per-position eval corrections
@@ -741,6 +743,7 @@ impl SearchWorker {
         } else {
             Vec::new()
         };
+        let finny_table = nnue.as_ref().map(|net| FinnyTable::new(net));
         Self {
             tt,
             board,
@@ -761,6 +764,7 @@ impl SearchWorker {
             use_nnue_eval: nnue.is_some(),
             nnue,
             nnue_acc,
+            finny_table,
             pawn_correction: Box::new([[0i32; 2]; CORRECTION_HIST_SIZE]),
             material_correction: Box::new([[0i32; 2]; CORRECTION_HIST_SIZE]),
             game_hash_history: Vec::new(),
@@ -863,7 +867,12 @@ impl SearchWorker {
             if let Some(ref net) = self.nnue {
                 let idx = ply.min(MAX_PLY - 1);
                 if !self.nnue_acc[idx].computed {
-                    self.nnue_acc[idx].refresh(&self.board, net);
+                    // Use Finny Table for fast refresh (diff-based, ~8× faster)
+                    if let Some(ref mut ft) = self.finny_table {
+                        ft.refresh(&mut self.nnue_acc[idx], &self.board, net);
+                    } else {
+                        self.nnue_acc[idx].refresh(&self.board, net);
+                    }
                 }
                 return net.evaluate(&self.nnue_acc[idx], self.board.side_to_move(), &self.board);
             }
@@ -996,7 +1005,11 @@ impl SearchWorker {
     pub fn nnue_refresh(&mut self, ply: usize) {
         if let Some(ref net) = self.nnue {
             let idx = ply.min(MAX_PLY - 1);
-            self.nnue_acc[idx].refresh(&self.board, net);
+            if let Some(ref mut ft) = self.finny_table {
+                ft.refresh(&mut self.nnue_acc[idx], &self.board, net);
+            } else {
+                self.nnue_acc[idx].refresh(&self.board, net);
+            }
         }
     }
 

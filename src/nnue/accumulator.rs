@@ -12,7 +12,7 @@
 
 use crate::nnue::features::{self, FeatureDelta};
 use crate::nnue::NnueNetwork;
-use chess::Board;
+use chess::{Board, Color, Piece, Square};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -180,6 +180,237 @@ impl Accumulator {
     }
 }
 
+// ============================================================================
+// FINNY TABLE (Accumulator Cache)
+// ============================================================================
+//
+// Idea from Luecx (Koivisto), adopted by Stockfish since SF15.
+// Caches accumulator state per (king_square, perspective).
+// When a full refresh is needed (e.g. king bucket changed), instead of
+// recomputing from all ~32 pieces, diff against the cached state —
+// typically only 2-4 pieces have changed, making refreshes ~8× faster.
+
+const NO_PIECE_ENC: u8 = 0;
+
+#[inline]
+fn encode_piece(color: Color, piece: Piece) -> u8 {
+    let c = if color == Color::White { 0u8 } else { 6u8 };
+    c + features::piece_index(piece) as u8 + 1
+}
+
+#[inline]
+fn decode_piece(encoded: u8) -> Option<(Color, Piece)> {
+    if encoded == NO_PIECE_ENC {
+        return None;
+    }
+    let v = (encoded - 1) as usize;
+    let color = if v < 6 { Color::White } else { Color::Black };
+    Some((color, features::ALL_PIECES[v % 6]))
+}
+
+/// Encode the board's piece layout into a compact [u8; 64] array.
+fn encode_board(board: &Board) -> ([u8; 64], u64) {
+    let mut pieces = [NO_PIECE_ENC; 64];
+    let mut bb = 0u64;
+    for &color in &[Color::White, Color::Black] {
+        let color_bb = board.color_combined(color);
+        for &piece in &features::ALL_PIECES {
+            let piece_bb = board.pieces(piece) & color_bb;
+            for sq in piece_bb {
+                let idx = sq.to_index();
+                pieces[idx] = encode_piece(color, piece);
+                bb |= 1u64 << idx;
+            }
+        }
+    }
+    (pieces, bb)
+}
+
+/// Find squares where pieces differ between cached and current state.
+#[inline]
+fn get_changed_squares(old: &[u8; 64], new: &[u8; 64]) -> u64 {
+    let mut changed = 0u64;
+    for i in 0..64 {
+        if old[i] != new[i] {
+            changed |= 1u64 << i;
+        }
+    }
+    changed
+}
+
+/// Single Finny Table entry: cached accumulator for one (king_sq, perspective).
+#[repr(align(64))]
+pub struct FinnyEntry {
+    accumulation: [i16; HIDDEN_SIZE],
+    psqt: [i32; MAX_BUCKETS],
+    pieces: [u8; 64],
+    piece_bb: u64,
+}
+
+impl FinnyEntry {
+    fn new(biases: &[i16]) -> Self {
+        let mut entry = Self {
+            accumulation: [0i16; HIDDEN_SIZE],
+            psqt: [0i32; MAX_BUCKETS],
+            pieces: [NO_PIECE_ENC; 64],
+            piece_bb: 0,
+        };
+        let hs = biases.len().min(HIDDEN_SIZE);
+        entry.accumulation[..hs].copy_from_slice(&biases[..hs]);
+        entry
+    }
+}
+
+/// Finny Table: per-(king_square, perspective) accumulator cache.
+/// 64 king squares × 2 perspectives = 128 entries (~144 KB).
+///
+/// Each entry caches the accumulator state from the last time a position
+/// with this king square was evaluated. On refresh, we diff the cached
+/// piece layout against the current board and apply only the changes.
+pub struct FinnyTable {
+    entries: Box<[[FinnyEntry; 2]; 64]>,
+}
+
+impl FinnyTable {
+    /// Create a new Finny Table initialized with biases (empty board state).
+    pub fn new(net: &NnueNetwork) -> Self {
+        let biases = &net.ft_biases;
+        Self {
+            entries: Box::new(std::array::from_fn(|_| {
+                [FinnyEntry::new(biases), FinnyEntry::new(biases)]
+            })),
+        }
+    }
+
+    /// Refresh a single perspective's accumulator using the cached entry.
+    ///
+    /// Instead of recomputing from all pieces (bias + sum of 32 weight columns),
+    /// we diff against the cached state and apply only the changes.
+    fn refresh_perspective(
+        &mut self,
+        acc_out: &mut [i16],
+        psqt_out: &mut [i32],
+        board: &Board,
+        king_sq: usize,
+        perspective: usize, // 0 = white, 1 = black
+        net: &NnueNetwork,
+    ) {
+        let hs = net.hidden_size;
+        let nb = net.num_buckets;
+        let has_psqt = !net.psqt_weights.is_empty();
+        let king_bucketed = net.has_king_buckets();
+
+        let entry = &mut self.entries[king_sq][perspective];
+
+        // Encode current board state
+        let (current_pieces, current_bb) = encode_board(board);
+
+        // Find squares that changed since the cache was last updated
+        let changed = get_changed_squares(&entry.pieces, &current_pieces);
+        let removed_bb = changed & entry.piece_bb;
+        let added_bb = changed & current_bb;
+
+        // Remove old features from cached accumulation
+        let mut iter = removed_bb;
+        while iter != 0 {
+            let sq_idx = iter.trailing_zeros() as usize;
+            iter &= iter - 1;
+
+            if let Some((color, piece)) = decode_piece(entry.pieces[sq_idx]) {
+                let sq = unsafe { Square::new(sq_idx as u8) };
+                let feat = if king_bucketed {
+                    if perspective == 0 {
+                        features::white_bucketed_feature(king_sq, color, piece, sq)
+                    } else {
+                        features::black_bucketed_feature(king_sq, color, piece, sq)
+                    }
+                } else {
+                    if perspective == 0 {
+                        features::white_feature(color, piece, sq)
+                    } else {
+                        features::black_feature(color, piece, sq)
+                    }
+                };
+
+                let offset = feat * hs;
+                vec_sub_i16(
+                    &mut entry.accumulation[..hs],
+                    &net.ft_weights[offset..offset + hs],
+                );
+                if has_psqt {
+                    let psqt_offset = feat * nb;
+                    for b in 0..nb {
+                        entry.psqt[b] -= net.psqt_weights[psqt_offset + b] as i32;
+                    }
+                }
+            }
+        }
+
+        // Add new features to cached accumulation
+        iter = added_bb;
+        while iter != 0 {
+            let sq_idx = iter.trailing_zeros() as usize;
+            iter &= iter - 1;
+
+            if let Some((color, piece)) = decode_piece(current_pieces[sq_idx]) {
+                let sq = unsafe { Square::new(sq_idx as u8) };
+                let feat = if king_bucketed {
+                    if perspective == 0 {
+                        features::white_bucketed_feature(king_sq, color, piece, sq)
+                    } else {
+                        features::black_bucketed_feature(king_sq, color, piece, sq)
+                    }
+                } else {
+                    if perspective == 0 {
+                        features::white_feature(color, piece, sq)
+                    } else {
+                        features::black_feature(color, piece, sq)
+                    }
+                };
+
+                let offset = feat * hs;
+                vec_add_i16(
+                    &mut entry.accumulation[..hs],
+                    &net.ft_weights[offset..offset + hs],
+                );
+                if has_psqt {
+                    let psqt_offset = feat * nb;
+                    for b in 0..nb {
+                        entry.psqt[b] += net.psqt_weights[psqt_offset + b] as i32;
+                    }
+                }
+            }
+        }
+
+        // Update cache with current board state
+        entry.pieces = current_pieces;
+        entry.piece_bb = current_bb;
+
+        // Copy cached result to output accumulator
+        acc_out[..hs].copy_from_slice(&entry.accumulation[..hs]);
+        if has_psqt {
+            psqt_out[..nb].copy_from_slice(&entry.psqt[..nb]);
+        }
+    }
+
+    /// Refresh both perspectives of an accumulator using Finny Table caches.
+    pub fn refresh(&mut self, acc: &mut Accumulator, board: &Board, net: &NnueNetwork) {
+        let wk_sq = board.king_square(Color::White).to_index();
+        let bk_sq = board.king_square(Color::Black).to_index();
+
+        self.refresh_perspective(
+            &mut acc.white, &mut acc.psqt_white,
+            board, wk_sq, 0, net,
+        );
+        self.refresh_perspective(
+            &mut acc.black, &mut acc.psqt_black,
+            board, bk_sq, 1, net,
+        );
+
+        acc.computed = true;
+    }
+}
+
 /// Stack of accumulators indexed by ply for use during search.
 ///
 /// At each ply, the accumulator represents the position after all moves
@@ -330,5 +561,135 @@ unsafe fn vec_sub_i16_avx2(dst: &mut [i16], src: &[i16]) {
         let b = _mm256_loadu_si256(src_ptr.add(i) as *const __m256i);
         _mm256_store_si256(dst_ptr.add(i) as *mut __m256i, _mm256_sub_epi16(a, b));
         i += 16;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    /// Create a small random-ish NNUE network for testing Finny Tables.
+    fn make_test_net() -> NnueNetwork {
+        let hs = 8; // small hidden size for testing
+        let nb = 1; // 1 output bucket
+        let num_input_buckets = 1; // no king bucketing for simplicity
+        let total_features = num_input_buckets * features::NUM_FEATURES;
+
+        // Deterministic "random" weights: feature_idx * 3 + i
+        let ft_weights: Vec<i16> = (0..total_features * hs)
+            .map(|i| ((i as i32 * 7 + 13) % 200 - 100) as i16)
+            .collect();
+        let ft_biases: Vec<i16> = (0..hs).map(|i| (i as i16 + 1) * 10).collect();
+        let output_weights: Vec<i16> = vec![1; nb * 2 * hs];
+        let output_biases: Vec<i16> = vec![0; nb];
+        let psqt_weights: Vec<i16> = vec![0; total_features * nb];
+
+        NnueNetwork {
+            hidden_size: hs,
+            num_buckets: nb,
+            num_input_buckets,
+            ft_weights,
+            ft_biases,
+            output_weights,
+            output_biases,
+            psqt_weights,
+        }
+    }
+
+    #[test]
+    fn test_finny_table_matches_full_refresh() {
+        let net = make_test_net();
+        let board = Board::default();
+
+        // Full refresh
+        let mut acc_full = Accumulator::new(net.hidden_size);
+        acc_full.refresh(&board, &net);
+
+        // Finny Table refresh (first call — cache is empty, so it adds all pieces)
+        let mut finny = FinnyTable::new(&net);
+        let mut acc_finny = Accumulator::new(net.hidden_size);
+        finny.refresh(&mut acc_finny, &board, &net);
+
+        // Both should produce identical results
+        assert_eq!(
+            &acc_full.white[..net.hidden_size],
+            &acc_finny.white[..net.hidden_size],
+            "White perspective mismatch on initial refresh"
+        );
+        assert_eq!(
+            &acc_full.black[..net.hidden_size],
+            &acc_finny.black[..net.hidden_size],
+            "Black perspective mismatch on initial refresh"
+        );
+        assert!(acc_finny.computed);
+    }
+
+    #[test]
+    fn test_finny_table_after_move() {
+        let net = make_test_net();
+
+        // Start position
+        let board1 = Board::default();
+        let mut finny = FinnyTable::new(&net);
+        let mut acc = Accumulator::new(net.hidden_size);
+        finny.refresh(&mut acc, &board1, &net);
+
+        // Make a move: e2e4
+        let board2 = Board::from_str("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1").unwrap();
+
+        // Full refresh on new position
+        let mut acc_full = Accumulator::new(net.hidden_size);
+        acc_full.refresh(&board2, &net);
+
+        // Finny Table refresh on new position (should diff against cached start pos)
+        let mut acc_finny = Accumulator::new(net.hidden_size);
+        finny.refresh(&mut acc_finny, &board2, &net);
+
+        assert_eq!(
+            &acc_full.white[..net.hidden_size],
+            &acc_finny.white[..net.hidden_size],
+            "White perspective mismatch after move"
+        );
+        assert_eq!(
+            &acc_full.black[..net.hidden_size],
+            &acc_finny.black[..net.hidden_size],
+            "Black perspective mismatch after move"
+        );
+    }
+
+    #[test]
+    fn test_finny_table_multiple_positions() {
+        let net = make_test_net();
+        let mut finny = FinnyTable::new(&net);
+
+        let positions = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+            "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e6 0 2",
+            "rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 1 2",
+            "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3",
+        ];
+
+        for fen in &positions {
+            let board = Board::from_str(fen).unwrap();
+
+            let mut acc_full = Accumulator::new(net.hidden_size);
+            acc_full.refresh(&board, &net);
+
+            let mut acc_finny = Accumulator::new(net.hidden_size);
+            finny.refresh(&mut acc_finny, &board, &net);
+
+            assert_eq!(
+                &acc_full.white[..net.hidden_size],
+                &acc_finny.white[..net.hidden_size],
+                "White mismatch at FEN: {}", fen
+            );
+            assert_eq!(
+                &acc_full.black[..net.hidden_size],
+                &acc_finny.black[..net.hidden_size],
+                "Black mismatch at FEN: {}", fen
+            );
+        }
     }
 }

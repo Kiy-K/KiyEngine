@@ -178,7 +178,7 @@ pub fn extract_features(board: &Board) -> ([usize; MAX_ACTIVE], [usize; MAX_ACTI
     (white_feats, black_feats, count)
 }
 
-const ALL_PIECES: [Piece; 6] = [
+pub const ALL_PIECES: [Piece; 6] = [
     Piece::Pawn,
     Piece::Knight,
     Piece::Bishop,
