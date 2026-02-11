@@ -1,6 +1,6 @@
 //! KiyEngine NNUE Trainer — Stockfish-style Architecture
 //!
-//! Architecture: (HalfKAv2_hm → 512)×2 → SCReLU → 8 output buckets
+//! Architecture: (HalfKAv2_hm → 512)×2 → SCReLU → L1(16) → CReLU → L2(8) → select
 //!
 //! Key improvements over basic Chess768:
 //! - King-bucketed inputs (ChessBucketsMirrored): 10 king buckets with horizontal mirroring
@@ -34,6 +34,7 @@ use bullet_lib::{
 use acyclib::graph::{GraphNodeId, GraphNodeIdTy};
 
 const HIDDEN_SIZE: usize = 512;
+const L1_SIZE: usize = 16;
 const NUM_OUTPUT_BUCKETS: usize = 8;
 
 /// King bucket layout: maps 32 half-board squares (horizontally mirrored) to 10 buckets.
@@ -86,8 +87,8 @@ fn main() {
     }
 
     println!("=== KiyEngine NNUE Trainer (Stockfish-style Architecture) ===");
-    println!("Architecture: (HalfKAv2_hm[{}kb] → {})×2 → SCReLU → {} output buckets",
-             NUM_INPUT_BUCKETS, HIDDEN_SIZE, NUM_OUTPUT_BUCKETS);
+    println!("Architecture: (HalfKAv2_hm[{}kb] → {})×2 → SCReLU → L1({}) → CReLU → L2({}) → select",
+             NUM_INPUT_BUCKETS, HIDDEN_SIZE, L1_SIZE, NUM_OUTPUT_BUCKETS);
     println!("Data:         {}", data_path);
     println!("Net ID:       {}", net_id);
     println!("Epochs:       {}", epochs);
@@ -118,14 +119,18 @@ fn main() {
                 .round()
                 .quantise::<i16>(255),
             SavedFormat::id("l0b").round().quantise::<i16>(255),
-            // Transpose l1w for fast CPU inference (row-major per bucket)
-            SavedFormat::id("l1w").round().quantise::<i16>(64).transpose(),
-            SavedFormat::id("l1b").round().quantise::<i16>(255 * 64),
+            // L1: shared hidden layer, i8 weights for fast inference
+            // Transpose for row-major layout: l1w[j * 2*HIDDEN + i]
+            SavedFormat::id("l1w").round().quantise::<i8>(64).transpose(),
+            SavedFormat::id("l1b").round().quantise::<i32>(255 * 64),
+            // L2: per-bucket output layer, i16 weights
+            // Transpose for row-major layout: l2w[bucket * 2*L1_SIZE + j]
+            SavedFormat::id("l2w").round().quantise::<i16>(64).transpose(),
+            SavedFormat::id("l2b").round().quantise::<i16>(255 * 64),
         ])
         .loss_fn(|output, target| output.sigmoid().squared_error(target))
         .build(|builder, stm_inputs, ntm_inputs, output_buckets| {
             // Input factoriser: shared 768→HIDDEN weights added to every bucket.
-            // This helps the network generalise across king positions (Bullet convention).
             let l0f = builder.new_weights("l0f", Shape::new(HIDDEN_SIZE, 768), InitSettings::Zeroed);
             let expanded_factoriser = l0f.repeat(NUM_INPUT_BUCKETS);
 
@@ -133,18 +138,23 @@ fn main() {
             let mut l0 = builder.new_affine("l0", 768 * NUM_INPUT_BUCKETS, HIDDEN_SIZE);
             l0.weights = l0.weights + expanded_factoriser;
 
-            // Output layer: 2*HIDDEN → NUM_OUTPUT_BUCKETS
-            let l1 = builder.new_affine("l1", 2 * HIDDEN_SIZE, NUM_OUTPUT_BUCKETS);
+            // L1: shared hidden layer (2*HIDDEN → L1_SIZE)
+            let l1 = builder.new_affine("l1", 2 * HIDDEN_SIZE, L1_SIZE);
 
-            // Inference: dual perspective with SCReLU activation
+            // L2: per-bucket output layer (2*L1_SIZE → NUM_OUTPUT_BUCKETS)
+            // CReLU doubles L1 output, so L2 input is 2*L1_SIZE
+            let l2 = builder.new_affine("l2", 2 * L1_SIZE, NUM_OUTPUT_BUCKETS);
+
+            // Forward pass: FT → SCReLU → concat → L1 → CReLU → L2 → select
             let stm_hidden = l0.forward(stm_inputs).screlu();
             let ntm_hidden = l0.forward(ntm_inputs).screlu();
-            let hidden_layer = stm_hidden.concat(ntm_hidden);
-            l1.forward(hidden_layer).select(output_buckets)
+            let ft_out = stm_hidden.concat(ntm_hidden);
+            let l1_out = l1.forward(ft_out).crelu();
+            l2.forward(l1_out).select(output_buckets)
         });
 
     // Stricter weight clipping for factorised inputs (prevents overflow in i16)
-    let stricter_clipping = AdamWParams { max_weight: 0.99, min_weight: -0.99, ..Default::default() };
+    let stricter_clipping = AdamWParams { max_weight: 1.98, min_weight: -1.98, ..Default::default() };
     trainer.optimiser.set_params_for_weight("l0w", stricter_clipping);
     trainer.optimiser.set_params_for_weight("l0f", stricter_clipping);
 

@@ -587,12 +587,17 @@ mod tests {
 
         NnueNetwork {
             hidden_size: hs,
+            l1_size: 0,
             num_buckets: nb,
             num_input_buckets,
             ft_weights,
             ft_biases,
             output_weights,
             output_biases,
+            l1_weights: Vec::new(),
+            l1_biases: Vec::new(),
+            l2_weights: Vec::new(),
+            l2_biases: Vec::new(),
             psqt_weights,
         }
     }
