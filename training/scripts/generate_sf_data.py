@@ -217,6 +217,7 @@ def main():
                         help="Number of parallel SF instances")
     parser.add_argument("--sf-path", type=str, default=None,
                         help="Path to Stockfish binary")
+    global PLAY_DEPTH, LABEL_DEPTH
     parser.add_argument("--play-depth", type=int, default=PLAY_DEPTH,
                         help="Depth for self-play moves (default: 4)")
     parser.add_argument("--label-depth", type=int, default=LABEL_DEPTH,
@@ -227,7 +228,6 @@ def main():
                         help="Append to output file instead of overwriting")
     args = parser.parse_args()
 
-    global PLAY_DEPTH, LABEL_DEPTH
     PLAY_DEPTH = args.play_depth
     LABEL_DEPTH = args.label_depth
 
