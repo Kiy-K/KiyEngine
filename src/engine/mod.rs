@@ -58,22 +58,14 @@ impl Engine {
         };
 
         if std::path::Path::new(DEFAULT_MODEL_PATH).exists() {
-<<<<<<< HEAD
-            println!("Loading v6.0.0 GGUF model: {}", DEFAULT_MODEL_PATH);
-=======
             println!("Loading GGUF model: {}", DEFAULT_MODEL_PATH);
->>>>>>> ed1f05e (chore: purge all stale v5.2.0/V5 references for LTS consistency)
             return Self::load_from_gguf(DEFAULT_MODEL_PATH, device);
         }
 
         anyhow::bail!("No model file found. Expected '{}'", DEFAULT_MODEL_PATH,)
     }
 
-<<<<<<< HEAD
-    /// Load model weights from GGUF file (v6.0.0 KiyNet_V6 format)
-=======
     /// Load model weights from GGUF file (KiyNet format)
->>>>>>> ed1f05e (chore: purge all stale v5.2.0/V5 references for LTS consistency)
     pub fn load_from_gguf(model_path: &str, device: Device) -> anyhow::Result<Self> {
         use crate::engine::gguf::GgmlQuantizationType;
         use crate::engine::gguf::GgufFile;

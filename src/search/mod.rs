@@ -284,8 +284,6 @@ impl Searcher {
                 ply,
             ));
 
-            let pos_hist = Arc::new(position_history);
-
             // Pre-compute NN policy ONCE, then share across all threads
             // Use KV cache if available for incremental inference
             let shared_policy: Arc<Option<(Vec<f32>, f32)>> = {
@@ -344,7 +342,6 @@ impl Searcher {
                             // Thread 0 (main): full depth
                             // Thread 1: depth-1, Thread 2: depth+0, Thread 3: depth-2, etc.
                             let effective_max = if max_depth == 0 { MAX_DEPTH } else { max_depth };
-                            let effective_max = effective_max.min(single_move_limit);
                             // Lazy SMP: main thread full depth, helpers use varied offsets
                             // for exploration diversity (Stockfish-inspired)
                             let local_max_depth = if is_main {
@@ -511,7 +508,15 @@ pub struct SearchWorker {
     cached_root_value: f32,
     // Repetition detection: game history (from UCI position command) + search path
     game_history: Arc<Vec<u64>>,
-    search_path: Vec<u64>,
+    search_path: [u64; MAX_PLY],
+    search_path_len: usize,
+    // NNUE evaluation
+    pub nnue: Option<Arc<NnueNetwork>>,
+    pub nnue_acc: Vec<Accumulator>,
+    pub use_nnue_eval: bool,
+    // Triangular PV table
+    pv_table: [[Option<ChessMove>; MAX_PLY]; MAX_PLY],
+    pv_len: [usize; MAX_PLY],
 }
 
 impl SearchWorker {
@@ -533,33 +538,16 @@ impl SearchWorker {
             cached_root_policy: None,
             cached_root_value: 0.0,
             game_history,
-            search_path: Vec::with_capacity(MAX_PLY),
+            search_path: [0u64; MAX_PLY],
+            search_path_len: 0,
+            nnue: None,
+            nnue_acc: (0..MAX_PLY).map(|_| Accumulator::new(512)).collect(),
+            use_nnue_eval: false,
+            pv_table: [[None; MAX_PLY]; MAX_PLY],
+            pv_len: [0; MAX_PLY],
         }
     }
 
-    /// Check for repetition: returns true if current position hash has been seen
-    /// in the game history (from UCI) or in the current search path.
-    #[inline]
-    fn is_repetition(&self, hash: u64) -> bool {
-        // Check search path (current search tree — any repeat is a draw)
-        for &h in self.search_path.iter().rev() {
-            if h == hash {
-                return true;
-            }
-        }
-        // Check game history (positions from UCI `position` command)
-        // 2 occurrences in history means this would be the 3rd → draw
-        let mut count = 0;
-        for &h in self.game_history.iter() {
-            if h == hash {
-                count += 1;
-                if count >= 2 {
-                    return true;
-                }
-            }
-        }
-        false
-    }
 
     /// Extract principal variation from TT (up to `max_len` moves).
     fn extract_pv(&self, root_board: &Board, max_len: usize) -> String {
@@ -595,7 +583,7 @@ impl SearchWorker {
 
     /// Set game position history for repetition detection.
     fn set_game_history(&mut self, history: Vec<u64>) {
-        self.game_hash_history = history;
+        self.game_history = Arc::new(history);
     }
 
     /// Check for repetition: 2-fold in search path OR position seen in game history.
@@ -613,8 +601,8 @@ impl SearchWorker {
             i = i.wrapping_sub(2);
         }
         // Check game history (last 100 positions max for performance)
-        let start = self.game_hash_history.len().saturating_sub(100);
-        for &h in &self.game_hash_history[start..] {
+        let start = self.game_history.len().saturating_sub(100);
+        for &h in &self.game_history[start..] {
             if h == hash {
                 return true;
             }
@@ -952,7 +940,7 @@ impl SearchWorker {
         // --- Step 1b: Repetition detection ---
         if !is_root {
             let hash = self.board.get_hash();
-            if self.is_repetition(hash) {
+            if self.is_repetition() {
                 return (0, None); // Draw by repetition
             }
         }
@@ -1076,16 +1064,16 @@ impl SearchWorker {
                 let old_board = self.board;
                 self.search_path_push(self.board.get_hash());
                 self.board = null_board;
-                self.search_path.push(self.board.get_hash());
+                self.search_path_push(self.board.get_hash());
 
-                // Adaptive reduction: R = 4 + depth/6, capped (Stockfish-like)
-                let r = 4 + (depth / 6).min(3);
+                // Adaptive reduction: R = 3 + depth/6, capped
+                let r = 3 + (depth / 6).min(3);
                 let null_depth = depth.saturating_sub(r);
                 let (val, _) = self.alpha_beta(-beta, -beta + 1, null_depth, ply + 1);
                 let null_score = -val;
 
                 self.board = old_board;
-                self.search_path.pop();
+                self.search_path_pop();
 
                 if self.stop_flag.load(Ordering::Relaxed) {
                     return (0, None);
@@ -1151,11 +1139,11 @@ impl SearchWorker {
                 let old_board = self.board;
                 self.nnue_make_move(*mv, ply);
                 self.board = old_board.make_move_new(*mv);
-                self.search_path.push(self.board.get_hash());
+                self.search_path_push(self.board.get_hash());
                 let (val, _) = self.alpha_beta(-se_beta, -se_beta + 1, se_depth, ply + 1);
                 let score = -val;
                 self.board = old_board;
-                self.search_path.pop();
+                self.search_path_pop();
 
                 if self.stop_flag.load(Ordering::Relaxed) {
                     return (0, None);
@@ -1231,7 +1219,7 @@ impl SearchWorker {
             self.search_path_push(self.board.get_hash());
             self.nnue_make_move(mv, ply);
             self.board = self.board.make_move_new(mv);
-            self.search_path.push(self.board.get_hash());
+            self.search_path_push(self.board.get_hash());
 
             // Record move/piece in stacks for continuation history
             self.move_stack[ply_idx] = Some(mv);
@@ -1368,7 +1356,7 @@ impl SearchWorker {
 
             // --- Step 19: Undo move ---
             self.board = old_board;
-            self.search_path.pop();
+            self.search_path_pop();
 
             if self.stop_flag.load(Ordering::Relaxed) {
                 return (0, None);
