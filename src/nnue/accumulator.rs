@@ -21,12 +21,19 @@ use std::arch::x86_64::*;
 ///
 /// Each perspective has `hidden_size` i16 values representing the sum of
 /// active feature columns plus the bias vector.
+///
+/// Also tracks PSQT (Piece-Square Table) shortcut scores per bucket
+/// for fast material+positional estimates.
 #[derive(Clone)]
 pub struct Accumulator {
     /// White perspective accumulator [hidden_size]
     pub white: Vec<i16>,
     /// Black perspective accumulator [hidden_size]
     pub black: Vec<i16>,
+    /// PSQT scores per bucket for white perspective [num_buckets]
+    pub psqt_white: Vec<i32>,
+    /// PSQT scores per bucket for black perspective [num_buckets]
+    pub psqt_black: Vec<i32>,
     /// Whether this accumulator has been computed
     pub computed: bool,
 }
@@ -37,6 +44,8 @@ impl Accumulator {
         Self {
             white: vec![0i16; hidden_size],
             black: vec![0i16; hidden_size],
+            psqt_white: Vec::new(),
+            psqt_black: Vec::new(),
             computed: false,
         }
     }
@@ -44,12 +53,23 @@ impl Accumulator {
     /// Full refresh: compute accumulator from scratch by scanning the board.
     ///
     /// acc[i] = bias[i] + sum(ft_weights[active_feature][i]) for all active features
+    /// Also computes PSQT shortcut scores if the network has PSQT weights.
     pub fn refresh(&mut self, board: &Board, net: &NnueNetwork) {
         let hs = net.hidden_size;
+        let nb = net.num_buckets;
+        let has_psqt = !net.psqt_weights.is_empty();
 
         // Start from bias
         self.white[..hs].copy_from_slice(&net.ft_biases[..hs]);
         self.black[..hs].copy_from_slice(&net.ft_biases[..hs]);
+
+        // Initialize PSQT accumulators
+        if has_psqt {
+            self.psqt_white.resize(nb, 0);
+            self.psqt_black.resize(nb, 0);
+            self.psqt_white.fill(0);
+            self.psqt_black.fill(0);
+        }
 
         // Extract active features
         let (white_feats, black_feats, count) = features::extract_features(board);
@@ -69,6 +89,16 @@ impl Accumulator {
                 &mut self.black[..hs],
                 &net.ft_weights[b_offset..b_offset + hs],
             );
+
+            // Accumulate PSQT scores
+            if has_psqt {
+                let w_psqt_offset = wf * nb;
+                let b_psqt_offset = bf * nb;
+                for b in 0..nb {
+                    self.psqt_white[b] += net.psqt_weights[w_psqt_offset + b] as i32;
+                    self.psqt_black[b] += net.psqt_weights[b_psqt_offset + b] as i32;
+                }
+            }
         }
 
         self.computed = true;
@@ -77,12 +107,23 @@ impl Accumulator {
     /// Incremental update: apply feature deltas from a move.
     ///
     /// Copies parent accumulator, then adds/subtracts changed feature columns.
+    /// Also incrementally updates PSQT shortcut scores.
     pub fn update_from(&mut self, parent: &Accumulator, delta: &FeatureDelta, net: &NnueNetwork) {
         let hs = net.hidden_size;
+        let nb = net.num_buckets;
+        let has_psqt = !net.psqt_weights.is_empty();
 
         // Copy parent state
         self.white[..hs].copy_from_slice(&parent.white[..hs]);
         self.black[..hs].copy_from_slice(&parent.black[..hs]);
+
+        // Copy PSQT state
+        if has_psqt {
+            self.psqt_white.resize(nb, 0);
+            self.psqt_black.resize(nb, 0);
+            self.psqt_white.copy_from_slice(&parent.psqt_white);
+            self.psqt_black.copy_from_slice(&parent.psqt_black);
+        }
 
         // Subtract removed features
         for r in 0..delta.num_removed {
@@ -97,6 +138,14 @@ impl Accumulator {
                 &mut self.black[..hs],
                 &net.ft_weights[b_offset..b_offset + hs],
             );
+            if has_psqt {
+                let w_psqt = wf * nb;
+                let b_psqt = bf * nb;
+                for b in 0..nb {
+                    self.psqt_white[b] -= net.psqt_weights[w_psqt + b] as i32;
+                    self.psqt_black[b] -= net.psqt_weights[b_psqt + b] as i32;
+                }
+            }
         }
 
         // Add new features
@@ -112,6 +161,14 @@ impl Accumulator {
                 &mut self.black[..hs],
                 &net.ft_weights[b_offset..b_offset + hs],
             );
+            if has_psqt {
+                let w_psqt = wf * nb;
+                let b_psqt = bf * nb;
+                for b in 0..nb {
+                    self.psqt_white[b] += net.psqt_weights[w_psqt + b] as i32;
+                    self.psqt_black[b] += net.psqt_weights[b_psqt + b] as i32;
+                }
+            }
         }
 
         self.computed = true;

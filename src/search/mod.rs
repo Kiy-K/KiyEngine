@@ -16,6 +16,16 @@ const INFINITY: i32 = 32_000;
 const MAX_PLY: usize = 128;
 const MAX_DEPTH: u8 = 64;
 
+/// Sentinel value meaning "no static eval stored in TT"
+const NONE_EVAL: i32 = i32::MIN;
+
+/// Correction history table size (power of 2 for fast modulo)
+const CORRECTION_HIST_SIZE: usize = 16384;
+/// Correction history weight limit (Stockfish-style gravity)
+const CORRECTION_HIST_LIMIT: i32 = 1024;
+/// Correction history grain (scaling factor for stored corrections)
+const CORRECTION_GRAIN: i32 = 256;
+
 // Pre-computed LMR reduction table: lmr_table[depth][moves_searched]
 // Avoids calling f32::ln() in the hot path.
 const LMR_MAX_DEPTH: usize = 64;
@@ -53,6 +63,8 @@ pub struct TTEntry {
     pub score: i32,
     pub flag: TTFlag,
     pub best_move: Option<ChessMove>,
+    /// Cached static eval from NNUE (avoids recomputation on TT hit)
+    pub static_eval: i32,
 }
 
 // =============================================================================
@@ -97,6 +109,9 @@ impl TranspositionTable {
     }
 
     pub fn resize(&self, _mb: usize) {
+        // Note: proper resize requires recreating the Arc<TranspositionTable>.
+        // For now, just clear to avoid stale entries. UCI handler should recreate
+        // the table for actual size changes.
         self.clear();
     }
 
@@ -167,6 +182,9 @@ impl TranspositionTable {
             TTFlag::UpperBound => 2,
         };
         d |= flag_bits << 40;
+        // Pack static eval into bits 42-57 (16 bits, i16)
+        let eval_u16 = entry.static_eval.clamp(-32768, 32767) as i16 as u16;
+        d |= (eval_u16 as u64) << 42;
         d |= 1u64 << 63; // sentinel: never zero
         d
     }
@@ -199,12 +217,16 @@ impl TranspositionTable {
             1 => TTFlag::LowerBound,
             _ => TTFlag::UpperBound,
         };
+        // Extract static eval from bits 42-57 (i16)
+        let static_eval = ((d >> 42) & 0xFFFF) as u16 as i16 as i32;
+
         Some(TTEntry {
             hash,
             depth,
             score,
             flag,
             best_move,
+            static_eval,
         })
     }
 }
@@ -212,10 +234,6 @@ impl TranspositionTable {
 // Module eval local (fallback)
 pub mod eval;
 pub mod lazy_smp;
-pub mod mcts;
-pub mod mcts_arena;
-pub mod mcts_batch;
-pub mod mcts_memory;
 pub mod time;
 pub mod tt;
 use self::time::TimeManager;
@@ -282,6 +300,9 @@ impl Searcher {
 
             // Pre-compute NN policy ONCE, then share across all threads
             // Use KV cache if available for incremental inference
+            // Apply temperature-scaled softmax (LLM technique) to convert raw logits
+            // to proper probabilities. T<1.0 sharpens, T>1.0 flattens the distribution.
+            const POLICY_TEMPERATURE: f32 = 0.8;
             let shared_policy: Arc<Option<(Vec<f32>, f32)>> = {
                 let result = if let Some(ref cache) = kv_cache {
                     let mut cache_guard = cache.lock();
@@ -290,7 +311,26 @@ impl Searcher {
                     engine.forward(&move_history)
                 };
                 if let Ok(res) = result {
-                    if let Ok(pol_vec) = res.0.to_vec1::<f32>() {
+                    if let Ok(mut pol_vec) = res.0.to_vec1::<f32>() {
+                        // Temperature-scaled softmax: softmax(logit / T)
+                        // Scale logits by inverse temperature
+                        let inv_t = 1.0 / POLICY_TEMPERATURE;
+                        for v in pol_vec.iter_mut() {
+                            *v *= inv_t;
+                        }
+                        // Numerically stable softmax: subtract max, exponentiate, normalize
+                        let max_val = pol_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let mut sum = 0.0f32;
+                        for v in pol_vec.iter_mut() {
+                            *v = (*v - max_val).exp();
+                            sum += *v;
+                        }
+                        if sum > 0.0 {
+                            let inv_sum = 1.0 / sum;
+                            for v in pol_vec.iter_mut() {
+                                *v *= inv_sum;
+                            }
+                        }
                         Arc::new(Some((pol_vec, res.1)))
                     } else {
                         Arc::new(None)
@@ -528,6 +568,10 @@ pub struct SearchWorker {
     nnue_acc: Vec<Accumulator>,
     // Whether to actually use NNUE for eval (false = skip accumulator updates)
     use_nnue_eval: bool,
+    // Correction histories (Stockfish-inspired): learn per-position eval corrections
+    // Indexed by hash % CORRECTION_HIST_SIZE, stores [White correction, Black correction]
+    pawn_correction: Box<[[i32; 2]; CORRECTION_HIST_SIZE]>,
+    material_correction: Box<[[i32; 2]; CORRECTION_HIST_SIZE]>,
     // Repetition detection: game position hashes from UCI position command
     game_hash_history: Vec<u64>,
     // Search path hashes for 2-fold repetition during search (fixed-size, zero-alloc)
@@ -568,9 +612,11 @@ impl SearchWorker {
             piece_stack: [0; MAX_PLY],
             cached_root_policy: None,
             cached_root_value: 0.0,
+            use_nnue_eval: nnue.is_some(),
             nnue,
             nnue_acc,
-            use_nnue_eval: false, // NNUE not ready — skip accumulator updates
+            pawn_correction: Box::new([[0i32; 2]; CORRECTION_HIST_SIZE]),
+            material_correction: Box::new([[0i32; 2]; CORRECTION_HIST_SIZE]),
             game_hash_history: Vec::new(),
             search_path: [0u64; MAX_PLY],
             search_path_len: 0,
@@ -638,6 +684,16 @@ impl SearchWorker {
                 }
             }
         }
+        // Age continuation history to prevent stale values from dominating
+        for pp in 0..12 {
+            for pt in 0..64 {
+                for cp in 0..12 {
+                    for ct in 0..64 {
+                        self.cont_history[pp][pt][cp][ct] = self.cont_history[pp][pt][cp][ct] * 3 / 4;
+                    }
+                }
+            }
+        }
     }
 
     // =========================================================================
@@ -651,12 +707,120 @@ impl SearchWorker {
     }
 
     // =========================================================================
-    // FAST STATIC EVAL — NNUE if available, else Material + PST.
+    // RAW NNUE EVAL — pure network output, no adjustments.
     // =========================================================================
     #[inline]
-    fn fast_eval(&mut self, _ply: usize) -> i32 {
-        // NNUE not yet ready — using Material + PST fallback
+    fn raw_nnue_eval(&mut self, ply: usize) -> i32 {
+        if self.use_nnue_eval {
+            if let Some(ref net) = self.nnue {
+                let idx = ply.min(MAX_PLY - 1);
+                if !self.nnue_acc[idx].computed {
+                    self.nnue_acc[idx].refresh(&self.board, net);
+                }
+                return net.evaluate(&self.nnue_acc[idx], self.board.side_to_move(), &self.board);
+            }
+        }
         eval::evaluate(&self.board, 0)
+    }
+
+    // =========================================================================
+    // ADJUSTED STATIC EVAL — Stockfish-inspired eval corrections.
+    //
+    // Applies:
+    // 1. Tempo bonus (small bonus for having the move)
+    // 2. Correction histories (pawn structure + material config learning)
+    // 3. Material scaling (reduce eval in drawish low-material positions)
+    // =========================================================================
+    #[inline]
+    fn fast_eval(&mut self, ply: usize) -> i32 {
+        let raw = self.raw_nnue_eval(ply);
+        self.adjust_eval(raw)
+    }
+
+    /// Apply Stockfish-style eval adjustments to a raw NNUE score.
+    #[inline]
+    fn adjust_eval(&self, raw: i32) -> i32 {
+        let mut eval = raw;
+
+        // 1. Tempo bonus: small advantage for having the move (~15cp in Stockfish)
+        eval += 16;
+
+        // 2. Pawn correction history
+        let pawn_hash = self.board.get_pawn_hash();
+        let pawn_idx = (pawn_hash as usize) % CORRECTION_HIST_SIZE;
+        let stm = if self.board.side_to_move() == Color::White { 0 } else { 1 };
+        let pawn_corr = self.pawn_correction[pawn_idx][stm];
+
+        // 3. Material correction history
+        let mat_hash = self.material_hash();
+        let mat_idx = (mat_hash as usize) % CORRECTION_HIST_SIZE;
+        let mat_corr = self.material_correction[mat_idx][stm];
+
+        // Apply corrections (scaled by CORRECTION_GRAIN)
+        let correction = (pawn_corr + mat_corr) / CORRECTION_GRAIN;
+        eval += correction;
+
+        // 4. Material scaling: reduce eval magnitude when total material is low
+        // This helps avoid overconfident evals in drawish endgames
+        let total_pieces = self.board.combined().0.count_ones() as i32; // 2-32
+        // Scale: full eval at 32 pieces, 60% at minimum (2 kings)
+        // scale_factor = 600 + 400 * (pieces - 2) / 30, in millipawns
+        let scale = (600 + 13 * (total_pieces - 2)).min(1000);
+        eval = eval * scale / 1000;
+
+        eval
+    }
+
+    /// Compute a simple material configuration hash for correction history.
+    /// Combines piece counts into a hash value.
+    #[inline]
+    fn material_hash(&self) -> u64 {
+        let mut h: u64 = 0;
+        for &piece in &[Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen] {
+            let w = (*self.board.pieces(piece) & *self.board.color_combined(Color::White)).0.count_ones() as u64;
+            let b = (*self.board.pieces(piece) & *self.board.color_combined(Color::Black)).0.count_ones() as u64;
+            h = h.wrapping_mul(13).wrapping_add(w);
+            h = h.wrapping_mul(13).wrapping_add(b);
+        }
+        h
+    }
+
+    /// Update correction histories after a search completes at a node.
+    /// Called when we have both a static eval and a search result (best_score).
+    /// The difference between search result and static eval teaches the correction.
+    #[inline]
+    fn update_correction_histories(&mut self, static_eval: i32, search_score: i32, depth: u8) {
+        // Don't update for mate scores
+        if search_score.abs() >= MATE_SCORE - 100 {
+            return;
+        }
+        if static_eval.abs() >= MATE_SCORE - 100 || static_eval == NONE_EVAL {
+            return;
+        }
+
+        let diff = search_score - static_eval;
+        let scaled_diff = diff * CORRECTION_GRAIN;
+        let weight = (depth as i32).min(16);
+        let stm = if self.board.side_to_move() == Color::White { 0 } else { 1 };
+
+        // Pawn correction
+        let pawn_hash = self.board.get_pawn_hash();
+        let pawn_idx = (pawn_hash as usize) % CORRECTION_HIST_SIZE;
+        let pc = &mut self.pawn_correction[pawn_idx][stm];
+        // Stockfish-style gravity: new_val = (old * (limit - weight) + diff * weight) / limit
+        *pc = ((*pc as i64 * (CORRECTION_HIST_LIMIT - weight) as i64
+            + scaled_diff as i64 * weight as i64)
+            / CORRECTION_HIST_LIMIT as i64) as i32;
+        *pc = (*pc).clamp(-CORRECTION_GRAIN * 32, CORRECTION_GRAIN * 32);
+
+        // Material correction
+        let mat_hash = self.material_hash();
+        let mat_idx = (mat_hash as usize) % CORRECTION_HIST_SIZE;
+        let mc = &mut self.material_correction[mat_idx][stm];
+        *mc = ((*mc as i64 * (CORRECTION_HIST_LIMIT - weight) as i64
+            + scaled_diff as i64 * weight as i64)
+            / CORRECTION_HIST_LIMIT as i64) as i32;
+        *mc = (*mc).clamp(-CORRECTION_GRAIN * 32, CORRECTION_GRAIN * 32);
     }
 
     // =========================================================================
@@ -712,6 +876,13 @@ impl SearchWorker {
                 let (left, right) = self.nnue_acc.split_at_mut(child_idx);
                 right[0].white.copy_from_slice(&left[parent_idx].white);
                 right[0].black.copy_from_slice(&left[parent_idx].black);
+                // Copy PSQT state too
+                if !left[parent_idx].psqt_white.is_empty() {
+                    right[0].psqt_white.resize(left[parent_idx].psqt_white.len(), 0);
+                    right[0].psqt_white.copy_from_slice(&left[parent_idx].psqt_white);
+                    right[0].psqt_black.resize(left[parent_idx].psqt_black.len(), 0);
+                    right[0].psqt_black.copy_from_slice(&left[parent_idx].psqt_black);
+                }
                 right[0].computed = true;
             } else {
                 self.nnue_acc[child_idx].computed = false;
@@ -971,6 +1142,7 @@ impl SearchWorker {
         let tt_move = tt_entry.as_ref().and_then(|e| e.best_move);
         let tt_score = tt_entry.as_ref().map(|e| e.score);
         let tt_depth = tt_entry.as_ref().map(|e| e.depth).unwrap_or(0);
+        let tt_static_eval = tt_entry.as_ref().map(|e| e.static_eval);
 
         if !is_pv {
             if let Some(ref entry) = tt_entry {
@@ -998,20 +1170,48 @@ impl SearchWorker {
         }
         self.nodes += 1;
 
-        // --- Step 6: Static Evaluation for pruning (fast, no NN) ---
+        // --- Step 6: Static Evaluation for pruning ---
+        // Use TT cached static eval if available (avoids redundant NNUE computation)
         let static_eval = if in_check {
             -INFINITY
+        } else if let Some(tt_eval) = tt_static_eval {
+            if tt_eval != NONE_EVAL as i32 {
+                tt_eval
+            } else {
+                self.fast_eval(ply)
+            }
         } else {
             self.fast_eval(ply)
         };
 
+        // Use TT score to refine static eval if applicable (Stockfish technique)
+        // If TT score is more accurate than static eval, use it for pruning decisions
+        let eval_for_pruning = if !in_check {
+            if let Some(tt_sc) = tt_score {
+                if let Some(ref entry) = tt_entry {
+                    match entry.flag {
+                        TTFlag::Exact => tt_sc,
+                        TTFlag::LowerBound if tt_sc > static_eval => tt_sc,
+                        TTFlag::UpperBound if tt_sc < static_eval => tt_sc,
+                        _ => static_eval,
+                    }
+                } else {
+                    static_eval
+                }
+            } else {
+                static_eval
+            }
+        } else {
+            static_eval
+        };
+
         // Store eval in stack for improving detection
-        self.eval_stack[ply_idx] = static_eval;
+        self.eval_stack[ply_idx] = eval_for_pruning;
 
         // --- Step 6b: Improving flag ---
         // Position is "improving" if static eval is better than 2 plies ago
         let improving =
-            !in_check && ply >= 2 && static_eval > self.eval_stack[ply_idx.saturating_sub(2)];
+            !in_check && ply >= 2 && eval_for_pruning > self.eval_stack[ply_idx.saturating_sub(2)];
 
         // --- Step 7: Razoring (Stockfish-style) ---
         if !is_pv && !in_check && depth <= 3 {
@@ -1029,10 +1229,10 @@ impl SearchWorker {
         if !is_pv
             && !in_check
             && depth <= 9
-            && static_eval - (if improving { 70 } else { 100 }) * (depth as i32) >= beta
-            && static_eval < MATE_SCORE - 100
+            && eval_for_pruning - (if improving { 70 } else { 100 }) * (depth as i32) >= beta
+            && eval_for_pruning < MATE_SCORE - 100
         {
-            return (static_eval, None);
+            return (eval_for_pruning, None);
         }
 
         // --- Step 8b: Probcut ---
@@ -1041,8 +1241,8 @@ impl SearchWorker {
         if !is_pv
             && !in_check
             && depth >= 5
-            && static_eval >= probcut_beta - 100
-            && static_eval < MATE_SCORE - 100
+            && eval_for_pruning >= probcut_beta - 100
+            && eval_for_pruning < MATE_SCORE - 100
         {
             let pc_depth = depth.saturating_sub(4);
             let (val, _) = self.alpha_beta(probcut_beta - 1, probcut_beta, pc_depth, ply);
@@ -1053,7 +1253,7 @@ impl SearchWorker {
 
         // --- Step 9: Real Null Move Pruning ---
         // Actually pass the move and search with reduced depth
-        if !is_pv && !in_check && depth >= 3 && static_eval >= beta && self.has_non_pawn_material()
+        if !is_pv && !in_check && depth >= 3 && eval_for_pruning >= beta && self.has_non_pawn_material()
         {
             if let Some(null_board) = self.board.null_move() {
                 let old_board = self.board;
@@ -1085,9 +1285,14 @@ impl SearchWorker {
         }
 
         // --- Step 10: Internal Iterative Reduction (IIR) ---
-        // Non-PV: reduce at depth>=3; PV: reduce at depth>=4
-        if tt_move.is_none() && !in_check && (depth >= 4 || (!is_pv && depth >= 3)) {
-            depth -= 1;
+        // Non-PV expected cut nodes: reduce by 2 (Stockfish-inspired)
+        // PV nodes: reduce by 1
+        if tt_move.is_none() && !in_check {
+            if !is_pv && depth >= 4 {
+                depth -= 2;
+            } else if depth >= 4 {
+                depth -= 1;
+            }
         }
 
         // --- Step 11: Neural Policy Lookup (root only, from cache — zero cost) ---
@@ -1185,6 +1390,35 @@ impl SearchWorker {
                 let futility_margin = static_eval + 150 + 100 * (depth as i32);
                 if futility_margin <= alpha {
                     continue;
+                }
+            }
+
+            // --- Step 14b: History Pruning (Stockfish-inspired) ---
+            // Prune quiet moves with very negative history at shallow depths
+            if !is_root && !in_check && !is_tactical && depth <= 4 && moves_searched > 0 {
+                let moved_piece_local = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
+                let moved_color_local = self.board.side_to_move();
+                let side_local = if moved_color_local == Color::White { 0 } else { 1 };
+                let h = self.history[side_local][mv.get_source().to_index()][mv.get_dest().to_index()];
+                let threshold = -2000 * (depth as i32);
+                if h < threshold {
+                    continue;
+                }
+                // Also check continuation history
+                if ply >= 1 {
+                    let prev_ply_idx = (ply - 1).min(MAX_PLY - 1);
+                    let pp = self.piece_stack[prev_ply_idx] as usize;
+                    if let Some(prev_mv) = self.move_stack[prev_ply_idx] {
+                        let pt = prev_mv.get_dest().to_index();
+                        let cp = Self::piece_index(moved_piece_local, moved_color_local) as usize;
+                        let ct = mv.get_dest().to_index();
+                        if pp < 12 && cp < 12 {
+                            let ch = self.cont_history[pp][pt][cp][ct];
+                            if ch < threshold {
+                                continue;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1480,7 +1714,10 @@ impl SearchWorker {
                         score,
                         flag: TTFlag::LowerBound,
                         best_move: Some(mv),
+                        static_eval,
                     });
+                    // Update correction histories: search found score != static eval
+                    self.update_correction_histories(static_eval, score, depth);
                     return (score, Some(mv));
                 }
             }
@@ -1499,7 +1736,13 @@ impl SearchWorker {
             score: best_score,
             flag,
             best_move,
+            static_eval,
         });
+
+        // Update correction histories at non-root PV/all nodes
+        if !is_root {
+            self.update_correction_histories(static_eval, best_score, depth);
+        }
 
         (best_score, best_move)
     }
@@ -1600,13 +1843,10 @@ impl SearchWorker {
                 scored_moves.push((mv, see_score));
             }
             // Second pass: non-capture queen promotions (critical for endgames)
+            // Reuse the same MoveGen iterator — set mask to non-capture squares
             moves.set_iterator_mask(!targets & !chess::EMPTY);
-            // Actually, iterate over all remaining non-capture moves and pick queen promos
-            let all_moves = MoveGen::new_legal(&self.board);
-            for mv in all_moves {
-                if mv.get_promotion() == Some(Piece::Queen)
-                    && (targets & BitBoard::from_square(mv.get_dest())).0 == 0
-                {
+            for mv in &mut moves {
+                if mv.get_promotion() == Some(Piece::Queen) {
                     scored_moves.push((mv, 44_000)); // Just below main search promo score
                 }
             }
@@ -1652,6 +1892,7 @@ impl SearchWorker {
                     score,
                     flag: TTFlag::LowerBound,
                     best_move: Some(mv),
+                    static_eval: stand_pat,
                 });
                 return score;
             }
@@ -1672,6 +1913,7 @@ impl SearchWorker {
             score: best_score,
             flag,
             best_move,
+            static_eval: stand_pat,
         });
 
         alpha
@@ -1719,11 +1961,15 @@ impl SearchWorker {
                 score += 200_000;
             }
 
-            // 2. Neural policy score (very high priority when available)
+            // 2. Neural policy score with temperature-scaled softmax (LLM technique)
+            // Raw logits are converted to probabilities via softmax(logit / T)
+            // T=0.8 sharpens the distribution → more decisive move ordering
             if let Some(pol) = policy {
                 let token = MoveCodec::get_policy_index(&mv);
                 if token < pol.len() {
-                    score += (pol[token] * 15_000.0) as i32;
+                    // pol[token] is already a logit; scale by temperature-adjusted weight
+                    // We use the raw value * 20_000 to give strong policy influence
+                    score += (pol[token] * 20_000.0) as i32;
                 }
             }
 

@@ -46,8 +46,13 @@ pub const SCALE: i32 = 400;
 /// Magic bytes for NNUE binary file format
 pub const NNUE_MAGIC: &[u8; 4] = b"KYNN";
 
-/// Current NNUE format version
-pub const NNUE_VERSION: u32 = 1;
+/// Current NNUE format version (v3: output buckets + PSQT shortcut)
+pub const NNUE_VERSION: u32 = 3;
+/// Also accept v2 files (single bucket, no PSQT)
+const NNUE_VERSION_V2: u32 = 2;
+
+/// Number of output buckets (piece-count based)
+pub const NUM_BUCKETS: usize = 8;
 
 /// Default NNUE file path
 pub const DEFAULT_NNUE_PATH: &str = "kiyengine.nnue";
@@ -59,6 +64,8 @@ pub const DEFAULT_NNUE_PATH: &str = "kiyengine.nnue";
 /// NNUE network weights (quantized, loaded from binary file).
 ///
 /// Architecture: (768 → hidden_size)×2 → SCReLU → 2*hidden_size → 1
+/// With output buckets: each bucket has its own output weights and bias.
+/// Bucket selected by: (total_pieces - 2) / 4
 pub struct NnueNetwork {
     /// Feature transformer weights: [NUM_FEATURES * hidden_size] (i16, row-major)
     /// ft_weights[feature * hidden_size + i] = weight for feature → neuron i
@@ -67,29 +74,52 @@ pub struct NnueNetwork {
     /// Feature transformer biases: [hidden_size] (i16)
     pub ft_biases: Vec<i16>,
 
-    /// Output layer weights: [2 * hidden_size] (i16)
-    /// First half for "us" perspective, second half for "them"
+    /// Output layer weights per bucket: [num_buckets][2 * hidden_size] (i16, flattened)
+    /// output_weights[bucket * 2 * hidden_size + i]
     pub output_weights: Vec<i16>,
 
-    /// Output layer bias (i16)
-    pub output_bias: i16,
+    /// Output layer bias per bucket: [num_buckets] (i16)
+    pub output_biases: Vec<i16>,
 
-    /// Hidden layer size (typically 256)
+    /// PSQT weights from feature transformer: [NUM_FEATURES * num_buckets] (i16)
+    /// psqt_weights[feature * num_buckets + bucket]
+    /// Empty if no PSQT shortcut.
+    pub psqt_weights: Vec<i16>,
+
+    /// Hidden layer size (typically 256 or 512)
     pub hidden_size: usize,
+
+    /// Number of output buckets (1 = legacy, 8 = standard)
+    pub num_buckets: usize,
 }
 
 impl NnueNetwork {
-    /// Evaluate a position given a computed accumulator.
+    /// Select output bucket based on total piece count.
+    /// bucket = (total_pieces - 2) / 4, clamped to [0, num_buckets-1]
+    #[inline]
+    pub fn bucket_index(&self, board: &Board) -> usize {
+        if self.num_buckets <= 1 {
+            return 0;
+        }
+        let total = board.combined().0.count_ones() as usize;
+        // total is 2..=32, bucket = (total - 2) / 4 gives 0..7
+        let bucket = (total.saturating_sub(2)) / 4;
+        bucket.min(self.num_buckets - 1)
+    }
+
+    /// Evaluate a position given a computed accumulator and the board (for bucket selection).
     ///
-    /// 1. Apply SCReLU: clamp(x, 0, QA)² to both perspectives
-    /// 2. Dot product with output weights
-    /// 3. Scale to centipawns
+    /// 1. Select output bucket by piece count
+    /// 2. Apply SCReLU: clamp(x, 0, QA)² to both perspectives
+    /// 3. Dot product with bucket's output weights
+    /// 4. Scale to centipawns
     ///
     /// Returns evaluation in centipawns from side-to-move's perspective.
     #[inline]
-    pub fn evaluate(&self, acc: &Accumulator, stm: Color) -> i32 {
+    pub fn evaluate(&self, acc: &Accumulator, stm: Color, board: &Board) -> i32 {
         debug_assert!(acc.computed, "Accumulator not computed");
 
+        let bucket = self.bucket_index(board);
         let (us, them) = match stm {
             Color::White => (&acc.white, &acc.black),
             Color::Black => (&acc.black, &acc.white),
@@ -98,34 +128,40 @@ impl NnueNetwork {
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") {
-                return unsafe { self.evaluate_avx2(us, them) };
+                return unsafe { self.evaluate_avx2(us, them, bucket) };
             }
         }
 
-        self.evaluate_scalar(us, them)
+        self.evaluate_scalar(us, them, bucket)
     }
 
     /// Scalar fallback evaluate (no SIMD).
+    /// Dequantization follows Bullet convention: (sum/QA + bias) * SCALE / (QA*QB)
     #[inline]
-    fn evaluate_scalar(&self, us: &[i16], them: &[i16]) -> i32 {
-        let qa = QA as i32;
-        let qa_sq = (QA as i64) * (QA as i64);
+    fn evaluate_scalar(&self, us: &[i16], them: &[i16], bucket: usize) -> i32 {
+        let qa = QA as i64;
+        let hs = self.hidden_size;
+        let w_offset = bucket * 2 * hs;
 
         let mut sum: i64 = 0;
 
-        for i in 0..self.hidden_size {
-            let v = (us[i] as i32).clamp(0, qa);
-            sum += (v * v) as i64 * self.output_weights[i] as i64;
+        for i in 0..hs {
+            let v = (us[i] as i64).clamp(0, qa);
+            sum += v * v * self.output_weights[w_offset + i] as i64;
         }
 
-        for i in 0..self.hidden_size {
-            let v = (them[i] as i32).clamp(0, qa);
-            sum += (v * v) as i64 * self.output_weights[self.hidden_size + i] as i64;
+        for i in 0..hs {
+            let v = (them[i] as i64).clamp(0, qa);
+            sum += v * v * self.output_weights[w_offset + hs + i] as i64;
         }
 
-        // sum is in QA² * QB units → divide by QA² to get QB units, add bias (QB units), divide by QB
-        let eval_cp = (sum / qa_sq + self.output_bias as i64) / (QB as i64);
-        eval_cp as i32
+        // sum is in QA² * QB units
+        // Bullet dequantization: (sum/QA + bias) * SCALE / (QA * QB)
+        sum /= qa;                                       // QA²*QB → QA*QB
+        sum += self.output_biases[bucket] as i64;         // bias in QA*QB units
+        sum *= SCALE as i64;                              // → centipawn-scaled
+        sum /= qa * QB as i64;                            // remove quantization
+        sum as i32
     }
 
     /// AVX2-vectorized SCReLU evaluate.
@@ -135,7 +171,7 @@ impl NnueNetwork {
     /// Uses 4 i32 accumulators to exploit instruction-level parallelism.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    unsafe fn evaluate_avx2(&self, us: &[i16], them: &[i16]) -> i32 {
+    unsafe fn evaluate_avx2(&self, us: &[i16], them: &[i16], bucket: usize) -> i32 {
         let zero = _mm256_setzero_si256();
         let qa_vec = _mm256_set1_epi16(QA);
 
@@ -143,23 +179,18 @@ impl NnueNetwork {
         let mut sum1 = _mm256_setzero_si256();
 
         let hs = self.hidden_size;
+        let w_offset = bucket * 2 * hs;
         debug_assert!(hs % 16 == 0, "hidden_size must be multiple of 16 for AVX2");
 
         // Process "us" perspective
         let mut i = 0;
         while i < hs {
-            // Load 16 x i16 accumulator values and weights
             let acc = _mm256_loadu_si256(us.as_ptr().add(i) as *const __m256i);
-            let wgt = _mm256_loadu_si256(self.output_weights.as_ptr().add(i) as *const __m256i);
+            let wgt = _mm256_loadu_si256(self.output_weights.as_ptr().add(w_offset + i) as *const __m256i);
 
-            // Clamp to [0, QA]: max(0, min(x, QA))
             let clamped = _mm256_min_epi16(_mm256_max_epi16(acc, zero), qa_vec);
 
-            // SCReLU trick: compute (clamped * weight) * clamped
-            // Step 1: clamped * weight → i16 (low 16 bits)
             let vw = _mm256_mullo_epi16(clamped, wgt);
-            // Step 2: madd_epi16(vw, clamped) → pairs of i16 multiplied and adjacent-added to i32
-            // This computes: vw[0]*clamped[0] + vw[1]*clamped[1] as i32, etc.
             let prod = _mm256_madd_epi16(vw, clamped);
 
             sum0 = _mm256_add_epi32(sum0, prod);
@@ -171,7 +202,7 @@ impl NnueNetwork {
         while i < hs {
             let acc = _mm256_loadu_si256(them.as_ptr().add(i) as *const __m256i);
             let wgt =
-                _mm256_loadu_si256(self.output_weights.as_ptr().add(hs + i) as *const __m256i);
+                _mm256_loadu_si256(self.output_weights.as_ptr().add(w_offset + hs + i) as *const __m256i);
 
             let clamped = _mm256_min_epi16(_mm256_max_epi16(acc, zero), qa_vec);
 
@@ -184,22 +215,22 @@ impl NnueNetwork {
 
         // Horizontal sum: sum0 + sum1 → 8 x i32 → scalar
         let combined = _mm256_add_epi32(sum0, sum1);
-        // Reduce 8 x i32 to scalar
         let hi128 = _mm256_extracti128_si256(combined, 1);
         let lo128 = _mm256_castsi256_si128(combined);
         let sum128 = _mm_add_epi32(lo128, hi128);
-        // Shuffle and add: [a,b,c,d] → [c,d,a,b] → add → [a+c,b+d,..]
         let hi64 = _mm_shuffle_epi32(sum128, 0b_01_00_11_10);
         let sum64 = _mm_add_epi32(sum128, hi64);
-        // Final pair
         let hi32 = _mm_shuffle_epi32(sum64, 0b_00_00_00_01);
         let total = _mm_add_epi32(sum64, hi32);
         let dot = _mm_cvtsi128_si32(total) as i64;
 
-        // Dequantize: dot is in QA² * QB units
-        let qa_sq = (QA as i64) * (QA as i64);
-        let eval_cp = (dot / qa_sq + self.output_bias as i64) / (QB as i64);
-        eval_cp as i32
+        // Bullet dequantization: (sum/QA + bias) * SCALE / (QA * QB)
+        let qa = QA as i64;
+        let mut result = dot / qa;                              // QA²*QB → QA*QB
+        result += self.output_biases[bucket] as i64;             // bias in QA*QB units
+        result *= SCALE as i64;                                  // → centipawn-scaled
+        result /= qa * QB as i64;                                // remove quantization
+        result as i32
     }
 
     /// Evaluate a board from scratch (no accumulator reuse).
@@ -207,19 +238,16 @@ impl NnueNetwork {
     pub fn evaluate_board(&self, board: &Board) -> i32 {
         let mut acc = Accumulator::new(self.hidden_size);
         acc.refresh(board, self);
-        self.evaluate(&acc, board.side_to_move())
+        self.evaluate(&acc, board.side_to_move(), board)
     }
 
     /// Load NNUE weights from a binary file.
     ///
-    /// Format:
-    /// - Magic: "KYNN" (4 bytes)
-    /// - Version: u32 LE
-    /// - hidden_size: u32 LE
-    /// - ft_weights: i16[768 * hidden_size] LE
-    /// - ft_biases: i16[hidden_size] LE
-    /// - output_weights: i16[2 * hidden_size] LE
-    /// - output_bias: i16 LE
+    /// Supports v2 (single bucket) and v3 (output buckets + PSQT) formats.
+    ///
+    /// v2 format: Magic, Version, hidden_size, ft_weights, ft_biases, output_weights[2*hs], output_bias
+    /// v3 format: Magic, Version, hidden_size, num_buckets, ft_weights, ft_biases,
+    ///            psqt_weights[768*num_buckets], output_weights[num_buckets*2*hs], output_biases[num_buckets]
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let data = std::fs::read(path.as_ref())?;
         Self::from_bytes(&data)
@@ -244,10 +272,11 @@ impl NnueNetwork {
         let mut buf4 = [0u8; 4];
         cursor.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != NNUE_VERSION {
+        if version != NNUE_VERSION && version != NNUE_VERSION_V2 {
             anyhow::bail!(
-                "Unsupported NNUE version: {} (expected {})",
+                "Unsupported NNUE version: {} (expected {} or {})",
                 version,
+                NNUE_VERSION_V2,
                 NNUE_VERSION
             );
         }
@@ -256,50 +285,89 @@ impl NnueNetwork {
         cursor.read_exact(&mut buf4)?;
         let hidden_size = u32::from_le_bytes(buf4) as usize;
 
-        // Read feature transformer weights: i16[768 * hidden_size]
-        let ft_count = NUM_FEATURES * hidden_size;
-        let ft_weights = read_i16_vec(&mut cursor, ft_count)?;
+        if version == NNUE_VERSION_V2 {
+            // --- V2: single bucket, no PSQT ---
+            let ft_count = NUM_FEATURES * hidden_size;
+            let ft_weights = read_i16_vec(&mut cursor, ft_count)?;
+            let ft_biases = read_i16_vec(&mut cursor, hidden_size)?;
+            let output_weights = read_i16_vec(&mut cursor, 2 * hidden_size)?;
 
-        // Read feature transformer biases: i16[hidden_size]
-        let ft_biases = read_i16_vec(&mut cursor, hidden_size)?;
+            let mut buf2 = [0u8; 2];
+            cursor.read_exact(&mut buf2)?;
+            let output_bias = i16::from_le_bytes(buf2);
 
-        // Read output weights: i16[2 * hidden_size]
-        let output_weights = read_i16_vec(&mut cursor, 2 * hidden_size)?;
+            let total_bytes = ft_count * 2 + hidden_size * 2 + hidden_size * 4 + 2;
+            println!(
+                "  NNUE v2 loaded: hidden_size={}, buckets=1, total={:.1}KB",
+                hidden_size,
+                total_bytes as f64 / 1024.0,
+            );
 
-        // Read output bias: i16
-        let mut buf2 = [0u8; 2];
-        cursor.read_exact(&mut buf2)?;
-        let output_bias = i16::from_le_bytes(buf2);
+            Ok(Self {
+                ft_weights,
+                ft_biases,
+                output_weights,
+                output_biases: vec![output_bias],
+                psqt_weights: Vec::new(),
+                hidden_size,
+                num_buckets: 1,
+            })
+        } else {
+            // --- V3: output buckets + optional PSQT ---
+            cursor.read_exact(&mut buf4)?;
+            let num_buckets = u32::from_le_bytes(buf4) as usize;
 
-        println!(
-            "  NNUE loaded: hidden_size={}, ft_weights={}, output_weights={}, total={:.1}KB",
-            hidden_size,
-            ft_count,
-            2 * hidden_size,
-            (ft_count * 2 + hidden_size * 2 + hidden_size * 4 + 2) as f64 / 1024.0,
-        );
+            let ft_count = NUM_FEATURES * hidden_size;
+            let ft_weights = read_i16_vec(&mut cursor, ft_count)?;
+            let ft_biases = read_i16_vec(&mut cursor, hidden_size)?;
 
-        Ok(Self {
-            ft_weights,
-            ft_biases,
-            output_weights,
-            output_bias,
-            hidden_size,
-        })
+            // PSQT weights: [768 * num_buckets]
+            let psqt_weights = read_i16_vec(&mut cursor, NUM_FEATURES * num_buckets)?;
+
+            // Output weights: [num_buckets * 2 * hidden_size]
+            let output_weights = read_i16_vec(&mut cursor, num_buckets * 2 * hidden_size)?;
+
+            // Output biases: [num_buckets]
+            let output_biases = read_i16_vec(&mut cursor, num_buckets)?;
+
+            let total_bytes = ft_count * 2 + hidden_size * 2
+                + NUM_FEATURES * num_buckets * 2
+                + num_buckets * 2 * hidden_size * 2
+                + num_buckets * 2;
+            println!(
+                "  NNUE v3 loaded: hidden_size={}, buckets={}, psqt={}, total={:.1}KB",
+                hidden_size,
+                num_buckets,
+                !psqt_weights.is_empty(),
+                total_bytes as f64 / 1024.0,
+            );
+
+            Ok(Self {
+                ft_weights,
+                ft_biases,
+                output_weights,
+                output_biases,
+                psqt_weights,
+                hidden_size,
+                num_buckets,
+            })
+        }
     }
 
     /// Create a network with random weights (for testing/bootstrapping only).
+    /// Uses single bucket for simplicity.
     pub fn random(hidden_size: usize) -> Self {
+        let num_buckets = 1;
         let ft_count = NUM_FEATURES * hidden_size;
         let mut ft_weights = vec![0i16; ft_count];
         let mut ft_biases = vec![0i16; hidden_size];
-        let mut output_weights = vec![0i16; 2 * hidden_size];
+        let mut output_weights = vec![0i16; num_buckets * 2 * hidden_size];
 
         // Simple deterministic pseudo-random initialization
         let mut seed: u64 = 0xDEADBEEF;
         for w in ft_weights.iter_mut() {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            *w = ((seed >> 48) as i16) / 256; // Small values ~[-128, 127]
+            *w = ((seed >> 48) as i16) / 256;
         }
         for b in ft_biases.iter_mut() {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -314,20 +382,26 @@ impl NnueNetwork {
             ft_weights,
             ft_biases,
             output_weights,
-            output_bias: 0,
+            output_biases: vec![0i16; num_buckets],
+            psqt_weights: Vec::new(),
             hidden_size,
+            num_buckets,
         }
     }
 
-    /// Serialize network to binary format (for saving trained weights).
+    /// Serialize network to v3 binary format.
     pub fn to_bytes(&self) -> Vec<u8> {
         let ft_count = NUM_FEATURES * self.hidden_size;
-        let total_size = 4 + 4 + 4 + ft_count * 2 + self.hidden_size * 2 + self.hidden_size * 4 + 2;
+        let psqt_count = NUM_FEATURES * self.num_buckets;
+        let out_count = self.num_buckets * 2 * self.hidden_size;
+        let total_size = 4 + 4 + 4 + 4 + ft_count * 2 + self.hidden_size * 2
+            + psqt_count * 2 + out_count * 2 + self.num_buckets * 2;
         let mut buf = Vec::with_capacity(total_size);
 
         buf.extend_from_slice(NNUE_MAGIC);
         buf.extend_from_slice(&NNUE_VERSION.to_le_bytes());
         buf.extend_from_slice(&(self.hidden_size as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.num_buckets as u32).to_le_bytes());
 
         for &w in &self.ft_weights {
             buf.extend_from_slice(&w.to_le_bytes());
@@ -335,10 +409,23 @@ impl NnueNetwork {
         for &b in &self.ft_biases {
             buf.extend_from_slice(&b.to_le_bytes());
         }
+        // PSQT weights (may be empty for num_buckets=1)
+        if self.psqt_weights.is_empty() {
+            // Write zeros for PSQT if not trained
+            for _ in 0..psqt_count {
+                buf.extend_from_slice(&0i16.to_le_bytes());
+            }
+        } else {
+            for &w in &self.psqt_weights {
+                buf.extend_from_slice(&w.to_le_bytes());
+            }
+        }
         for &w in &self.output_weights {
             buf.extend_from_slice(&w.to_le_bytes());
         }
-        buf.extend_from_slice(&self.output_bias.to_le_bytes());
+        for &b in &self.output_biases {
+            buf.extend_from_slice(&b.to_le_bytes());
+        }
 
         buf
     }
@@ -387,10 +474,11 @@ mod tests {
         let net2 = NnueNetwork::from_bytes(&bytes).unwrap();
 
         assert_eq!(net.hidden_size, net2.hidden_size);
+        assert_eq!(net.num_buckets, net2.num_buckets);
         assert_eq!(net.ft_weights, net2.ft_weights);
         assert_eq!(net.ft_biases, net2.ft_biases);
         assert_eq!(net.output_weights, net2.output_weights);
-        assert_eq!(net.output_bias, net2.output_bias);
+        assert_eq!(net.output_biases, net2.output_biases);
     }
 
     #[test]
