@@ -1,13 +1,16 @@
 #!/bin/bash
 # ============================================================
-# Download Lichess Broadcast Data & Convert to Bulletformat
+# Download Lichess Data & Convert to Bulletformat (SF Depth-12)
 # ============================================================
 #
-# Downloads recent Lichess broadcast PGN files (GM/IM games),
-# extracts training positions, and converts to bulletformat.
+# Downloads Lichess broadcast PGN files (GM/IM games), labels
+# each position with Stockfish depth 12, and converts to
+# bulletformat for NNUE training.
 #
 # Usage:
 #   ./download_and_convert.sh [--months "2025-01 2025-02 ..."] [--all]
+#   ./download_and_convert.sh --threads 8
+#   ./download_and_convert.sh --no-label   # WDL-only (fast)
 # ============================================================
 
 set -euo pipefail
@@ -22,16 +25,27 @@ mkdir -p "$DATA_DIR"
 # Default: download last 6 months of broadcasts
 MONTHS=""
 DOWNLOAD_ALL=false
+LABEL_DEPTH=12
+THREADS=8
+NO_LABEL=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --months) MONTHS="$2"; shift 2 ;;
         --all) DOWNLOAD_ALL=true; shift ;;
+        --threads) THREADS="$2"; shift 2 ;;
+        --label-depth) LABEL_DEPTH="$2"; shift 2 ;;
+        --no-label) NO_LABEL=true; shift ;;
         *) shift ;;
     esac
 done
 
-echo "=== Lichess Broadcast → Bulletformat Pipeline ==="
+LABEL_FLAG="--label-depth $LABEL_DEPTH --threads $THREADS"
+if [ "$NO_LABEL" = true ]; then
+    LABEL_FLAG="--no-label"
+fi
+
+echo "=== Lichess Broadcast → Bulletformat Pipeline (SF depth $LABEL_DEPTH) ==="
 echo ""
 
 # ── Step 1: Download & extract positions ──
@@ -39,18 +53,18 @@ echo "[Step 1] Downloading and extracting positions..."
 cd "$TRAINING_DIR"
 
 if [ "$DOWNLOAD_ALL" = true ]; then
-    python3 scripts/prepare_data.py --download-all --output "$DATA_DIR/train.txt" --min-elo 2400
+    python3 scripts/prepare_data.py --download-all --output "$DATA_DIR/train.txt" --min-elo 2400 $LABEL_FLAG
 elif [ -n "$MONTHS" ]; then
     for month in $MONTHS; do
         echo "  Processing month: $month"
-        python3 scripts/prepare_data.py --download "$month" --output "$DATA_DIR/train.txt" --min-elo 2400
+        python3 scripts/prepare_data.py --download "$month" --output "$DATA_DIR/train.txt" --min-elo 2400 $LABEL_FLAG
     done
 else
-    # Default: last few available months
+    # Default: last few available months of broadcast data
     echo "  Downloading recent broadcast months..."
     for month in 2024-07 2024-08 2024-09 2024-10 2024-11 2024-12 2025-01; do
         echo "  Processing month: $month"
-        python3 scripts/prepare_data.py --download "$month" --output "$DATA_DIR/train.txt" --min-elo 2400 || true
+        python3 scripts/prepare_data.py --download "$month" --output "$DATA_DIR/train.txt" --min-elo 2400 $LABEL_FLAG || true
     done
 fi
 

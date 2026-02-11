@@ -1,20 +1,33 @@
 #!/usr/bin/env python3
 """
-Lichess Broadcast PGN → Bullet Training Data Pipeline
+Lichess PGN → NNUE Training Data Pipeline (Stockfish Depth-12 Labels)
 
-Downloads Lichess broadcast PGN files (high-quality GM/IM games) and converts
-them to Bullet's text format: `<FEN> | <score_cp> | <result>`
+Extracts positions from Lichess broadcast PGN files (GM/IM games) and/or
+standard-rated game PGNs, then labels each position with Stockfish at
+configurable depth (default: 12) for high-quality NNUE training data.
 
-The text output can then be converted to bulletformat using bullet-utils:
-  cargo run --release --package bullet-utils -- text-to-bullet input.txt output.bullet
+Output: Bullet text format `<FEN> | <score_cp> | <result>`
+Convert: bullet-utils convert --from text --input train.txt --output train.bullet
 
 Usage:
-  python prepare_data.py --input broadcast.pgn.zst --output data/train.txt [--min-elo 2400]
-  python prepare_data.py --download 2025-01 --output data/train.txt
-  python prepare_data.py --download-all --output data/train.txt
+  # Broadcast games (auto-download from Lichess):
+  python prepare_data.py --download 2025-01 --output data/train.txt --label-depth 12
+
+  # All recent broadcast months:
+  python prepare_data.py --download-all --output data/train.txt --label-depth 12 --threads 8
+
+  # Local PGN file (broadcast or standard-rated):
+  python prepare_data.py --input games.pgn.zst --output data/train.txt --label-depth 12
+
+  # Download standard-rated games from Lichess (by month):
+  python prepare_data.py --download-standard 2025-01 --output data/train.txt --label-depth 12
+
+  # WDL-only (no SF labeling, fast but lower quality):
+  python prepare_data.py --download-all --output data/train.txt --no-label
 
 Requirements:
   pip install python-chess zstandard requests tqdm
+  Stockfish binary (set STOCKFISH_PATH or use --sf-path)
 """
 
 import argparse
@@ -45,26 +58,50 @@ try:
 except ImportError:
     tqdm = None
 
+try:
+    import chess.engine
+except ImportError:
+    pass  # Handled when --label-depth is used
+
 
 BROADCAST_BASE = "https://database.lichess.org/broadcast"
 BROADCAST_LIST = f"{BROADCAST_BASE}/list.txt"
+STANDARD_BASE = "https://database.lichess.org/standard"
 
 # Positions to skip (opening, endgame with few pieces)
 MIN_PLY = 16          # Skip first 8 full moves (opening book territory)
 MIN_PIECES = 6        # Skip positions with fewer than 6 pieces
 MAX_POSITIONS_PER_GAME = 80  # Cap positions per game
 SAMPLE_RATE = 0.6     # Sample 60% of eligible positions (reduce correlation)
+MAX_ABS_EVAL = 3000   # Skip positions with |eval| > 3000cp (decided games)
+SF_HASH_MB = 128      # Stockfish hash per instance
 
 
-def download_broadcast(month: str, output_dir: str = "downloads") -> str:
-    """Download a Lichess broadcast PGN for a given month (e.g., '2025-01')."""
+def get_sf_path(user_path=None):
+    """Find Stockfish binary."""
+    candidates = [
+        user_path,
+        os.environ.get("STOCKFISH_PATH"),
+        "stockfish",
+        "/usr/local/bin/stockfish",
+        "/usr/bin/stockfish",
+        os.path.expanduser("~/stockfish/stockfish"),
+        os.path.expanduser("~/Documents/Chess_engine/stockfish-ubuntu-x86-64-avx2/stockfish/stockfish-ubuntu-x86-64-avx2"),
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return "stockfish"  # Let it fail with a clear error
+
+
+def download_file(url: str, output_dir: str = "downloads") -> str:
+    """Download a file from URL if not already cached locally."""
     if requests is None:
         print("ERROR: requests required for download. Install: pip install requests")
         sys.exit(1)
 
     os.makedirs(output_dir, exist_ok=True)
-    filename = f"lichess_db_broadcast_{month}.pgn.zst"
-    url = f"{BROADCAST_BASE}/{filename}"
+    filename = url.split("/")[-1]
     local_path = os.path.join(output_dir, filename)
 
     if os.path.exists(local_path):
@@ -92,6 +129,21 @@ def download_broadcast(month: str, output_dir: str = "downloads") -> str:
 
     print(f"  Saved: {local_path}")
     return local_path
+
+
+def download_broadcast(month: str, output_dir: str = "downloads") -> str:
+    """Download a Lichess broadcast PGN for a given month (e.g., '2025-01')."""
+    filename = f"lichess_db_broadcast_{month}.pgn.zst"
+    url = f"{BROADCAST_BASE}/{filename}"
+    return download_file(url, output_dir)
+
+
+def download_standard(month: str, output_dir: str = "downloads") -> str:
+    """Download a Lichess standard-rated PGN for a given month.
+    WARNING: These files are VERY large (multi-GB). Use with --min-elo to filter."""
+    filename = f"lichess_db_standard_rated_{month}.pgn.zst"
+    url = f"{STANDARD_BASE}/{filename}"
+    return download_file(url, output_dir)
 
 
 def list_available_months() -> list:
@@ -143,11 +195,10 @@ def result_to_float(result_str: str) -> float:
         return -1.0  # Unknown
 
 
-def extract_positions(game, min_elo: int = 0) -> list:
-    """Extract training positions from a single PGN game.
+def extract_fens(game, min_elo: int = 0) -> list:
+    """Extract candidate FENs from a single PGN game.
 
-    Returns list of (fen, score_cp, result) tuples.
-    Score is set to 0 for pretraining (WDL-only), or can be filled by engine later.
+    Returns list of (fen, result) tuples — score will be added by SF labeling.
     """
     # Check result
     result_str = game.headers.get("Result", "*")
@@ -166,7 +217,7 @@ def extract_positions(game, min_elo: int = 0) -> list:
             pass  # No ELO info, include anyway (broadcast games are generally high quality)
 
     # Walk through moves
-    positions = []
+    fens = []
     board = game.board()
     ply = 0
 
@@ -188,55 +239,151 @@ def extract_positions(game, min_elo: int = 0) -> list:
         if random.random() > SAMPLE_RATE:
             continue
 
-        # FEN (we only need piece placement, side to move, castling, en passant)
-        fen = board.fen()
+        fens.append((board.fen(), result))
 
-        # Score: 0 for WDL-only pretraining
-        # In a full pipeline, you'd re-score with Stockfish here
-        score_cp = 0
-
-        # Result is white-relative
-        positions.append((fen, score_cp, result))
-
-        if len(positions) >= MAX_POSITIONS_PER_GAME:
+        if len(fens) >= MAX_POSITIONS_PER_GAME:
             break
 
-    return positions
+    return fens
 
 
-def process_pgn_file(pgn_path: str, output_path: str, min_elo: int = 0) -> int:
-    """Process a PGN file and write training positions to text format."""
+def label_positions_sf(fens_with_results, sf_path, label_depth, threads=1):
+    """Label a batch of (fen, result) tuples with Stockfish eval at given depth.
+
+    Returns list of (fen, score_cp, result) tuples.
+    Positions with |eval| > MAX_ABS_EVAL or mate scores are filtered.
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import math
+
+    if not fens_with_results:
+        return []
+
+    # Split into chunks for parallel labeling
+    chunk_size = max(1, math.ceil(len(fens_with_results) / threads))
+    chunks = [
+        fens_with_results[i:i + chunk_size]
+        for i in range(0, len(fens_with_results), chunk_size)
+    ]
+
+    results = []
+    if threads <= 1 or len(chunks) <= 1:
+        results = _label_chunk(sf_path, label_depth, fens_with_results)
+    else:
+        with ProcessPoolExecutor(max_workers=min(threads, len(chunks))) as pool:
+            futures = {
+                pool.submit(_label_chunk, sf_path, label_depth, chunk): i
+                for i, chunk in enumerate(chunks)
+            }
+            for f in as_completed(futures):
+                try:
+                    results.extend(f.result())
+                except Exception as e:
+                    print(f"  Label worker error: {e}", file=sys.stderr)
+
+    return results
+
+
+def _label_chunk(sf_path, label_depth, fens_with_results):
+    """Label a chunk of positions with a single Stockfish instance."""
+    labeled = []
+    try:
+        engine = chess.engine.SimpleEngine.popen_uci(sf_path)
+        engine.configure({"Hash": SF_HASH_MB, "Threads": 1})
+    except Exception as e:
+        print(f"  Failed to start Stockfish: {e}", file=sys.stderr)
+        return labeled
+
+    try:
+        for fen, result in fens_with_results:
+            try:
+                board = chess.Board(fen)
+                info = engine.analyse(board, chess.engine.Limit(depth=label_depth))
+                score = info["score"].white()
+
+                if score.is_mate():
+                    mate_in = score.mate()
+                    if mate_in > 0:
+                        score_cp = 29000 - mate_in * 100
+                    else:
+                        score_cp = -29000 - mate_in * 100
+                else:
+                    score_cp = score.score()
+
+                if score_cp is None or abs(score_cp) > MAX_ABS_EVAL:
+                    continue
+
+                labeled.append((fen, score_cp, result))
+            except Exception:
+                continue
+    finally:
+        try:
+            engine.quit()
+        except Exception:
+            pass
+
+    return labeled
+
+
+def process_pgn_file(pgn_path: str, output_path: str, min_elo: int = 0,
+                     sf_path: str = None, label_depth: int = 0, threads: int = 1) -> int:
+    """Process a PGN file and write training positions to text format.
+
+    If label_depth > 0 and sf_path is set, labels each position with Stockfish.
+    Otherwise, writes score_cp = 0 (WDL-only).
+    """
     print(f"Processing: {pgn_path}")
+    use_sf = label_depth > 0 and sf_path is not None
+    if use_sf:
+        print(f"  SF labeling: depth {label_depth}, {threads} thread(s)")
 
     text_stream, raw_fh = open_pgn(pgn_path)
     total_positions = 0
     total_games = 0
     skipped_games = 0
 
-    with open(output_path, "a", encoding="utf-8") as out:
-        while True:
-            try:
-                game = chess.pgn.read_game(text_stream)
-            except Exception:
-                continue
+    # Buffer FENs for batch SF labeling (process in chunks of 500 games)
+    GAME_BATCH = 500
+    fen_buffer = []  # list of (fen, result)
 
-            if game is None:
-                break
-
-            total_games += 1
-            positions = extract_positions(game, min_elo)
-
-            if not positions:
-                skipped_games += 1
-                continue
-
-            for fen, score, result in positions:
-                # Bullet text format: FEN | score_cp | result
+    def flush_buffer():
+        nonlocal total_positions, fen_buffer
+        if not fen_buffer:
+            return
+        if use_sf:
+            labeled = label_positions_sf(fen_buffer, sf_path, label_depth, threads)
+        else:
+            labeled = [(fen, 0, result) for fen, result in fen_buffer]
+        with open(output_path, "a", encoding="utf-8") as out:
+            for fen, score, result in labeled:
                 out.write(f"{fen} | {score} | {result:.1f}\n")
                 total_positions += 1
+        fen_buffer = []
 
-            if total_games % 1000 == 0:
-                print(f"  Games: {total_games}, Positions: {total_positions}, Skipped: {skipped_games}")
+    while True:
+        try:
+            game = chess.pgn.read_game(text_stream)
+        except Exception:
+            continue
+
+        if game is None:
+            break
+
+        total_games += 1
+        fens = extract_fens(game, min_elo)
+
+        if not fens:
+            skipped_games += 1
+            continue
+
+        fen_buffer.extend(fens)
+
+        if total_games % GAME_BATCH == 0:
+            flush_buffer()
+            print(f"  Games: {total_games}, Positions: {total_positions}, Skipped: {skipped_games}")
+
+    # Final flush
+    flush_buffer()
 
     raw_fh.close()
     print(f"  Done: {total_games} games → {total_positions} positions")
@@ -244,18 +391,52 @@ def process_pgn_file(pgn_path: str, output_path: str, min_elo: int = 0) -> int:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Lichess Broadcast → Bullet Training Data")
+    parser = argparse.ArgumentParser(
+        description="Lichess PGN → NNUE Training Data (SF Depth-12 Labels)"
+    )
+    # Input sources
     parser.add_argument("--input", type=str, help="Path to PGN file (.pgn or .pgn.zst)")
-    parser.add_argument("--download", type=str, help="Download specific month (e.g., 2025-01)")
-    parser.add_argument("--download-all", action="store_true", help="Download all available months")
+    parser.add_argument("--download", type=str, help="Download broadcast month (e.g., 2025-01)")
+    parser.add_argument("--download-all", action="store_true", help="Download all broadcast months")
+    parser.add_argument("--download-standard", type=str,
+                        help="Download standard-rated month (WARNING: large files, use --min-elo)")
     parser.add_argument("--list-months", action="store_true", help="List available broadcast months")
+
+    # Output
     parser.add_argument("--output", type=str, default="data/train.txt", help="Output text file path")
+
+    # SF labeling
+    parser.add_argument("--label-depth", type=int, default=12,
+                        help="Stockfish labeling depth (default: 12, 0 = WDL-only)")
+    parser.add_argument("--no-label", action="store_true",
+                        help="Disable SF labeling (WDL-only, score=0)")
+    parser.add_argument("--sf-path", type=str, default=None, help="Path to Stockfish binary")
+    parser.add_argument("--threads", type=int, default=4,
+                        help="Parallel SF instances for labeling (default: 4)")
+
+    # Filtering
     parser.add_argument("--min-elo", type=int, default=0, help="Minimum ELO filter (0 = no filter)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
     args = parser.parse_args()
 
     random.seed(args.seed)
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+
+    # Resolve SF labeling
+    label_depth = 0 if args.no_label else args.label_depth
+    sf_path = None
+    if label_depth > 0:
+        sf_path = get_sf_path(args.sf_path)
+        # Verify SF works
+        try:
+            engine = chess.engine.SimpleEngine.popen_uci(sf_path)
+            sf_name = engine.id.get("name", "Stockfish")
+            print(f"  ✓ {sf_name} ready (labeling at depth {label_depth})")
+            engine.quit()
+        except Exception as e:
+            print(f"  ✗ Cannot start Stockfish: {e}")
+            print(f"    Set STOCKFISH_PATH, use --sf-path, or --no-label")
+            sys.exit(1)
 
     if args.list_months:
         months = list_available_months()
@@ -267,6 +448,10 @@ def main():
     # Clear output file
     open(args.output, "w").close()
 
+    common_kwargs = dict(
+        min_elo=args.min_elo, sf_path=sf_path,
+        label_depth=label_depth, threads=args.threads,
+    )
     total = 0
 
     if args.download_all:
@@ -274,22 +459,34 @@ def main():
         print(f"Downloading all {len(months)} broadcast months...")
         for month in months:
             path = download_broadcast(month)
-            total += process_pgn_file(path, args.output, args.min_elo)
+            total += process_pgn_file(path, args.output, **common_kwargs)
 
     elif args.download:
         path = download_broadcast(args.download)
-        total += process_pgn_file(path, args.output, args.min_elo)
+        total += process_pgn_file(path, args.output, **common_kwargs)
+
+    elif args.download_standard:
+        path = download_standard(args.download_standard)
+        total += process_pgn_file(path, args.output, **common_kwargs)
 
     elif args.input:
-        total += process_pgn_file(args.input, args.output, args.min_elo)
+        total += process_pgn_file(args.input, args.output, **common_kwargs)
 
     else:
         parser.print_help()
         return
 
-    print(f"\n=== Total: {total} training positions written to {args.output} ===")
-    print(f"\nNext step: convert to bulletformat:")
-    print(f"  cd ../bullet && cargo run --release --package bullet-utils -- text-to-bullet {args.output} data/train.bullet")
+    print(f"\n{'=' * 60}")
+    print(f"  Total: {total:,} training positions → {args.output}")
+    if label_depth > 0:
+        print(f"  Labels: Stockfish depth {label_depth}")
+    else:
+        print(f"  Labels: WDL-only (score=0)")
+    print(f"{'=' * 60}")
+    print(f"\nNext steps:")
+    print(f"  1. Shuffle:  shuf {args.output} -o {args.output}")
+    print(f"  2. Convert:  bullet-utils convert --from text --input {args.output} --output data/train.bullet")
+    print(f"  3. Train:    cargo run --release -- --data data/train.bullet --epochs 400")
 
 
 if __name__ == "__main__":
