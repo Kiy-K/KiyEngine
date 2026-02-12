@@ -1,6 +1,8 @@
-# KiyEngine v6.1.0
+# KiyEngine v6.1.3
 
 A high-performance UCI chess engine written in Rust, featuring a **hybrid evaluation system** combining a BitNet 1.58-bit Transformer for root move ordering with a **NNUE deep network** (SCReLU + CReLU) for fast per-node evaluation, all powered by hand-tuned AVX2 SIMD. Ships as a **single self-contained binary** with NNUE weights and opening books embedded at compile time.
+
+**v6.1.3 Highlights**: v5.2 GGUF model compatibility, exponential passed pawn evaluation, mate verification search, improved opening book selection, and 50% score vs Stockfish 1500.
 
 ## Highlights
 
@@ -9,7 +11,7 @@ A high-performance UCI chess engine written in Rust, featuring a **hybrid evalua
 | **NPS** | ~900K single-thread, ~1.6M (4 threads) |
 | **Search Depth** | 26-64 in 10s+0.1s self-play |
 | **NNUE Eval** | (768→512)×2 → SCReLU → L1(16) → CReLU → L2(8) per bucket |
-| **BitNet Model** | 22.76M params, GGUF format (79 MB, mmap) |
+| **BitNet Model** | 22.76M params, GGUF v5.2/v6 (79 MB, mmap) |
 | **Quantization** | NNUE i16/i8, BitNet 1.58-bit ternary |
 | **Distribution** | Single binary (~93 MB, all assets embedded) |
 
@@ -24,7 +26,7 @@ A high-performance UCI chess engine written in Rust, featuring a **hybrid evalua
 - **Embedded weights** -- compiled into binary via `include_bytes!`, no external files needed
 
 ### BitNet Transformer (Root Policy)
-- **BitNet 1.58-bit** -- 12 layers, 512 d_model, 8 heads (GQA, 2 KV heads), 1536 hidden dim
+- **BitNet 1.58-bit** -- supports v5.2 (MHA, 8 heads, learned pos_embed) and v6 (GQA, 2 KV heads, RoPE)
 - **Bit-Packed Ternary Weights** -- dual bitmask format, 4x denser than i8
 - **SIMD Packed GEMV** -- AVX-512, AVX2, NEON, scalar (auto-detected)
 - **KV Cache** -- 4-5x speedup for incremental inference
@@ -62,7 +64,14 @@ A high-performance UCI chess engine written in Rust, featuring a **hybrid evalua
 
 ### Opening Book
 - **Polyglot format** -- dual-book (embedded in binary, zero external files)
-- Weighted random selection, limited to first 30 plies
+- Best-move selection (highest weight), MIN_WEIGHT=10, limited to first 16 plies
+
+### Evaluation Enhancements (v6.1.3)
+- **Exponential passed pawn bonus** -- rank-scaled `[0, 10, 20, 45, 80, 140, 250]` with endgame scaling
+- **Protected passer bonus** -- extra reward for pawn-defended passed pawns
+- **Development penalty** -- penalizes undeveloped knights/bishops in opening phase
+- **Mate verification** -- forces 2 extra iterations when mate score first appears
+- **BitNet Black-side skip** -- disables biased model policy when playing Black
 
 ## Installation and Build
 

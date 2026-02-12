@@ -5,6 +5,44 @@ All notable changes to KiyEngine will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.1.3] - 2026-02-12
+
+### Added
+
+- **v5.2 GGUF Model Compatibility** -- load v5.2 BitNet architecture alongside v6
+  - Fused `in_proj_weight` → split Q/K/V for standard MHA (8 heads, no GQA)
+  - Learned positional embeddings (`pos_embed`) instead of RoPE
+  - QKV and output projection biases
+  - Auto-detection: no `head_count_kv` metadata → v5.2 format
+- **Exponential Passed Pawn Bonus** -- `[0, 10, 20, 45, 80, 140, 250, 0]` by rank
+  - Protected passer bonus: `[0, 5, 10, 20, 40, 70, 125, 0]` for pawn-defended passers
+  - Endgame scaling: bonus increases as total material decreases
+- **Minor Piece Development Penalty** -- opening-phase evaluation correction
+  - -15cp per undeveloped knight (Nb1/Ng1 or Nb8/Ng8)
+  - -10cp per undeveloped bishop (Bc1/Bf1 or Bc8/Bf8)
+  - Active only when phase > 16 (opening/early middlegame)
+- **Mate Verification** -- prevents phantom mate blunders
+  - When a mate score first appears, forces 2 additional iterative deepening iterations
+  - Set-once design: no escalation (avoids infinite verification loops)
+
+### Changed
+
+- **Opening Book** -- improved move quality and reliability
+  - Selection: weighted random → best-move (highest weight)
+  - `MIN_WEIGHT`: 2 → 10 (filters dubious/rare lines)
+  - `MAX_BOOK_PLY`: 30 → 16 (avoids deep book mistakes)
+- **BitNet Policy** -- skipped for Black side (model has White-side training bias)
+  - Engine uses pure NNUE + classical eval + search when playing Black
+  - Eliminates weak Black-side policy guidance from biased model
+
+### Performance
+
+- **Acid Test vs SF_1500**: 50% score (5W-5L), Elo 0.0 ± 251
+  - White: 40%, Black: 60% (previously 0% Black winrate)
+  - First-ever Black wins achieved
+
+---
+
 ## [6.1.0] - 2026-02-12
 
 ### Added

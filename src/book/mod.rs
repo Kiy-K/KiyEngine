@@ -95,10 +95,11 @@ pub fn polyglot_hash(board: &Board) -> u64 {
 // =============================================================================
 
 /// Maximum number of half-moves (ply) from startpos to use the book.
-const MAX_BOOK_PLY: usize = 30;
+const MAX_BOOK_PLY: usize = 16;
 
 /// Minimum weight threshold — skip dubious book moves below this.
-const MIN_WEIGHT: u32 = 2;
+/// Raised from 2 to 10 to avoid weak lines (especially as Black).
+const MIN_WEIGHT: u32 = 10;
 
 /// Simple thread-local RNG for weighted book move selection.
 /// Uses xorshift64 seeded from system time — no external crate needed.
@@ -213,20 +214,8 @@ impl OpeningBook {
             return None;
         }
 
-        // Weighted random selection for variety (best practice from PolyGlot)
-        let total_weight: u64 = candidates.iter().map(|&(_, w)| w as u64).sum();
-        let mut pick = simple_rand(total_weight);
-        for (move_raw, weight) in &candidates {
-            if pick < *weight as u64 {
-                if let Some(mv) = Self::parse_polyglot_move(*move_raw, board) {
-                    return Some(mv);
-                }
-                // If this particular encoding didn't parse, fall through
-            }
-            pick = pick.saturating_sub(*weight as u64);
-        }
-
-        // Fallback: try all in weight-descending order
+        // Best-move selection: pick the highest-weight move for reliability.
+        // Weighted random was causing dubious book moves (especially as Black).
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
         for (move_raw, _weight) in &candidates {
             if let Some(mv) = Self::parse_polyglot_move(*move_raw, board) {

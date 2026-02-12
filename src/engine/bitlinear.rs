@@ -103,6 +103,8 @@ pub struct BitLinear {
     pub eps: f64,
     /// Cached dequantized weights as F32 transposed [in_dim, out_dim] (lazy init, thread-safe)
     dequantized_cache_t: RwLock<Option<Tensor>>,
+    /// v5.2 compat: skip RMSNorm in forward (standard linear, no norm)
+    pub skip_norm: bool,
 }
 
 impl BitLinear {
@@ -141,6 +143,42 @@ impl BitLinear {
             rms_norm_weight_f32,
             eps: 1e-5,
             dequantized_cache_t: RwLock::new(None),
+            skip_norm: false,
+        })
+    }
+
+    /// Load a plain linear layer (no RMSNorm) from VarBuilder.
+    /// Used for v5.2 attention projections which are standard linear, not BitLinear.
+    pub fn load_plain(weight_key: &str, vb: &VarBuilder, in_dim: usize, out_dim: usize) -> Result<Self> {
+        let weight = vb.get((out_dim, in_dim), weight_key)?;
+        let raw = weight.flatten_all()?.to_vec1::<f32>()?;
+        let weight_i8 = pack_f16_to_ternary_i8(&raw);
+        let (pos_bits, neg_bits, row_bytes) = pack_ternary_bits(&weight_i8, out_dim, in_dim);
+        // Dummy norm weights (ones) — won't be used since skip_norm=true
+        let ones = vec![1.0f32; in_dim];
+        let rms_norm_weight = Tensor::from_vec(ones.clone(), (in_dim,), &candle_core::Device::Cpu)?;
+        Ok(Self {
+            weight_i8, pos_bits, neg_bits, row_bytes,
+            scale: 1.0, in_dim, out_dim,
+            rms_norm_weight, rms_norm_weight_f32: ones,
+            eps: 1e-5, dequantized_cache_t: RwLock::new(None),
+            skip_norm: true,
+        })
+    }
+
+    /// Create BitLinear from raw f32 weight slice (for splitting fused weights).
+    /// No RMSNorm (skip_norm=true).
+    pub fn from_raw_f32(raw: &[f32], in_dim: usize, out_dim: usize) -> Result<Self> {
+        let weight_i8 = pack_f16_to_ternary_i8(raw);
+        let (pos_bits, neg_bits, row_bytes) = pack_ternary_bits(&weight_i8, out_dim, in_dim);
+        let ones = vec![1.0f32; in_dim];
+        let rms_norm_weight = Tensor::from_vec(ones.clone(), (in_dim,), &candle_core::Device::Cpu)?;
+        Ok(Self {
+            weight_i8, pos_bits, neg_bits, row_bytes,
+            scale: 1.0, in_dim, out_dim,
+            rms_norm_weight, rms_norm_weight_f32: ones,
+            eps: 1e-5, dequantized_cache_t: RwLock::new(None),
+            skip_norm: true,
         })
     }
 
@@ -236,6 +274,10 @@ impl BitLinear {
         }
         let device = x.device();
         let w_t = self.get_weights_t(device)?;
+        if self.skip_norm {
+            // v5.2 plain linear: x @ W^T (no RMSNorm)
+            return x.broadcast_matmul(&w_t);
+        }
         self.fused_rms_norm_matmul(x, &w_t)
     }
 
@@ -249,12 +291,16 @@ impl BitLinear {
         // Single copy: tensor → f32 slice
         let x_f32: Vec<f32> = x.flatten_all()?.to_vec1::<f32>()?;
 
-        // RMS norm on raw f32 — zero tensor allocation
-        let x_normed = rms_norm_vec(&x_f32, &self.rms_norm_weight_f32, self.eps as f32);
+        // RMS norm on raw f32 — zero tensor allocation (skip for v5.2 plain linear)
+        let x_input = if self.skip_norm {
+            x_f32
+        } else {
+            rms_norm_vec(&x_f32, &self.rms_norm_weight_f32, self.eps as f32)
+        };
 
         // SIMD packed GEMV (AVX-512/AVX2/NEON)
         let mut output = vec![0.0f32; self.out_dim];
-        self.dispatch_packed_gemv(&x_normed, &mut output);
+        self.dispatch_packed_gemv(&x_input, &mut output);
 
         // Single copy back: f32 slice → tensor (preserve input rank)
         let out_shape = if orig_rank <= 2 {

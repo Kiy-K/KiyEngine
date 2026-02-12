@@ -733,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "kiy_engine"
-version = "6.1.0"
+version = "6.1.3"
 dependencies = [
  "anyhow",
  "bytemuck",

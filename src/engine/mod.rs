@@ -49,6 +49,8 @@ pub struct Engine {
     pub d_model: usize,
     pub context_length: usize,
     pub head_dim: usize,
+    /// v5.2: learned positional embedding [d_model, context_length] (None for v6 which uses RoPE)
+    pub pos_embed: Option<Tensor>,
 }
 
 impl Engine {
@@ -108,17 +110,24 @@ impl Engine {
             .get_u32("kiyengine.attention.head_count")
             .or_else(|| gguf.get_u32("kiyengine.head_count"))
             .unwrap_or(NUM_HEADS as u32) as usize;
-        let num_kv_heads = gguf
-            .get_u32("kiyengine.attention.head_count_kv")
-            .unwrap_or(NUM_KV_HEADS as u32) as usize;
+        // Detect v5.2 vs v6: v5.2 has no head_count_kv metadata (standard MHA)
+        let has_kv_heads_meta = gguf.get_u32("kiyengine.attention.head_count_kv").is_some();
+        let is_v52 = !has_kv_heads_meta;
+        let num_kv_heads = if is_v52 {
+            num_heads // v5.2: standard MHA, all heads are KV heads
+        } else {
+            gguf.get_u32("kiyengine.attention.head_count_kv")
+                .unwrap_or(NUM_KV_HEADS as u32) as usize
+        };
         let hidden_dim = gguf
             .get_u32("kiyengine.feed_forward_length")
             .unwrap_or(HIDDEN_DIM as u32) as usize;
         let head_dim = d_model / num_heads;
 
-        println!(
-            "  Config: d_model={}, layers={}, heads={}, kv_heads={}, head_dim={}, hidden={}, ctx={}, vocab={}",
-            d_model, num_layers, num_heads, num_kv_heads, head_dim, hidden_dim, context_length, vocab_size
+        let format_str = if is_v52 { "v5.2 (MHA+pos_embed)" } else { "v6 (GQA+RoPE)" };
+        eprintln!(
+            "  Config: {} d_model={}, layers={}, heads={}, kv_heads={}, head_dim={}, hidden={}, ctx={}, vocab={}",
+            format_str, d_model, num_layers, num_heads, num_kv_heads, head_dim, hidden_dim, context_length, vocab_size
         );
 
         // Convert all GGUF tensors to f32 Candle tensors
@@ -159,24 +168,37 @@ impl Engine {
         let embed_w = vb.get((vocab_size, d_model), "embed.weight")?;
         let embedding = Embedding::new(embed_w, d_model);
 
-        // V6: No positional embedding — using RoPE instead
-        // Precompute RoPE cos/sin for max context length
+        // Precompute RoPE cos/sin (used by v6; v5.2 ignores them but they must exist)
         let (rope_cos, rope_sin) = precompute_rope(head_dim, context_length, ROPE_THETA, &device)?;
         let rope_cos_f32 = rope_cos.flatten_all()?.to_vec1::<f32>()?;
         let rope_sin_f32 = rope_sin.flatten_all()?.to_vec1::<f32>()?;
 
-        // Load transformer blocks (with GQA params)
+        // v5.2: load learned positional embedding [d_model, context_length, 1]
+        let pos_embed = if is_v52 {
+            match vb.get((d_model, context_length, 1), "pos_embed") {
+                Ok(pe) => {
+                    // Reshape to [1, context_length, d_model] for broadcasting with embedded input
+                    let pe = pe.squeeze(2)?.transpose(0, 1)?.unsqueeze(0)?;
+                    Some(pe)
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        // Load transformer blocks
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
-            layers.push(TransformerBlock::load(
-                i,
-                &vb,
-                d_model,
-                hidden_dim,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-            )?);
+            if is_v52 {
+                layers.push(TransformerBlock::load_v52(
+                    i, &vb, d_model, hidden_dim, num_heads, head_dim,
+                )?);
+            } else {
+                layers.push(TransformerBlock::load(
+                    i, &vb, d_model, hidden_dim, num_heads, num_kv_heads, head_dim,
+                )?);
+            }
         }
 
         // Load final layer norm
@@ -211,9 +233,9 @@ impl Engine {
         let _ = value_head.layer1.get_weights_t(&device);
         let _ = value_head.layer2.get_weights_t(&device);
 
-        println!(
-            "  Model loaded successfully ({} layers, GQA {}/{})",
-            num_layers, num_heads, num_kv_heads
+        eprintln!(
+            "  Model loaded successfully ({} layers, {} {}/{})",
+            num_layers, if is_v52 { "MHA" } else { "GQA" }, num_heads, num_kv_heads
         );
 
         Ok(Self {
@@ -231,6 +253,7 @@ impl Engine {
             d_model,
             context_length,
             head_dim,
+            pos_embed,
         })
     }
 
@@ -273,12 +296,18 @@ impl Engine {
             let new_count = take_len - cached_len;
             let new_tokens_slice = &tokens_slice[cached_len..];
 
-            // Embed only new tokens (no positional embedding — RoPE handles positions)
+            // Embed only new tokens
             let new_tokens_u32: Vec<u32> = new_tokens_slice.iter().map(|&t| t as u32).collect();
             let new_tensor = Tensor::new(new_tokens_u32.as_slice(), &self.device)?.unsqueeze(0)?;
             let mut x = self.embedding.forward(&new_tensor)?;
 
-            // Process through layers with KV cache + RoPE
+            // v5.2: add positional embedding for new token positions
+            if let Some(ref pe) = self.pos_embed {
+                let pe_slice = pe.narrow(1, cached_len, new_count)?;
+                x = x.broadcast_add(&pe_slice)?;
+            }
+
+            // Process through layers with KV cache
             if new_count == 1 {
                 // Fused single-token path: inline RoPE on f32, per-group attention
                 let pos = cached_len; // position of the new token
@@ -345,7 +374,13 @@ impl Engine {
         let tokens_tensor = Tensor::new(tokens_u32.as_slice(), &self.device)?.unsqueeze(0)?;
         let mut x = self.embedding.forward(&tokens_tensor)?;
 
-        // Full forward with cache population (RoPE applied inside each layer)
+        // v5.2: add learned positional embedding
+        if let Some(ref pe) = self.pos_embed {
+            let pe_slice = pe.narrow(1, 0, take_len)?;
+            x = x.broadcast_add(&pe_slice)?;
+        }
+
+        // Full forward with cache population
         for (i, layer) in self.layers.iter().enumerate() {
             let (out, new_k, new_v) = layer.forward_cached(
                 &x,
@@ -397,7 +432,11 @@ impl Engine {
         let tokens_tensor = Tensor::new(tokens_u32.as_slice(), &self.device)?.unsqueeze(0)?;
         let mut x = self.embedding.forward(&tokens_tensor)?;
 
-        // V6: No positional embedding — RoPE applied inside each attention layer
+        // v5.2: add learned positional embedding; v6: RoPE applied inside each layer
+        if let Some(ref pe) = self.pos_embed {
+            let pe_slice = pe.narrow(1, 0, take_len)?;
+            x = x.broadcast_add(&pe_slice)?;
+        }
         let mask = if take_len > 1 {
             Some(&self.causal_mask)
         } else {

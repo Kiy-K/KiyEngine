@@ -1,4 +1,4 @@
-# KiyEngine v6.1.0 Documentation
+# KiyEngine v6.1.3 Documentation
 
 ## Table of Contents
 
@@ -27,8 +27,10 @@ KiyEngine is a high-performance UCI chess engine built in Rust with the followin
    - 10 input buckets (king-square), 8 output buckets (piece-count)
    - Weights embedded in binary via `include_bytes!`
 
-2. **BitNet Transformer** (`engine/`) -- Root move ordering (embedded)
-   - BitNet 1.58-bit Transformer (12 layers, 512 d_model, 8 heads, GQA with 2 KV heads, 1536 hidden dim)
+2. **BitNet Transformer** (`engine/`) -- Root move ordering (embedded, White-side only)
+   - BitNet 1.58-bit Transformer with dual-architecture support:
+     - **v6**: 12 layers, 512 d_model, GQA (8 heads, 2 KV heads), RoPE, 1536 hidden dim
+     - **v5.2**: 8 layers, 512 d_model, MHA (8 heads), learned positional embeddings, biases
    - Bit-packed ternary weights with dual bitmask format (4x denser than i8)
    - SIMD-optimized packed GEMV (AVX-512, AVX2, NEON, scalar fallback)
    - KV Cache for incremental inference (4-5x speedup)
@@ -49,7 +51,11 @@ KiyEngine is a high-performance UCI chess engine built in Rust with the followin
 4. **Static Evaluation Fallback** (`search/eval.rs`)
    - Material + PeSTO piece-square tables (used when NNUE unavailable)
    - Bishop pair bonus, rook on open/semi-open file
-   - Passed pawn bonus (rank-scaled), doubled/isolated pawn penalties
+   - Exponential passed pawn bonus (rank-scaled 10-250cp) with endgame scaling
+   - Protected passer bonus (pawn-defended passed pawns)
+   - Doubled/isolated pawn penalties
+   - Minor piece development penalty (undeveloped N/B in opening phase)
+   - King pawn shield evaluation
 
 5. **Time Management** (`search/time.rs`)
    - Stockfish-inspired soft/hard time bounds with ply-aware scaling
@@ -58,10 +64,13 @@ KiyEngine is a high-performance UCI chess engine built in Rust with the followin
 ### Inference Pipeline
 
 ```text
-Input tokens -> Embedding -> [TransformerBlock x 12] -> ln_f -> PolicyHead / ValueHead
-                                       |
-                        RMSNorm -> MultiheadAttention (GQA) -> LayerScale -> Residual
-                                 -> RMSNorm -> BitSwiGLU -> LayerScale -> Residual
+Input tokens -> Embedding (+pos_embed for v5.2) -> [TransformerBlock x N] -> ln_f -> PolicyHead / ValueHead
+                                                            |
+                        RMSNorm -> Attention (GQA/MHA) -> LayerScale -> Residual
+                                -> RMSNorm -> BitSwiGLU -> LayerScale -> Residual
+
+v6:   12 layers, GQA (8 heads, 2 KV), RoPE, no biases
+v5.2:  8 layers, MHA (8 heads),       pos_embed, QKV+output biases
 
 BitSwiGLU: w_gate(BitLinear) -> SiLU * w_val(BitLinear) -> w_out(BitLinear)
 
@@ -122,7 +131,7 @@ Centralized constants to avoid magic numbers:
 | Constant | Value | Description |
 |----------|-------|-------------|
 | `ENGINE_NAME` | "KiyEngine" | Engine identifier |
-| `ENGINE_VERSION` | "6.1.0" | Current version |
+| `ENGINE_VERSION` | "6.1.3" | Current version |
 | `VOCAB_SIZE` | 4608 | NN move vocabulary (72 planes x 64 squares) |
 | `CONTEXT_LENGTH` | 256 | NN attention context length |
 | `D_MODEL` | 512 | NN embedding dimension |
@@ -150,8 +159,10 @@ Centralized constants to avoid magic numbers:
 - `dispatch_packed_gemv()` -- runtime ISA selection (AVX-512 > AVX2 > NEON > scalar)
 - `pack_ternary_bits()` -- packs i8 weights into dual bitmasks at load time
 
-**MultiheadAttention** -- 8-head GQA attention with 2 KV heads and RoPE
+**GQAttention** -- Multi-head attention with dual-architecture support
 
+- v6: GQA (8 heads, 2 KV heads) with RoPE
+- v5.2: MHA (8 heads) with QKV/output biases, no RoPE (uses pos_embed)
 - `forward(x)` -- standard attention forward pass
 - `forward_cached(x, cache)` -- incremental KV cache attention
 
@@ -278,7 +289,9 @@ PeSTO midgame piece-square tables provide positional bonuses for each piece on e
 | Bishop pair | +30cp | Count >= 2 bishops per side |
 | Rook on open file | +20cp | No friendly pawns on file |
 | Rook on semi-open file | +10cp | No friendly pawns, enemy pawns present |
-| Passed pawn | +5 to +100cp | No enemy pawns on same/adjacent files ahead |
+| Passed pawn | +10 to +250cp | No enemy pawns on same/adjacent files ahead (exponential) |
+| Protected passer | +5 to +125cp | Passed pawn defended by another pawn |
+| Development penalty | -10 to -15cp | Undeveloped knights/bishops on starting squares |
 | Doubled pawn | -10cp | Another friendly pawn on same file |
 | Isolated pawn | -15cp | No friendly pawns on adjacent files |
 
@@ -464,4 +477,4 @@ Apache License 2.0 -- See LICENSE file for details.
 
 Copyright 2026 Khoi
 
-(Updated for v6.1.0)
+(Updated for v6.1.3)

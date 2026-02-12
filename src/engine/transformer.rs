@@ -135,6 +135,11 @@ pub struct GQAttention {
     pub scale: f64,
     /// GQA repeat factor: num_heads / num_kv_heads
     pub gqa_repeat: usize,
+    /// v5.2: optional biases for QKV and output projections
+    pub qkv_bias: Option<Tensor>,
+    pub o_bias: Option<Tensor>,
+    /// Whether to apply RoPE (v6=true, v5.2=false — uses learned pos_embed)
+    pub use_rope: bool,
 }
 
 impl GQAttention {
@@ -189,6 +194,62 @@ impl GQAttention {
             embed_dim,
             scale: (head_dim as f64).sqrt(),
             gqa_repeat: num_heads / num_kv_heads,
+            qkv_bias: None,
+            o_bias: None,
+            use_rope: true,
+        })
+    }
+
+    /// Load v5.2 attention: fused in_proj_weight [embed_dim, 3*embed_dim] split into Q/K/V.
+    /// Standard MHA (num_kv_heads = num_heads), plain linear (no RMSNorm), with biases.
+    pub fn load_v52(
+        prefix: &str,
+        vb: &VarBuilder,
+        embed_dim: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self> {
+        let total_proj = 3 * embed_dim; // 1536
+
+        // Load fused in_proj_weight [embed_dim, total_proj] and split into Q/K/V
+        let in_proj = vb.get((total_proj, embed_dim), &format!("{}.in_proj_weight", prefix))?;
+        let in_proj_f32 = in_proj.flatten_all()?.to_vec1::<f32>()?;
+
+        // Split: first embed_dim rows = Q, next embed_dim = K, last embed_dim = V
+        let q_raw = &in_proj_f32[0..embed_dim * embed_dim];
+        let k_raw = &in_proj_f32[embed_dim * embed_dim..2 * embed_dim * embed_dim];
+        let v_raw = &in_proj_f32[2 * embed_dim * embed_dim..3 * embed_dim * embed_dim];
+
+        let q_proj = BitLinear::from_raw_f32(q_raw, embed_dim, embed_dim)?;
+        let k_proj = BitLinear::from_raw_f32(k_raw, embed_dim, embed_dim)?;
+        let v_proj = BitLinear::from_raw_f32(v_raw, embed_dim, embed_dim)?;
+
+        // Load output projection (plain linear, no RMSNorm)
+        let o_proj = BitLinear::load_plain(
+            &format!("{}.out_proj.weight", prefix),
+            vb,
+            embed_dim,
+            embed_dim,
+        )?;
+
+        // Load biases
+        let qkv_bias = vb.get((total_proj,), &format!("{}.in_proj_bias", prefix)).ok();
+        let o_bias = vb.get((embed_dim,), &format!("{}.out_proj.bias", prefix)).ok();
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            num_heads,
+            num_kv_heads: num_heads, // v5.2 = standard MHA
+            head_dim,
+            embed_dim,
+            scale: (head_dim as f64).sqrt(),
+            gqa_repeat: 1, // No GQA expansion needed
+            qkv_bias,
+            o_bias,
+            use_rope: false, // v5.2 uses learned pos_embed
         })
     }
 
@@ -220,10 +281,20 @@ impl GQAttention {
     ) -> Result<Tensor> {
         let (batch, seq_len, _) = x.dims3()?;
 
-        // Separate projections (each does RMSNorm internally)
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        // Separate projections (each does RMSNorm internally for v6, plain linear for v5.2)
+        let mut q = self.q_proj.forward(x)?;
+        let mut k = self.k_proj.forward(x)?;
+        let mut v = self.v_proj.forward(x)?;
+
+        // v5.2: add fused QKV bias (split into Q/K/V portions)
+        if let Some(ref bias) = self.qkv_bias {
+            let q_bias = bias.narrow(0, 0, self.embed_dim)?;
+            let k_bias = bias.narrow(0, self.embed_dim, self.embed_dim)?;
+            let v_bias = bias.narrow(0, 2 * self.embed_dim, self.embed_dim)?;
+            q = q.broadcast_add(&q_bias)?;
+            k = k.broadcast_add(&k_bias)?;
+            v = v.broadcast_add(&v_bias)?;
+        }
 
         // Reshape: Q → [batch, num_heads, seq, head_dim]
         let q = q
@@ -237,9 +308,12 @@ impl GQAttention {
             .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // Apply RoPE to Q and K
-        let q = apply_rope(&q, rope_cos, rope_sin, 0)?;
-        let k = apply_rope(&k, rope_cos, rope_sin, 0)?;
+        // Apply RoPE to Q and K (v6 only; v5.2 uses learned pos_embed added before attention)
+        let (q, k) = if self.use_rope {
+            (apply_rope(&q, rope_cos, rope_sin, 0)?, apply_rope(&k, rope_cos, rope_sin, 0)?)
+        } else {
+            (q, k)
+        };
 
         // Expand KV heads for GQA: [batch, num_heads, seq, head_dim]
         let k = self.expand_kv(&k)?;
@@ -265,8 +339,12 @@ impl GQAttention {
                 .contiguous()?
                 .reshape((batch, seq_len, self.embed_dim))?;
 
-        // Output projection (BitLinear with RMSNorm)
-        self.o_proj.forward(&attn_out)
+        // Output projection (BitLinear with RMSNorm for v6, plain linear for v5.2)
+        let out = self.o_proj.forward(&attn_out)?;
+        if let Some(ref bias) = self.o_bias {
+            return out.broadcast_add(bias);
+        }
+        Ok(out)
     }
 
     /// Forward with KV cache for incremental inference.
@@ -285,9 +363,19 @@ impl GQAttention {
         let (batch, new_tokens, _) = x_new.dims3()?;
         let cached_len = total_seq_len - new_tokens;
 
-        let q = self.q_proj.forward(x_new)?;
-        let k = self.k_proj.forward(x_new)?;
-        let v = self.v_proj.forward(x_new)?;
+        let mut q = self.q_proj.forward(x_new)?;
+        let mut k = self.k_proj.forward(x_new)?;
+        let mut v = self.v_proj.forward(x_new)?;
+
+        // v5.2: add fused QKV bias
+        if let Some(ref bias) = self.qkv_bias {
+            let q_bias = bias.narrow(0, 0, self.embed_dim)?;
+            let k_bias = bias.narrow(0, self.embed_dim, self.embed_dim)?;
+            let v_bias = bias.narrow(0, 2 * self.embed_dim, self.embed_dim)?;
+            q = q.broadcast_add(&q_bias)?;
+            k = k.broadcast_add(&k_bias)?;
+            v = v.broadcast_add(&v_bias)?;
+        }
 
         let q = q
             .reshape((batch, new_tokens, self.num_heads, self.head_dim))?
@@ -299,9 +387,12 @@ impl GQAttention {
             .reshape((batch, new_tokens, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // RoPE with offset for cached positions
-        let q = apply_rope(&q, rope_cos, rope_sin, cached_len)?;
-        let k = apply_rope(&k, rope_cos, rope_sin, cached_len)?;
+        // RoPE with offset for cached positions (v6 only)
+        let (q, k) = if self.use_rope {
+            (apply_rope(&q, rope_cos, rope_sin, cached_len)?, apply_rope(&k, rope_cos, rope_sin, cached_len)?)
+        } else {
+            (q, k)
+        };
 
         // Concatenate with cache (at num_kv_heads dimension)
         let full_k = if let Some(ck) = cache_k {
@@ -341,7 +432,10 @@ impl GQAttention {
                 .contiguous()?
                 .reshape((batch, new_tokens, self.embed_dim))?;
 
-        let output = self.o_proj.forward(&attn_out)?;
+        let mut output = self.o_proj.forward(&attn_out)?;
+        if let Some(ref bias) = self.o_bias {
+            output = output.broadcast_add(bias)?;
+        }
 
         // Return un-expanded K,V for cache storage (saves memory)
         Ok((output, full_k, full_v))
@@ -367,33 +461,43 @@ impl GQAttention {
         let k_raw = self.k_proj.forward(x_new)?; // [1, 1, kv_dim]
         let v_raw = self.v_proj.forward(x_new)?; // [1, 1, kv_dim]
 
-        // Extract to f32 for inline RoPE
+        // Extract to f32
         let mut q_f32: Vec<f32> = q_raw.flatten_all()?.to_vec1::<f32>()?;
         let mut k_f32: Vec<f32> = k_raw.flatten_all()?.to_vec1::<f32>()?;
-        let v_f32: Vec<f32> = v_raw.flatten_all()?.to_vec1::<f32>()?;
+        let mut v_f32: Vec<f32> = v_raw.flatten_all()?.to_vec1::<f32>()?;
 
-        // RoPE cos/sin for position `pos`
-        let cos_row = &rope_cos_f32[pos * half..(pos + 1) * half];
-        let sin_row = &rope_sin_f32[pos * half..(pos + 1) * half];
-
-        // Apply RoPE inline to Q (num_heads × head_dim)
-        for h in 0..self.num_heads {
-            let base = h * self.head_dim;
-            for i in 0..half {
-                let even = q_f32[base + i];
-                let odd = q_f32[base + half + i];
-                q_f32[base + i] = even * cos_row[i] - odd * sin_row[i];
-                q_f32[base + half + i] = even * sin_row[i] + odd * cos_row[i];
-            }
+        // v5.2: add QKV bias inline
+        if let Some(ref bias) = self.qkv_bias {
+            let bias_f32 = bias.flatten_all()?.to_vec1::<f32>()?;
+            let q_dim = self.num_heads * self.head_dim;
+            let kv_dim = self.num_kv_heads * self.head_dim;
+            for i in 0..q_dim { q_f32[i] += bias_f32[i]; }
+            for i in 0..kv_dim { k_f32[i] += bias_f32[q_dim + i]; }
+            for i in 0..kv_dim { v_f32[i] += bias_f32[q_dim + kv_dim + i]; }
         }
-        // Apply RoPE inline to K (num_kv_heads × head_dim)
-        for h in 0..self.num_kv_heads {
-            let base = h * self.head_dim;
-            for i in 0..half {
-                let even = k_f32[base + i];
-                let odd = k_f32[base + half + i];
-                k_f32[base + i] = even * cos_row[i] - odd * sin_row[i];
-                k_f32[base + half + i] = even * sin_row[i] + odd * cos_row[i];
+
+        // Apply RoPE inline (v6 only; v5.2 uses pos_embed added before attention)
+        if self.use_rope {
+            let cos_row = &rope_cos_f32[pos * half..(pos + 1) * half];
+            let sin_row = &rope_sin_f32[pos * half..(pos + 1) * half];
+
+            for h in 0..self.num_heads {
+                let base = h * self.head_dim;
+                for i in 0..half {
+                    let even = q_f32[base + i];
+                    let odd = q_f32[base + half + i];
+                    q_f32[base + i] = even * cos_row[i] - odd * sin_row[i];
+                    q_f32[base + half + i] = even * sin_row[i] + odd * cos_row[i];
+                }
+            }
+            for h in 0..self.num_kv_heads {
+                let base = h * self.head_dim;
+                for i in 0..half {
+                    let even = k_f32[base + i];
+                    let odd = k_f32[base + half + i];
+                    k_f32[base + i] = even * cos_row[i] - odd * sin_row[i];
+                    k_f32[base + half + i] = even * sin_row[i] + odd * cos_row[i];
+                }
             }
         }
 
@@ -442,7 +546,10 @@ impl GQAttention {
         let attn_out = attn_out.reshape((1, 1, self.embed_dim))?;
 
         // O projection (auto-dispatches to SIMD for single token)
-        let output = self.o_proj.forward(&attn_out)?;
+        let mut output = self.o_proj.forward(&attn_out)?;
+        if let Some(ref bias) = self.o_bias {
+            output = output.broadcast_add(bias)?;
+        }
 
         Ok((output, full_k, full_v))
     }
@@ -624,6 +731,43 @@ impl TransformerBlock {
         let ln2 = vb.get((embed_dim,), &format!("{}.ln2.weight", prefix))?;
         let mlp = BitSwiGLU::load(&format!("{}.mlp", prefix), vb, embed_dim, hidden_dim)?;
         let ls2 = LayerScale::load(&format!("{}.ls2", prefix), vb, embed_dim)?;
+
+        Ok(Self {
+            ln1,
+            attn,
+            ls1,
+            ln2,
+            mlp,
+            ls2,
+            embed_dim,
+        })
+    }
+
+    /// Load v5.2 format: fused attention, ls1.gamma/ls2.gamma naming
+    pub fn load_v52(
+        layer_idx: usize,
+        vb: &VarBuilder,
+        embed_dim: usize,
+        hidden_dim: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self> {
+        let prefix = format!("layers.{}", layer_idx);
+
+        let ln1 = vb.get((embed_dim,), &format!("{}.ln1.weight", prefix))?;
+        let attn = GQAttention::load_v52(
+            &format!("{}.attn", prefix),
+            vb,
+            embed_dim,
+            num_heads,
+            head_dim,
+        )?;
+        // v5.2: key is "ls1.gamma"
+        let ls1 = LayerScale::load(&format!("{}.ls1.gamma", prefix), vb, embed_dim)?;
+
+        let ln2 = vb.get((embed_dim,), &format!("{}.ln2.weight", prefix))?;
+        let mlp = BitSwiGLU::load(&format!("{}.mlp", prefix), vb, embed_dim, hidden_dim)?;
+        let ls2 = LayerScale::load(&format!("{}.ls2.gamma", prefix), vb, embed_dim)?;
 
         Ok(Self {
             ln1,

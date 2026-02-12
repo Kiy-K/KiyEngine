@@ -118,6 +118,46 @@ impl MoveCodec {
         Self::move_to_token(mv) as usize
     }
 
+    /// Flip a move token for board mirroring (rank mirror + direction flip).
+    /// Used when playing Black: flip the entire game history so the model
+    /// sees the position from White's perspective.
+    #[inline]
+    pub fn flip_token(token: u32) -> u32 {
+        let plane = (token / 64) as usize;
+        let from_sq = token % 64;
+        let flipped_from = from_sq ^ 56; // mirror rank: rank 1↔8, 2↔7, etc.
+
+        let flipped_plane = if plane < 56 {
+            // Queen-like: flip direction (N↔S, NE↔SE, NW↔SW, E/W unchanged)
+            let dir = plane / 7;
+            let dist = plane % 7;
+            const QUEEN_FLIP: [usize; 8] = [4, 3, 2, 1, 0, 7, 6, 5];
+            QUEEN_FLIP[dir] * 7 + dist
+        } else if plane < 64 {
+            // Knight: flip vertical component
+            let knight_idx = plane - 56;
+            const KNIGHT_FLIP: [usize; 8] = [3, 2, 1, 0, 7, 6, 5, 4];
+            56 + KNIGHT_FLIP[knight_idx]
+        } else {
+            // Under-promotions: file delta unchanged by rank flip
+            plane
+        };
+
+        (flipped_plane * 64 + flipped_from as usize) as u32
+    }
+
+    /// Un-flip a policy vector: real_policy[i] = flipped_policy[flip_token(i)]
+    pub fn unflip_policy(flipped_policy: &[f32]) -> Vec<f32> {
+        let mut real_policy = vec![0.0f32; flipped_policy.len()];
+        for i in 0..flipped_policy.len() {
+            let flipped_idx = Self::flip_token(i as u32) as usize;
+            if flipped_idx < flipped_policy.len() {
+                real_policy[i] = flipped_policy[flipped_idx];
+            }
+        }
+        real_policy
+    }
+
     // --- private helpers ---------------------------------------------------
 
     /// Map (delta_file, delta_rank) to one of 8 queen directions (0..7).
@@ -176,9 +216,19 @@ pub struct UciHandler {
 
 impl UciHandler {
     pub fn new() -> anyhow::Result<Self> {
-        let engine = Arc::new(Engine::new()?);
+        let engine = match Engine::new() {
+            Ok(e) => {
+                eprintln!("info string BitNet engine loaded successfully");
+                Some(Arc::new(e))
+            }
+            Err(err) => {
+                eprintln!("info string WARNING: BitNet model failed to load: {}", err);
+                eprintln!("info string Running without BitNet (NNUE + classical eval only)");
+                None
+            }
+        };
         let tt = Arc::new(TranspositionTable::new(512));
-        let mut searcher = Searcher::new(Arc::clone(&engine), Arc::clone(&tt));
+        let mut searcher = Searcher::new(engine.clone(), Arc::clone(&tt));
 
         // Load NNUE: try disk file first, then fall back to embedded weights
         let nnue_path = crate::nnue::DEFAULT_NNUE_PATH;
@@ -234,12 +284,14 @@ impl UciHandler {
         let (tx, rx) = mpsc::channel();
 
         std::thread::spawn(move || {
+            use std::io::Write;
             while let Ok(msg) = rx.recv() {
                 println!("{}", msg);
+                let _ = std::io::stdout().flush();
             }
         });
 
-        let num_layers = engine.num_layers();
+        let num_layers = engine.as_ref().map_or(8, |e| e.num_layers());
         Ok(Self {
             searcher,
             tt,
@@ -274,7 +326,7 @@ impl UciHandler {
         let parts: Vec<&str> = command.split_whitespace().collect();
         match parts.get(0).copied() {
             Some("uci") => {
-                println!("id name KiyEngine V6.1.0");
+                println!("id name KiyEngine V6.1.3");
                 println!("id author Khoi");
                 println!("option name Hash type spin default 512 min 64 max 65536");
                 println!("option name Threads type spin default 4 min 1 max 256");

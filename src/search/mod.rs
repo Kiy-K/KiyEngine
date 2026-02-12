@@ -353,7 +353,7 @@ use self::time::TimeManager;
 // =============================================================================
 
 pub struct Searcher {
-    engine: Arc<Engine>,
+    engine: Option<Arc<Engine>>,
     tt: Arc<TranspositionTable>,
     pub threads: usize,
     pub move_overhead: u32,
@@ -362,7 +362,7 @@ pub struct Searcher {
 }
 
 impl Searcher {
-    pub fn new(engine: Arc<Engine>, tt: Arc<TranspositionTable>) -> Self {
+    pub fn new(engine: Option<Arc<Engine>>, tt: Arc<TranspositionTable>) -> Self {
         Self {
             engine,
             tt,
@@ -388,7 +388,7 @@ impl Searcher {
         kv_cache: Option<Arc<parking_lot::Mutex<KVCache>>>,
         position_history: Vec<u64>,
     ) {
-        let engine = Arc::clone(&self.engine);
+        let engine = self.engine.clone();
         let tt = Arc::clone(&self.tt);
         let num_threads = self.threads;
         let move_overhead = self.move_overhead;
@@ -420,11 +420,21 @@ impl Searcher {
             // to proper probabilities. T<1.0 sharpens, T>1.0 flattens the distribution.
             const POLICY_TEMPERATURE: f32 = 0.8;
             let shared_policy: Arc<Option<(Vec<f32>, f32)>> = {
-                let result = if let Some(ref cache) = kv_cache {
-                    let mut cache_guard = cache.lock();
-                    engine.forward_with_cache(&move_history, &mut cache_guard)
+                // Skip BitNet when playing Black — model has White-side bias.
+                // NNUE + classical eval handles Black positions reliably.
+                let result = if is_white {
+                    if let Some(ref eng) = engine {
+                        if let Some(ref cache) = kv_cache {
+                            let mut cache_guard = cache.lock();
+                            eng.forward_with_cache(&move_history, &mut cache_guard)
+                        } else {
+                            eng.forward(&move_history)
+                        }
+                    } else {
+                        Err(candle_core::Error::Msg("No BitNet engine loaded".to_string()))
+                    }
                 } else {
-                    engine.forward(&move_history)
+                    Err(candle_core::Error::Msg("BitNet skipped for Black side".to_string()))
                 };
                 if let Ok(res) = result {
                     if let Ok(mut pol_vec) = res.0.to_vec1::<f32>() {
@@ -535,6 +545,8 @@ impl Searcher {
                             };
 
                             const MIN_DEPTH: u8 = 3;
+                            // Mate verification: when mate score appears, force N more iterations
+                            let mut mate_verify_until: u8 = 0;
 
                             for depth in 1..=local_max_depth {
                                 // Reset search path for clean repetition detection
@@ -549,7 +561,7 @@ impl Searcher {
                                 if worker.stop_flag.load(Ordering::Relaxed) {
                                     break;
                                 }
-                                if !depth_only && depth > MIN_DEPTH {
+                                if !depth_only && depth > MIN_DEPTH && depth > mate_verify_until {
                                     if is_main {
                                         if tm_clone.should_stop_soft() {
                                             break;
@@ -599,6 +611,12 @@ impl Searcher {
                                             best_move = mv;
                                             last_score = score;
 
+                                            // Mate verification: if mate score first appears,
+                                            // verify with 2 more iterations (set once, don't escalate)
+                                            if score.abs() >= MATE_SCORE - 100 && mate_verify_until == 0 {
+                                                mate_verify_until = depth + 2;
+                                            }
+
                                             // Update time manager with iteration results
                                             tm_clone.update_iteration(
                                                 depth as u32,
@@ -640,10 +658,12 @@ impl Searcher {
                                             } else {
                                                 String::new()
                                             };
-                                            println!(
-                                                "info depth {} score cp {} nodes {} nps {}{} pv {}",
-                                                depth, score, worker.nodes, nps, tb_str, pv_str
-                                            );
+                                            if let Some(ref sender) = tx_clone {
+                                                let _ = sender.send(format!(
+                                                    "info depth {} score cp {} nodes {} nps {}{} pv {}",
+                                                    depth, score, worker.nodes, nps, tb_str, pv_str
+                                                ));
+                                            }
                                         }
                                         break;
                                     }
@@ -656,17 +676,16 @@ impl Searcher {
 
                             // Gửi kết quả cuối cùng (chỉ main thread)
                             if is_main {
-                                if let Some(mv) = best_move {
-                                    let _ = tx_clone.unwrap().send(format!("bestmove {}", mv));
-                                } else {
-                                    // Fallback: Lấy đại một nước hợp lệ nếu chưa tìm thấy gì
-                                    let mut moves = MoveGen::new_legal(&board_clone);
-                                    if let Some(mv) = moves.next() {
-                                        let _ = tx_clone.unwrap().send(format!("bestmove {}", mv));
+                                if let Some(ref sender) = tx_clone {
+                                    if let Some(mv) = best_move {
+                                        let _ = sender.send(format!("bestmove {}", mv));
                                     } else {
-                                        // Checkmate/Stalemate detected at root
-                                        let _ =
-                                            tx_clone.unwrap().send("bestmove (none)".to_string());
+                                        let mut moves = MoveGen::new_legal(&board_clone);
+                                        if let Some(mv) = moves.next() {
+                                            let _ = sender.send(format!("bestmove {}", mv));
+                                        } else {
+                                            let _ = sender.send("bestmove (none)".to_string());
+                                        }
                                     }
                                 }
                             }
@@ -943,7 +962,35 @@ impl SearchWorker {
     }
 
     // =========================================================================
-    // RAW NNUE EVAL — pure network output, no adjustments.
+    // MATERIAL BALANCE — pure piece counting, no positional terms.
+    // Used to correct NNUE material blindness.
+    // =========================================================================
+    #[inline]
+    fn material_balance(&self) -> i32 {
+        let mut score: i32 = 0;
+        let white = *self.board.color_combined(Color::White);
+        let black = *self.board.color_combined(Color::Black);
+        let pieces = [
+            (Piece::Pawn, 100),
+            (Piece::Knight, 320),
+            (Piece::Bishop, 330),
+            (Piece::Rook, 500),
+            (Piece::Queen, 900),
+        ];
+        for &(piece, val) in &pieces {
+            let w = (self.board.pieces(piece) & white).0.count_ones() as i32;
+            let b = (self.board.pieces(piece) & black).0.count_ones() as i32;
+            score += (w - b) * val;
+        }
+        if self.board.side_to_move() == Color::White {
+            score
+        } else {
+            -score
+        }
+    }
+
+    // =========================================================================
+    // RAW NNUE EVAL — network output + material correction.
     // =========================================================================
     #[inline(always)]
     fn raw_nnue_eval(&mut self, ply: usize) -> i32 {
@@ -958,7 +1005,20 @@ impl SearchWorker {
                         self.nnue_acc[idx].refresh(&self.board, net);
                     }
                 }
-                return net.evaluate(&self.nnue_acc[idx], self.board.side_to_move(), &self.board);
+                let nnue_score =
+                    net.evaluate(&self.nnue_acc[idx], self.board.side_to_move(), &self.board);
+                // Material correction: NNUE is material-blind, so blend with
+                // fast material balance.  Speed > positional accuracy here
+                // because deeper search catches more tactics.
+                let material = self.material_balance();
+                // Sanity check: if NNUE and material diverge wildly,
+                // trust material more to prevent eval hallucinations
+                let divergence = (nnue_score - material).abs();
+                if divergence > 300 {
+                    return (nnue_score + 9 * material) / 10;
+                }
+                // Normal blend: 75% material + 25% NNUE positional
+                return (nnue_score + 3 * material) / 4;
             }
         }
         eval::evaluate(&self.board, 0)
@@ -1014,6 +1074,103 @@ impl SearchWorker {
         eval = eval * scale / 1000;
 
         eval
+    }
+
+    /// King safety correction: penalize uncastled king that has moved to rank 2-3
+    /// in the opening/middlegame. Scaled by opponent's attacking material.
+    #[inline]
+    fn king_safety_correction(&self) -> i32 {
+        let stm = self.board.side_to_move();
+        let opp = !stm;
+        let our_king = self.board.king_square(stm);
+        let opp_king = self.board.king_square(opp);
+
+        // Game phase: higher = more pieces = more dangerous for exposed king
+        let opp_material = {
+            let opp_bb = *self.board.color_combined(opp);
+            let n = (self.board.pieces(Piece::Knight) & opp_bb).0.count_ones() as i32;
+            let b = (self.board.pieces(Piece::Bishop) & opp_bb).0.count_ones() as i32;
+            let r = (self.board.pieces(Piece::Rook) & opp_bb).0.count_ones() as i32;
+            let q = (self.board.pieces(Piece::Queen) & opp_bb).0.count_ones() as i32;
+            n * 1 + b * 1 + r * 2 + q * 4 // phase-like weight
+        };
+
+        // Only apply when opponent has significant material (midgame)
+        if opp_material < 4 {
+            return 0;
+        }
+
+        let mut penalty = 0i32;
+
+        // Our king exposure
+        penalty -= Self::king_exposure_penalty(our_king, stm, opp_material);
+        // Opponent king exposure (bonus for us)
+        penalty += Self::king_exposure_penalty(opp_king, opp, opp_material) / 2;
+
+        penalty
+    }
+
+    /// Calculate penalty for a single king based on rank and castling status.
+    /// Returns a positive value (penalty).
+    #[inline]
+    fn king_exposure_penalty(king_sq: Square, color: Color, opp_material: i32) -> i32 {
+        let rank = king_sq.to_index() / 8; // 0=rank1, 7=rank8
+        let file = king_sq.to_index() % 8;
+
+        // Effective rank from this color's perspective (0 = back rank)
+        let eff_rank = if color == Color::White { rank } else { 7 - rank };
+
+        // King on back rank in corner area = likely castled = safe
+        if eff_rank == 0 && (file <= 2 || file >= 5) {
+            return 0;
+        }
+
+        // Penalty for king advanced beyond rank 1 (not castled)
+        // Scaled by opponent's attacking material
+        let rank_penalty = match eff_rank {
+            0 => {
+                // Back rank but in center (d1/e1) = hasn't castled
+                if file >= 3 && file <= 4 { 15 } else { 0 }
+            }
+            1 => 30, // Rank 2: moderate danger (Kd2, Ke2)
+            2 => 60, // Rank 3: serious danger (Kd3 in midgame = suicidal)
+            3 => 80, // Rank 4+: extreme
+            _ => 100,
+        };
+
+        // Scale penalty by opponent material (more pieces = more dangerous)
+        (rank_penalty * opp_material) / 8
+    }
+
+    /// Pawn chain correction: bonus for pawns defending each other diagonally.
+    /// From side-to-move perspective.
+    #[inline]
+    fn pawn_chain_correction(&self) -> i32 {
+        let white_bb = *self.board.color_combined(Color::White);
+        let black_bb = *self.board.color_combined(Color::Black);
+        let white_pawns = (self.board.pieces(Piece::Pawn) & white_bb).0;
+        let black_pawns = (self.board.pieces(Piece::Pawn) & black_bb).0;
+
+        // White pawn chains: pawn on (file, rank) defended by pawn on (file±1, rank-1)
+        // Shift white pawns NE and NW to find defenders
+        let w_defend_ne = (white_pawns >> 9) & 0xFEFEFEFEFEFEFEFE; // shift down-left
+        let w_defend_nw = (white_pawns >> 7) & 0x7F7F7F7F7F7F7F7F; // shift down-right
+        let w_defended = white_pawns & (w_defend_ne | w_defend_nw);
+        let w_chain = w_defended.count_ones() as i32;
+
+        // Black pawn chains: pawn defended by pawn on (file±1, rank+1)
+        let b_defend_se = (black_pawns << 7) & 0xFEFEFEFEFEFEFEFE; // shift up-left
+        let b_defend_sw = (black_pawns << 9) & 0x7F7F7F7F7F7F7F7F; // shift up-right
+        let b_defended = black_pawns & (b_defend_se | b_defend_sw);
+        let b_chain = b_defended.count_ones() as i32;
+
+        let chain_score = (w_chain - b_chain) * 8; // 8cp per connected pawn
+
+        if self.board.side_to_move() == Color::White {
+            chain_score
+        } else {
+            -chain_score
+        }
     }
 
     /// Compute a simple material configuration hash for correction history.
@@ -1410,11 +1567,13 @@ impl SearchWorker {
             }
         }
 
-        // --- Step 2: Check extension ---
+        // --- Step 2: Detect check (extension handled at horizon and per-move) ---
         let in_check = self.board.checkers().0 != 0;
-        if in_check && depth < MAX_PLY as u8 {
-            depth += 1;
-        }
+        // NOTE: unconditional depth+=1 here was removed — it caused exponential
+        // search explosion when combined with per-move gives_check extension.
+        // Check extensions are now handled by:
+        //   (a) Horizon: depth==0 && in_check → depth=1  (line ~1503)
+        //   (b) Per-move: gives_check && (depth>6 || is_pv) → ext=1  (line ~1833)
 
         let ply_idx = ply.min(MAX_PLY - 1);
 
@@ -1438,7 +1597,10 @@ impl SearchWorker {
         // --- Step 4: TT Lookup ---
         let hash = self.board.get_hash();
         let tt_entry = self.tt.get(hash);
-        let tt_move = tt_entry.as_ref().and_then(|e| e.best_move);
+        let tt_move = tt_entry.as_ref().and_then(|e| e.best_move).filter(|m| {
+            // Validate TT move is legal (guards against Zobrist hash collisions)
+            self.board.legal(*m)
+        });
         let tt_score = tt_entry.as_ref().map(|e| e.score);
         let tt_depth = tt_entry.as_ref().map(|e| e.depth).unwrap_or(0);
         let tt_static_eval = tt_entry.as_ref().map(|e| e.static_eval);
@@ -1464,8 +1626,15 @@ impl SearchWorker {
         }
 
         // --- Step 5: Leaf node → Quiescence ---
+        // When in check at the horizon, extend by 1 instead of dropping into
+        // qsearch.  This gives the engine a full alpha-beta ply to find quiet
+        // escape moves (blocks, interpositions) that qsearch would miss.
         if depth == 0 {
-            return (self.quiescence(alpha, beta, ply), None);
+            if in_check {
+                depth = 1;
+            } else {
+                return (self.quiescence(alpha, beta, ply, 0), None);
+            }
         }
         self.nodes += 1;
         // Periodically flush to shared counter (every 4096 nodes, low contention)
@@ -1520,7 +1689,7 @@ impl SearchWorker {
         if !is_pv && !in_check && depth <= 3 {
             let razor_margin = 300 + 250 * (depth as i32);
             if static_eval + razor_margin < alpha {
-                let q_score = self.quiescence(alpha, beta, ply);
+                let q_score = self.quiescence(alpha, beta, ply, 0);
                 if q_score < alpha {
                     return (q_score, None);
                 }
@@ -1602,12 +1771,12 @@ impl SearchWorker {
             }
         }
 
-        // --- Step 11: Neural Policy Lookup (root only, from cache — zero cost) ---
-        let policy: Option<&[f32]> = if is_root {
-            self.cached_root_policy.as_deref()
-        } else {
-            None
-        };
+        // --- Step 11: Neural Policy Lookup (DISABLED) ---
+        // BitNet policy is currently harmful — suggests flashy but tactically
+        // hollow moves (Bd5?, Nce2?, Ne5?). Disabled until the policy network
+        // is retrained on quality data. Search heuristics (TT, MVV-LVA, killers,
+        // history, countermove, cont_history) provide reliable move ordering.
+        let policy: Option<&[f32]> = None;
 
         // --- Step 12: Generate and order moves ---
         let mut moves = self.order_moves(MoveGen::new_legal(&self.board), policy, ply, tt_move);
@@ -1690,9 +1859,19 @@ impl SearchWorker {
             let is_promo = mv.get_promotion().is_some();
             let is_tactical = is_cap || is_promo;
 
+            // Pre-compute gives_check for quiet moves BEFORE pruning.
+            // Checking moves must NEVER be pruned (Stockfish principle).
+            // Only compute at shallow depths where pruning (LMP/futility/history/SEE)
+            // actually fires — avoids expensive board copy at deep nodes.
+            let gives_check = if !is_tactical && moves_searched > 0 && depth <= 8 {
+                self.board.make_move_new(mv).checkers().0 != 0
+            } else {
+                false
+            };
+
             // --- Step 13: Late Move Pruning (LMP) ---
             // Improving flag: allow more moves when improving
-            if !is_root && !in_check && !is_tactical && depth <= 8 {
+            if !is_root && !in_check && !is_tactical && !gives_check && depth <= 8 {
                 let base = 3 + (depth as usize) * (depth as usize) / 3;
                 let lmp_threshold = if improving { base + 3 } else { base };
                 if moves_searched >= lmp_threshold {
@@ -1701,7 +1880,7 @@ impl SearchWorker {
             }
 
             // --- Step 14: Futility Pruning ---
-            if !is_root && !in_check && !is_tactical && depth <= 8 && moves_searched > 0 {
+            if !is_root && !in_check && !is_tactical && !gives_check && depth <= 8 && moves_searched > 0 {
                 let futility_margin = static_eval + 150 + 100 * (depth as i32);
                 if futility_margin <= alpha {
                     continue;
@@ -1710,7 +1889,7 @@ impl SearchWorker {
 
             // --- Step 14b: History Pruning (Stockfish-inspired) ---
             // Prune quiet moves with very negative history at shallow depths
-            if !is_root && !in_check && !is_tactical && depth <= 4 && moves_searched > 0 {
+            if !is_root && !in_check && !is_tactical && !gives_check && depth <= 4 && moves_searched > 0 {
                 let moved_piece_local = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
                 let moved_color_local = self.board.side_to_move();
                 let side_local = if moved_color_local == Color::White {
@@ -1743,7 +1922,7 @@ impl SearchWorker {
             }
 
             // --- Step 15: SEE Pruning for bad captures/quiet moves ---
-            if !is_root && !is_promo && moves_searched > 0 {
+            if !is_root && !is_promo && !gives_check && moves_searched > 0 {
                 let see_threshold = if is_cap {
                     // Captures: prune if SEE is sufficiently negative (depth-scaled)
                     -20 * (depth as i32)
@@ -1771,12 +1950,20 @@ impl SearchWorker {
             self.move_stack[ply_idx] = Some(mv);
             self.piece_stack[ply_idx] = Self::piece_index(moved_piece, moved_color);
 
+            // Recompute gives_check precisely after make_move (the pre-pruning
+            // value was only computed for quiet non-first moves; update for all).
             let gives_check = self.board.checkers().0 != 0;
 
             let mut score;
 
             // --- Extensions ---
             let mut ext: u8 = 0;
+
+            // Check extension: only at high depth or PV nodes (Stockfish-style).
+            // Unconditional check extension causes search explosion.
+            if gives_check && (depth > 6 || is_pv) {
+                ext = 1;
+            }
 
             // Singular extension (highest priority)
             if Some(mv) == tt_move && singular_extension > 0 {
@@ -2085,7 +2272,7 @@ impl SearchWorker {
     // =========================================================================
     // QUIESCENCE SEARCH with Delta Pruning + Check Extensions
     // =========================================================================
-    fn quiescence(&mut self, mut alpha: i32, beta: i32, ply: usize) -> i32 {
+    fn quiescence(&mut self, mut alpha: i32, beta: i32, ply: usize, qs_depth: i32) -> i32 {
         self.nodes += 1;
         if self.nodes & 4095 == 0 {
             self.shared_nodes.fetch_add(4096, Ordering::Relaxed);
@@ -2186,6 +2373,14 @@ impl SearchWorker {
                 if mv.get_promotion() == Some(Piece::Queen) {
                     scored_moves.push(mv, 44_000);
                 }
+                // Third pass: quiet check-giving moves in first 2 QS plies
+                // Catches knight forks, discovered checks, and other tactical shots
+                else if qs_depth == 0 && mv.get_promotion().is_none() {
+                    let new_board = self.board.make_move_new(mv);
+                    if new_board.checkers().0 != 0 {
+                        scored_moves.push(mv, 30_000); // Below captures, above nothing
+                    }
+                }
             }
         }
         let original_alpha = alpha;
@@ -2214,7 +2409,7 @@ impl SearchWorker {
             self.nnue_make_move(mv, ply);
             self.board = self.board.make_move_new(mv);
 
-            let score = -self.quiescence(-beta, -alpha, ply + 1);
+            let score = -self.quiescence(-beta, -alpha, ply + 1, qs_depth + 1);
 
             self.board = old_board;
             self.search_path_pop();
@@ -2301,11 +2496,16 @@ impl SearchWorker {
                 score += 200_000;
             }
 
-            // 2. Neural policy score with temperature-scaled softmax (LLM technique)
+            // 2. Neural policy score (capped to prevent overriding tactical signals)
             if let Some(pol) = policy {
                 let token = MoveCodec::get_policy_index(&mv);
                 if token < pol.len() {
-                    score += (pol[token] * 20_000.0) as i32;
+                    let mut policy_bonus = (pol[token] * 8_000.0) as i32;
+                    // SEE validation: halve policy bonus for moves that lose material
+                    if policy_bonus > 500 && self.see_score(mv) < 0 {
+                        policy_bonus /= 4;
+                    }
+                    score += policy_bonus;
                 }
             }
 

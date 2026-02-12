@@ -26,7 +26,13 @@ const ADJACENT_FILES: [u64; 8] = [
 ];
 
 // Passed pawn bonus by rank (from White's perspective, rank 1-8 index 0-7)
-const PASSED_PAWN_BONUS: [i32; 8] = [0, 5, 10, 20, 35, 60, 100, 0];
+// Exponential scaling: each rank roughly doubles the bonus
+const PASSED_PAWN_BONUS: [i32; 8] = [0, 10, 20, 45, 80, 140, 250, 0];
+// Extra bonus when passed pawn is protected by another pawn
+const PROTECTED_PASSER_BONUS: [i32; 8] = [0, 5, 10, 20, 40, 70, 125, 0];
+
+// Total game phase for endgame scaling (same as pst.rs)
+const TOTAL_PHASE: i32 = 24;
 
 // Pawn shield masks: squares directly in front of king (2 ranks deep)
 // These are relative masks applied based on king position
@@ -131,7 +137,22 @@ pub fn evaluate(board: &Board, _ply: usize) -> i32 {
             0
         };
         if (black_pawns & BitBoard(passed_mask)).0 == 0 {
-            score += PASSED_PAWN_BONUS[rank];
+            // Endgame scaling: passed pawns are more valuable with fewer pieces
+            let eg_scale = (TOTAL_PHASE - phase).max(0) as i32;
+            let base = PASSED_PAWN_BONUS[rank];
+            score += base + (base * eg_scale) / (TOTAL_PHASE * 2);
+
+            // Protected passer: defended by another pawn (diagonal behind)
+            let prot_mask = if rank > 0 {
+                let behind_rank = (rank - 1) * 8;
+                let mut m = 0u64;
+                if file > 0 { m |= 1u64 << (behind_rank + file - 1); }
+                if file < 7 { m |= 1u64 << (behind_rank + file + 1); }
+                m
+            } else { 0 };
+            if (white_pawns & BitBoard(prot_mask)).0 != 0 {
+                score += PROTECTED_PASSER_BONUS[rank];
+            }
         }
 
         // Doubled pawn: another friendly pawn on same file ahead
@@ -159,7 +180,22 @@ pub fn evaluate(board: &Board, _ply: usize) -> i32 {
             0
         };
         if (white_pawns & BitBoard(passed_mask)).0 == 0 {
-            score -= PASSED_PAWN_BONUS[7 - rank];
+            let brank = 7 - rank;
+            let eg_scale = (TOTAL_PHASE - phase).max(0) as i32;
+            let base = PASSED_PAWN_BONUS[brank];
+            score -= base + (base * eg_scale) / (TOTAL_PHASE * 2);
+
+            // Protected passer for Black
+            let prot_mask = if rank < 7 {
+                let behind_rank = (rank + 1) * 8;
+                let mut m = 0u64;
+                if file > 0 { m |= 1u64 << (behind_rank + file - 1); }
+                if file < 7 { m |= 1u64 << (behind_rank + file + 1); }
+                m
+            } else { 0 };
+            if (black_pawns & BitBoard(prot_mask)).0 != 0 {
+                score -= PROTECTED_PASSER_BONUS[brank];
+            }
         }
 
         // Doubled pawn
@@ -172,6 +208,28 @@ pub fn evaluate(board: &Board, _ply: usize) -> i32 {
         if (black_pawns & BitBoard(ADJACENT_FILES[file])).0 == 0 {
             score += 15;
         }
+    }
+
+    // --- Minor piece development penalty (opening only, phase > 16) ---
+    // Penalize knights/bishops still on starting squares
+    if phase > 16 {
+        // White undeveloped pieces
+        let w_knights = board.pieces(Piece::Knight) & white_bb;
+        let w_bishops = board.pieces(Piece::Bishop) & white_bb;
+        // Starting squares: Nb1(1), Ng1(6), Bc1(2), Bf1(5)
+        if (w_knights & BitBoard(1u64 << 1)).0 != 0 { score -= 15; }  // Nb1
+        if (w_knights & BitBoard(1u64 << 6)).0 != 0 { score -= 15; }  // Ng1
+        if (w_bishops & BitBoard(1u64 << 2)).0 != 0 { score -= 10; }  // Bc1
+        if (w_bishops & BitBoard(1u64 << 5)).0 != 0 { score -= 10; }  // Bf1
+
+        // Black undeveloped pieces
+        let b_knights = board.pieces(Piece::Knight) & black_bb;
+        let b_bishops = board.pieces(Piece::Bishop) & black_bb;
+        // Starting squares: Nb8(57), Ng8(62), Bc8(58), Bf8(61)
+        if (b_knights & BitBoard(1u64 << 57)).0 != 0 { score += 15; }  // Nb8
+        if (b_knights & BitBoard(1u64 << 62)).0 != 0 { score += 15; }  // Ng8
+        if (b_bishops & BitBoard(1u64 << 58)).0 != 0 { score += 10; }  // Bc8
+        if (b_bishops & BitBoard(1u64 << 61)).0 != 0 { score += 10; }  // Bf8
     }
 
     if board.side_to_move() == Color::White {
