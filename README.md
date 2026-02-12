@@ -11,7 +11,7 @@ A high-performance UCI chess engine written in Rust, featuring a **hybrid evalua
 | **NNUE Eval** | (768→512)×2 → SCReLU → L1(16) → CReLU → L2(8) per bucket |
 | **BitNet Model** | 22.76M params, GGUF format (79 MB, mmap) |
 | **Quantization** | NNUE i16/i8, BitNet 1.58-bit ternary |
-| **Distribution** | Single binary (NNUE + books embedded) |
+| **Distribution** | Single binary (~93 MB, all assets embedded) |
 
 ## Key Features
 
@@ -28,7 +28,7 @@ A high-performance UCI chess engine written in Rust, featuring a **hybrid evalua
 - **Bit-Packed Ternary Weights** -- dual bitmask format, 4x denser than i8
 - **SIMD Packed GEMV** -- AVX-512, AVX2, NEON, scalar (auto-detected)
 - **KV Cache** -- 4-5x speedup for incremental inference
-- **GGUF format** -- memory-mapped loading (optional, loaded from disk if present)
+- **GGUF format** -- embedded in binary via `include_bytes!`, disk file takes priority if present
 
 ### Search
 - **Alpha-Beta with PVS**, aspiration windows (exponential widening)
@@ -74,9 +74,9 @@ cd KiyEngine
 cargo build --release
 ```
 
-The release binary is at `./target/release/kiy_engine`. **No external files needed** -- NNUE weights and opening books are embedded in the binary.
+The release binary is at `./target/release/kiy_engine`. **No external files needed** -- GGUF model, NNUE weights, and opening books are all embedded in the binary (~93 MB).
 
-Optionally place `kiyengine.gguf` alongside the binary for BitNet Transformer root policy (enhanced move ordering).
+Disk files (`kiyengine.gguf`, `kiyengine.nnue`, `book*.bin`) take priority over embedded assets if present.
 
 ## UCI Options
 
@@ -140,7 +140,7 @@ src/
 
 ## Troubleshooting
 
-- **Missing GGUF model**: Optional. Engine works standalone with embedded NNUE. Place `kiyengine.gguf` alongside the binary for enhanced root policy.
+- **Missing model files**: Not an issue. All assets (GGUF, NNUE, books) are embedded in the binary. Disk files override embedded if present.
 - **Out of memory**: Reduce `Hash` (e.g., `setoption name Hash value 128`).
 - **Slow NPS**: Ensure `--release` build. Check `Threads` is appropriate for your CPU.
 

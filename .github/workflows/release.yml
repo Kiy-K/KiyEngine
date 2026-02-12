@@ -44,7 +44,7 @@ jobs:
       - name: Verify embedded assets exist
         run: |
           echo "Checking assets that will be embedded via include_bytes!..."
-          for f in kiyengine.nnue src/book/book1.bin src/book/book2.bin; do
+          for f in kiyengine.gguf kiyengine.nnue src/book/book1.bin src/book/book2.bin; do
             if [ ! -f "$f" ]; then
               echo "ERROR: $f not found"
               exit 1
@@ -113,8 +113,8 @@ jobs:
             **Hybrid evaluation: BitNet 1.58-bit Transformer + NNUE Deep Network**
             
             ### Single Binary Distribution
-            Download the binary for your platform. **No external files needed** -- NNUE weights
-            and opening books are embedded in the binary at compile time.
+            Download the binary for your platform (~93 MB). **No external files needed** -- GGUF model,
+            NNUE weights, and opening books are all embedded in the binary at compile time.
             
             | Platform | File |
             |----------|------|
@@ -123,7 +123,7 @@ jobs:
             
             ### Architecture
             - **NNUE Evaluation**: (768→512)×2 → SCReLU → L1(16) → CReLU → L2(8) per bucket
-            - **BitNet Transformer**: 12-layer, 512 d_model, GQA (optional, load `kiyengine.gguf`)
+            - **BitNet Transformer**: 12-layer, 512 d_model, GQA (embedded, 79 MB GGUF)
             - **AVX2 SIMD**: Hand-tuned intrinsics for NNUE eval, accumulator updates, and BitNet GEMV
             - **Search**: Alpha-beta PVS, Lazy SMP, SEE, LMR, Syzygy TB support
             - **~900K NPS** single-thread, **~1.6M NPS** 4 threads

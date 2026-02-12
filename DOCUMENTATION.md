@@ -27,12 +27,12 @@ KiyEngine is a high-performance UCI chess engine built in Rust with the followin
    - 10 input buckets (king-square), 8 output buckets (piece-count)
    - Weights embedded in binary via `include_bytes!`
 
-2. **BitNet Transformer** (`engine/`) -- Optional root move ordering
+2. **BitNet Transformer** (`engine/`) -- Root move ordering (embedded)
    - BitNet 1.58-bit Transformer (12 layers, 512 d_model, 8 heads, GQA with 2 KV heads, 1536 hidden dim)
    - Bit-packed ternary weights with dual bitmask format (4x denser than i8)
    - SIMD-optimized packed GEMV (AVX-512, AVX2, NEON, scalar fallback)
    - KV Cache for incremental inference (4-5x speedup)
-   - Loaded from disk (`kiyengine.gguf`) if present, otherwise skipped
+   - GGUF model embedded in binary via `include_bytes!` (79 MB), disk file takes priority if present
 
 3. **Search Algorithm** (`search/`)
    - Lazy SMP with configurable thread count, varied depth offsets, lock-free shared TT
@@ -106,7 +106,7 @@ KiyEngine/
 +-- Cargo.toml               Package manifest (v6.1.0)
 +-- .cargo/config.toml       SIMD target features (AVX2/AVX-512/BMI2)
 +-- kiyengine.nnue           NNUE weights (embedded in binary)
-+-- kiyengine.gguf           BitNet model (optional, loaded from disk)
++-- kiyengine.gguf           BitNet model (embedded in binary, ~79 MB)
 ```
 
 For detailed architectural diagrams, see [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -321,8 +321,8 @@ instability    = 1.0 + 1.5 * best_move_changes / 10.0
 ### Prerequisites
 
 - Rust 1.70+ (stable toolchain)
-- NNUE weights and opening books are embedded in the binary (no external files required)
-- Optional: `kiyengine.gguf` for BitNet Transformer root policy
+- All assets (GGUF, NNUE, books) are embedded in the binary (~93 MB, no external files required)
+- Disk files override embedded assets if present
 
 ### Build Commands
 
@@ -436,9 +436,9 @@ echo "uci\nisready\nposition fen <FEN>\ngo depth 14" | ./target/release/kiy_engi
 
 ### "Failed to load engine"
 
-- NNUE weights are embedded in the binary — no external file needed
-- If using the BitNet Transformer, ensure `kiyengine.gguf` is alongside the binary
-- Engine works standalone with just NNUE eval (GGUF is optional)
+- All assets (GGUF, NNUE, books) are embedded in the binary
+- Engine is fully self-contained — no external files needed
+- Disk files override embedded assets if present
 
 ### Low NPS
 

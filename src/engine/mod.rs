@@ -26,6 +26,9 @@ use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder};
 use std::collections::HashMap;
 
+/// Embedded GGUF model (compiled into binary for single-file distribution)
+pub static EMBEDDED_GGUF: &[u8] = include_bytes!("../../kiyengine.gguf");
+
 /// Main engine struct containing the neural network
 pub struct Engine {
     pub embedding: Embedding,
@@ -49,7 +52,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Create a new engine — loads GGUF model
+    /// Create a new engine — loads GGUF model from disk or embedded bytes
     pub fn new() -> anyhow::Result<Self> {
         let device = if cfg!(feature = "cuda") {
             Device::new_cuda(0).unwrap_or(Device::Cpu)
@@ -58,19 +61,35 @@ impl Engine {
         };
 
         if std::path::Path::new(DEFAULT_MODEL_PATH).exists() {
-            println!("Loading v6.0.0 GGUF model: {}", DEFAULT_MODEL_PATH);
+            eprintln!("info string Loading GGUF model: {}", DEFAULT_MODEL_PATH);
             return Self::load_from_gguf(DEFAULT_MODEL_PATH, device);
         }
 
-        anyhow::bail!("No model file found. Expected '{}'", DEFAULT_MODEL_PATH,)
+        // Fall back to embedded GGUF
+        eprintln!("info string Loading GGUF model: embedded");
+        Self::load_from_embedded(device)
     }
 
-    /// Load model weights from GGUF file (v6.0.0 KiyNet_V6 format)
-    pub fn load_from_gguf(model_path: &str, device: Device) -> anyhow::Result<Self> {
-        use crate::engine::gguf::GgmlQuantizationType;
+    /// Load model from embedded GGUF bytes compiled into the binary
+    pub fn load_from_embedded(device: Device) -> anyhow::Result<Self> {
         use crate::engine::gguf::GgufFile;
+        let gguf = GgufFile::from_static_bytes(EMBEDDED_GGUF)?;
+        Self::load_from_gguf_parsed(gguf, device)
+    }
 
+    /// Load model weights from GGUF file on disk
+    pub fn load_from_gguf(model_path: &str, device: Device) -> anyhow::Result<Self> {
+        use crate::engine::gguf::GgufFile;
         let gguf = GgufFile::from_path(model_path)?;
+        Self::load_from_gguf_parsed(gguf, device)
+    }
+
+    /// Load model weights from a parsed GgufFile
+    fn load_from_gguf_parsed(
+        gguf: crate::engine::gguf::GgufFile,
+        device: Device,
+    ) -> anyhow::Result<Self> {
+        use crate::engine::gguf::GgmlQuantizationType;
 
         // Extract configuration from GGUF metadata
         let vocab_size = gguf

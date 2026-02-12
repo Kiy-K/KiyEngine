@@ -144,6 +144,31 @@ pub struct GgufTensorInfo {
     pub n_elements: u64,
 }
 
+/// Backing store for GGUF data — either memory-mapped file or embedded static bytes.
+pub enum GgufData {
+    Mmap(Mmap),
+    Static(&'static [u8]),
+}
+
+impl std::fmt::Debug for GgufData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GgufData::Mmap(m) => write!(f, "Mmap({} bytes)", m.len()),
+            GgufData::Static(s) => write!(f, "Static({} bytes)", s.len()),
+        }
+    }
+}
+
+impl std::ops::Deref for GgufData {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            GgufData::Mmap(m) => m,
+            GgufData::Static(s) => s,
+        }
+    }
+}
+
 /// Parsed GGUF file
 #[derive(Debug)]
 pub struct GgufFile {
@@ -151,7 +176,7 @@ pub struct GgufFile {
     pub metadata: HashMap<String, GgufMetadataValue>,
     pub tensors: Vec<GgufTensorInfo>,
     pub tensor_data_offset: u64,
-    pub mmap: Mmap,
+    pub data: GgufData,
 }
 
 impl GgufFile {
@@ -159,22 +184,27 @@ impl GgufFile {
     pub fn from_path<P: AsRef<std::path::Path>>(path: P) -> anyhow::Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        Self::from_mmap(mmap)
+        Self::parse(GgufData::Mmap(mmap))
     }
 
-    /// Parse GGUF from memory-mapped buffer
-    pub fn from_mmap(mmap: Mmap) -> anyhow::Result<Self> {
-        if mmap.len() < 24 {
+    /// Load GGUF from static byte slice (embedded in binary)
+    pub fn from_static_bytes(bytes: &'static [u8]) -> anyhow::Result<Self> {
+        Self::parse(GgufData::Static(bytes))
+    }
+
+    /// Parse GGUF from any backing data
+    fn parse(data: GgufData) -> anyhow::Result<Self> {
+        if data.len() < 24 {
             anyhow::bail!("GGUF file too small (minimum 24 bytes)");
         }
 
         // Verify magic
-        if &mmap[0..4] != GGUF_MAGIC {
+        if &data[0..4] != GGUF_MAGIC {
             anyhow::bail!("Invalid GGUF magic (expected 'GGUF')");
         }
 
         // Parse header
-        let version = u32::from_le_bytes([mmap[4], mmap[5], mmap[6], mmap[7]]);
+        let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         if version != GGUF_VERSION {
             anyhow::bail!(
                 "Unsupported GGUF version: {} (expected {})",
@@ -184,10 +214,10 @@ impl GgufFile {
         }
 
         let n_tensors = u64::from_le_bytes([
-            mmap[8], mmap[9], mmap[10], mmap[11], mmap[12], mmap[13], mmap[14], mmap[15],
+            data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
         ]);
         let n_kv = u64::from_le_bytes([
-            mmap[16], mmap[17], mmap[18], mmap[19], mmap[20], mmap[21], mmap[22], mmap[23],
+            data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
         ]);
 
         let mut offset: usize = 24;
@@ -195,7 +225,7 @@ impl GgufFile {
         // Parse metadata
         let mut metadata = HashMap::new();
         for _ in 0..n_kv {
-            let (key, value, consumed) = Self::parse_kv(&mmap[offset..])?;
+            let (key, value, consumed) = Self::parse_kv(&data[offset..])?;
             metadata.insert(key, value);
             offset += consumed;
         }
@@ -204,7 +234,7 @@ impl GgufFile {
         let mut tensors = Vec::with_capacity(n_tensors as usize);
 
         for _ in 0..n_tensors {
-            let (info, consumed) = Self::parse_tensor_info(&mmap[offset..])?;
+            let (info, consumed) = Self::parse_tensor_info(&data[offset..])?;
             tensors.push(info);
             offset += consumed;
         }
@@ -218,7 +248,7 @@ impl GgufFile {
             metadata,
             tensors,
             tensor_data_offset,
-            mmap,
+            data,
         })
     }
 
@@ -427,7 +457,7 @@ impl GgufFile {
         let type_size = info.quantization.type_size();
         let data_size = info.n_elements as usize * type_size;
         let abs_offset = self.tensor_data_offset as usize + info.offset as usize;
-        &self.mmap[abs_offset..abs_offset + data_size]
+        &self.data[abs_offset..abs_offset + data_size]
     }
 
     /// Get metadata value as f32

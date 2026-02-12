@@ -21,10 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Fused SIMD Accumulator Updates** -- single-pass memory operations
   - `vec_copy_sub_add_i16`: fused copy+sub+add for quiet moves (1 memory pass)
   - `vec_copy_sub2_add_i16`: fused copy+sub2+add for captures (1 memory pass)
-- **Embedded Assets** -- single self-contained binary distribution
-  - NNUE weights embedded via `include_bytes!` (7.6 MB, loaded from embedded if no disk file)
+- **Embedded Assets** -- single self-contained binary (~93 MB)
+  - GGUF model embedded via `include_bytes!` (79 MB BitNet Transformer)
+  - NNUE weights embedded via `include_bytes!` (7.6 MB deep network)
   - Opening books embedded via `include_bytes!` (1.9 MB + 49 KB)
-  - Disk files take priority if present (allows overriding embedded weights)
+  - Disk files take priority if present (allows overriding embedded assets)
+  - `GgufData` enum: supports both `Mmap` (disk) and `Static` (embedded) backing
 - **Syzygy Tablebase Support** -- WDL + DTZ probing via `shakmaty-syzygy`
   - Auto-extraction from `syzygy.tar.zst` archive
   - Configurable path via UCI `SyzygyPath` option
@@ -36,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Evaluation** -- NNUE is now the primary evaluation at every node (was Material+PST)
-- **Distribution** -- single binary with embedded NNUE + books (was binary + external files)
+- **Distribution** -- single ~93 MB binary with all assets embedded (GGUF + NNUE + books)
 - **UCI version** -- reports `KiyEngine V6.1.0`
 - **Opening book loading** -- tries disk files first, falls back to embedded bytes
 - **NNUE loading** -- tries disk file first, falls back to embedded weights

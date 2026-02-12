@@ -345,11 +345,11 @@ Incremental inference (subsequent calls):
 +-----------------------------------------------+
 |              Evaluation Stack                  |
 |                                                |
-|  [Root Only]  BitNet Transformer (optional)    |
+|  [Root Only]  BitNet Transformer (embedded)    |
 |               - Policy logits (move ordering)  |
 |               - Value score (unused in search) |
 |               - Shared via Arc across threads  |
-|               - Loaded from disk if present    |
+|               - Embedded in binary (79 MB)     |
 |                                                |
 |  [Every Node] NNUE Deep Network (primary)     |
 |               - (768->512)x2 per perspective   |
@@ -710,7 +710,7 @@ KiyEngine/
 |   |   +-- book1.bin           Polyglot book 1 (embedded via include_bytes!)
 |   |   +-- book2.bin           Polyglot book 2 (embedded via include_bytes!)
 |   |
-|   +-- engine/                 BitNet Transformer inference (optional)
+|   +-- engine/                 BitNet Transformer inference (embedded)
 |   |   +-- mod.rs              Engine struct, forward / forward_with_cache
 |   |   +-- bitlinear.rs        BitLinear: packed ternary weights, SIMD GEMV
 |   |   +-- transformer.rs      MultiheadAttention, BitSwiGLU, KVCache
@@ -740,7 +740,7 @@ KiyEngine/
 |
 +-- Cargo.toml                  Package manifest (v6.1.0)
 +-- .cargo/config.toml          SIMD target features (AVX2/AVX-512/BMI2)
-+-- kiyengine.gguf              BitNet Transformer model (~79 MB, optional)
++-- kiyengine.gguf              BitNet Transformer model (~79 MB, embedded in binary)
 +-- kiyengine.nnue              NNUE weights (~7.6 MB, embedded in binary)
 ```
 
