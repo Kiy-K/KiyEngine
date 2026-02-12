@@ -75,11 +75,13 @@ def convert_v5(input_path: str, output_path: str, hidden_size: int = 512,
     ft_biases = np.frombuffer(data[offset:offset + ft_b_bytes], dtype=np.int16).copy()
     offset += ft_b_bytes
 
-    # L1 weights: i8 (already transposed in save_format)
+    # L1 weights: i8 — Bullet saves transposed [2*hidden, l1_size], engine needs [l1_size, 2*hidden]
     l1_w_count = l1_size * 2 * hidden_size
     l1_w_bytes = l1_w_count  # i8 = 1 byte each
-    l1_weights = np.frombuffer(data[offset:offset + l1_w_bytes], dtype=np.int8).copy()
+    l1_weights_raw = np.frombuffer(data[offset:offset + l1_w_bytes], dtype=np.int8).copy()
     offset += l1_w_bytes
+    # Transpose: [2*hidden, l1_size] row-major → [l1_size, 2*hidden] row-major
+    l1_weights = l1_weights_raw.reshape(2 * hidden_size, l1_size).T.flatten()
 
     # L1 biases: i32
     l1_b_count = l1_size
@@ -87,11 +89,13 @@ def convert_v5(input_path: str, output_path: str, hidden_size: int = 512,
     l1_biases = np.frombuffer(data[offset:offset + l1_b_bytes], dtype=np.int32).copy()
     offset += l1_b_bytes
 
-    # L2 weights: i16 (already transposed in save_format)
+    # L2 weights: i16 — Bullet saves transposed [l1_size, num_buckets], engine needs [num_buckets, l1_size]
     l2_w_count = num_output_buckets * l1_size
     l2_w_bytes = l2_w_count * 2
-    l2_weights = np.frombuffer(data[offset:offset + l2_w_bytes], dtype=np.int16).copy()
+    l2_weights_raw = np.frombuffer(data[offset:offset + l2_w_bytes], dtype=np.int16).copy()
     offset += l2_w_bytes
+    # Transpose: [l1_size, num_buckets] row-major → [num_buckets, l1_size] row-major
+    l2_weights = l2_weights_raw.reshape(l1_size, num_output_buckets).T.flatten()
 
     # L2 biases: i16
     l2_b_count = num_output_buckets

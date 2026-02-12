@@ -120,11 +120,11 @@ fn main() {
                 .quantise::<i16>(255),
             SavedFormat::id("l0b").round().quantise::<i16>(255),
             // L1: shared hidden layer, i8 weights for fast inference
-            // Transpose for row-major layout: l1w[j * 2*HIDDEN + i]
+            // .transpose() saves as [2*HIDDEN, l1_size]; converter transposes back to [l1_size, 2*HIDDEN]
             SavedFormat::id("l1w").round().quantise::<i8>(64).transpose(),
             SavedFormat::id("l1b").round().quantise::<i32>(255 * 64),
             // L2: per-bucket output layer, i16 weights
-            // Transpose for row-major layout: l2w[bucket * L1_SIZE + j]
+            // .transpose() saves as [L1_SIZE, num_buckets]; converter transposes back to [num_buckets, L1_SIZE]
             SavedFormat::id("l2w").round().quantise::<i16>(64).transpose(),
             SavedFormat::id("l2b").round().quantise::<i16>(255 * 64),
         ])
