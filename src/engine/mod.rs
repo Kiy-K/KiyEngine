@@ -124,7 +124,11 @@ impl Engine {
             .unwrap_or(HIDDEN_DIM as u32) as usize;
         let head_dim = d_model / num_heads;
 
-        let format_str = if is_v52 { "v5.2 (MHA+pos_embed)" } else { "v6 (GQA+RoPE)" };
+        let format_str = if is_v52 {
+            "v5.2 (MHA+pos_embed)"
+        } else {
+            "v6 (GQA+RoPE)"
+        };
         eprintln!(
             "  Config: {} d_model={}, layers={}, heads={}, kv_heads={}, head_dim={}, hidden={}, ctx={}, vocab={}",
             format_str, d_model, num_layers, num_heads, num_kv_heads, head_dim, hidden_dim, context_length, vocab_size
@@ -196,7 +200,13 @@ impl Engine {
                 )?);
             } else {
                 layers.push(TransformerBlock::load(
-                    i, &vb, d_model, hidden_dim, num_heads, num_kv_heads, head_dim,
+                    i,
+                    &vb,
+                    d_model,
+                    hidden_dim,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
                 )?);
             }
         }
@@ -235,7 +245,10 @@ impl Engine {
 
         eprintln!(
             "  Model loaded successfully ({} layers, {} {}/{})",
-            num_layers, if is_v52 { "MHA" } else { "GQA" }, num_heads, num_kv_heads
+            num_layers,
+            if is_v52 { "MHA" } else { "GQA" },
+            num_heads,
+            num_kv_heads
         );
 
         Ok(Self {

@@ -431,10 +431,14 @@ impl Searcher {
                             eng.forward(&move_history)
                         }
                     } else {
-                        Err(candle_core::Error::Msg("No BitNet engine loaded".to_string()))
+                        Err(candle_core::Error::Msg(
+                            "No BitNet engine loaded".to_string(),
+                        ))
                     }
                 } else {
-                    Err(candle_core::Error::Msg("BitNet skipped for Black side".to_string()))
+                    Err(candle_core::Error::Msg(
+                        "BitNet skipped for Black side".to_string(),
+                    ))
                 };
                 if let Ok(res) = result {
                     if let Ok(mut pol_vec) = res.0.to_vec1::<f32>() {
@@ -990,15 +994,22 @@ impl SearchWorker {
     }
 
     // =========================================================================
-    // RAW NNUE EVAL — network output + material correction.
+    // RAW NNUE EVAL — classical eval base + bounded NNUE positional correction.
+    //
+    // Classical eval (Material + PeSTO PSTs + positional terms) is the reliable
+    // base.  The NNUE network is undertrained (material-blind), so we extract
+    // only its *positional* component (nnue_score − material_balance) and clamp
+    // it to ±150 cp.  This preserves any positional patterns NNUE learned
+    // without letting its material blindness pollute the evaluation.
     // =========================================================================
     #[inline(always)]
     fn raw_nnue_eval(&mut self, ply: usize) -> i32 {
+        let classical = eval::evaluate(&self.board, 0);
+
         if self.use_nnue_eval {
             if let Some(ref net) = self.nnue {
                 let idx = ply.min(MAX_PLY - 1);
                 if !self.nnue_acc[idx].computed {
-                    // Use Finny Table for fast refresh (diff-based, ~8× faster)
                     if let Some(ref mut ft) = self.finny_table {
                         ft.refresh(&mut self.nnue_acc[idx], &self.board, net);
                     } else {
@@ -1007,21 +1018,14 @@ impl SearchWorker {
                 }
                 let nnue_score =
                     net.evaluate(&self.nnue_acc[idx], self.board.side_to_move(), &self.board);
-                // Material correction: NNUE is material-blind, so blend with
-                // fast material balance.  Speed > positional accuracy here
-                // because deeper search catches more tactics.
+                // Extract NNUE positional component by subtracting material.
+                // Clamp to prevent material-blind hallucinations.
                 let material = self.material_balance();
-                // Sanity check: if NNUE and material diverge wildly,
-                // trust material more to prevent eval hallucinations
-                let divergence = (nnue_score - material).abs();
-                if divergence > 300 {
-                    return (nnue_score + 9 * material) / 10;
-                }
-                // Normal blend: 75% material + 25% NNUE positional
-                return (nnue_score + 3 * material) / 4;
+                let nnue_positional = (nnue_score - material).clamp(-150, 150);
+                return classical + nnue_positional;
             }
         }
-        eval::evaluate(&self.board, 0)
+        classical
     }
 
     // =========================================================================
@@ -1065,13 +1069,15 @@ impl SearchWorker {
         let correction = (pawn_corr + mat_corr) / CORRECTION_GRAIN;
         eval += correction;
 
-        // 4. Material scaling: reduce eval magnitude when total material is low
-        // This helps avoid overconfident evals in drawish endgames
+        // 4. Material scaling: very mild reduction only for near-bare-king positions
+        // Endgame advantages are MORE decisive, so we only scale down when
+        // material is extremely low (e.g., KP vs K scenarios where draws are likely)
         let total_pieces = self.board.combined().0.count_ones() as i32; // 2-32
-                                                                        // Scale: full eval at 32 pieces, 60% at minimum (2 kings)
-                                                                        // scale_factor = 600 + 400 * (pieces - 2) / 30, in millipawns
-        let scale = (600 + 13 * (total_pieces - 2)).min(1000);
-        eval = eval * scale / 1000;
+        if total_pieces <= 6 {
+            // Only scale in very late endgames: 90% at 6 pieces, 80% at 2 (bare kings)
+            let scale = (800 + 33 * (total_pieces - 2)).min(1000);
+            eval = eval * scale / 1000;
+        }
 
         eval
     }
@@ -1118,7 +1124,11 @@ impl SearchWorker {
         let file = king_sq.to_index() % 8;
 
         // Effective rank from this color's perspective (0 = back rank)
-        let eff_rank = if color == Color::White { rank } else { 7 - rank };
+        let eff_rank = if color == Color::White {
+            rank
+        } else {
+            7 - rank
+        };
 
         // King on back rank in corner area = likely castled = safe
         if eff_rank == 0 && (file <= 2 || file >= 5) {
@@ -1130,7 +1140,11 @@ impl SearchWorker {
         let rank_penalty = match eff_rank {
             0 => {
                 // Back rank but in center (d1/e1) = hasn't castled
-                if file >= 3 && file <= 4 { 15 } else { 0 }
+                if file >= 3 && file <= 4 {
+                    15
+                } else {
+                    0
+                }
             }
             1 => 30, // Rank 2: moderate danger (Kd2, Ke2)
             2 => 60, // Rank 3: serious danger (Kd3 in midgame = suicidal)
@@ -1771,12 +1785,16 @@ impl SearchWorker {
             }
         }
 
-        // --- Step 11: Neural Policy Lookup (DISABLED) ---
-        // BitNet policy is currently harmful — suggests flashy but tactically
-        // hollow moves (Bd5?, Nce2?, Ne5?). Disabled until the policy network
-        // is retrained on quality data. Search heuristics (TT, MVV-LVA, killers,
-        // history, countermove, cont_history) provide reliable move ordering.
-        let policy: Option<&[f32]> = None;
+        // --- Step 11: Neural Policy at Root ---
+        // Use BitNet policy for root move ordering only — SEE validation in
+        // order_moves already guards against bad suggestions (halves bonus for
+        // SEE-negative moves).  At non-root nodes, rely on search heuristics
+        // (TT, MVV-LVA, killers, history, countermove, cont_history).
+        let policy: Option<&[f32]> = if is_root {
+            self.cached_root_policy.as_deref()
+        } else {
+            None
+        };
 
         // --- Step 12: Generate and order moves ---
         let mut moves = self.order_moves(MoveGen::new_legal(&self.board), policy, ply, tt_move);
@@ -1880,7 +1898,13 @@ impl SearchWorker {
             }
 
             // --- Step 14: Futility Pruning ---
-            if !is_root && !in_check && !is_tactical && !gives_check && depth <= 8 && moves_searched > 0 {
+            if !is_root
+                && !in_check
+                && !is_tactical
+                && !gives_check
+                && depth <= 8
+                && moves_searched > 0
+            {
                 let futility_margin = static_eval + 150 + 100 * (depth as i32);
                 if futility_margin <= alpha {
                     continue;
@@ -1889,7 +1913,13 @@ impl SearchWorker {
 
             // --- Step 14b: History Pruning (Stockfish-inspired) ---
             // Prune quiet moves with very negative history at shallow depths
-            if !is_root && !in_check && !is_tactical && !gives_check && depth <= 4 && moves_searched > 0 {
+            if !is_root
+                && !in_check
+                && !is_tactical
+                && !gives_check
+                && depth <= 4
+                && moves_searched > 0
+            {
                 let moved_piece_local = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
                 let moved_color_local = self.board.side_to_move();
                 let side_local = if moved_color_local == Color::White {

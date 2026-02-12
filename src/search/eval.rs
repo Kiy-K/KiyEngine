@@ -146,10 +146,16 @@ pub fn evaluate(board: &Board, _ply: usize) -> i32 {
             let prot_mask = if rank > 0 {
                 let behind_rank = (rank - 1) * 8;
                 let mut m = 0u64;
-                if file > 0 { m |= 1u64 << (behind_rank + file - 1); }
-                if file < 7 { m |= 1u64 << (behind_rank + file + 1); }
+                if file > 0 {
+                    m |= 1u64 << (behind_rank + file - 1);
+                }
+                if file < 7 {
+                    m |= 1u64 << (behind_rank + file + 1);
+                }
                 m
-            } else { 0 };
+            } else {
+                0
+            };
             if (white_pawns & BitBoard(prot_mask)).0 != 0 {
                 score += PROTECTED_PASSER_BONUS[rank];
             }
@@ -189,10 +195,16 @@ pub fn evaluate(board: &Board, _ply: usize) -> i32 {
             let prot_mask = if rank < 7 {
                 let behind_rank = (rank + 1) * 8;
                 let mut m = 0u64;
-                if file > 0 { m |= 1u64 << (behind_rank + file - 1); }
-                if file < 7 { m |= 1u64 << (behind_rank + file + 1); }
+                if file > 0 {
+                    m |= 1u64 << (behind_rank + file - 1);
+                }
+                if file < 7 {
+                    m |= 1u64 << (behind_rank + file + 1);
+                }
                 m
-            } else { 0 };
+            } else {
+                0
+            };
             if (black_pawns & BitBoard(prot_mask)).0 != 0 {
                 score -= PROTECTED_PASSER_BONUS[brank];
             }
@@ -217,19 +229,35 @@ pub fn evaluate(board: &Board, _ply: usize) -> i32 {
         let w_knights = board.pieces(Piece::Knight) & white_bb;
         let w_bishops = board.pieces(Piece::Bishop) & white_bb;
         // Starting squares: Nb1(1), Ng1(6), Bc1(2), Bf1(5)
-        if (w_knights & BitBoard(1u64 << 1)).0 != 0 { score -= 15; }  // Nb1
-        if (w_knights & BitBoard(1u64 << 6)).0 != 0 { score -= 15; }  // Ng1
-        if (w_bishops & BitBoard(1u64 << 2)).0 != 0 { score -= 10; }  // Bc1
-        if (w_bishops & BitBoard(1u64 << 5)).0 != 0 { score -= 10; }  // Bf1
+        if (w_knights & BitBoard(1u64 << 1)).0 != 0 {
+            score -= 15;
+        } // Nb1
+        if (w_knights & BitBoard(1u64 << 6)).0 != 0 {
+            score -= 15;
+        } // Ng1
+        if (w_bishops & BitBoard(1u64 << 2)).0 != 0 {
+            score -= 10;
+        } // Bc1
+        if (w_bishops & BitBoard(1u64 << 5)).0 != 0 {
+            score -= 10;
+        } // Bf1
 
         // Black undeveloped pieces
         let b_knights = board.pieces(Piece::Knight) & black_bb;
         let b_bishops = board.pieces(Piece::Bishop) & black_bb;
         // Starting squares: Nb8(57), Ng8(62), Bc8(58), Bf8(61)
-        if (b_knights & BitBoard(1u64 << 57)).0 != 0 { score += 15; }  // Nb8
-        if (b_knights & BitBoard(1u64 << 62)).0 != 0 { score += 15; }  // Ng8
-        if (b_bishops & BitBoard(1u64 << 58)).0 != 0 { score += 10; }  // Bc8
-        if (b_bishops & BitBoard(1u64 << 61)).0 != 0 { score += 10; }  // Bf8
+        if (b_knights & BitBoard(1u64 << 57)).0 != 0 {
+            score += 15;
+        } // Nb8
+        if (b_knights & BitBoard(1u64 << 62)).0 != 0 {
+            score += 15;
+        } // Ng8
+        if (b_bishops & BitBoard(1u64 << 58)).0 != 0 {
+            score += 10;
+        } // Bc8
+        if (b_bishops & BitBoard(1u64 << 61)).0 != 0 {
+            score += 10;
+        } // Bf8
     }
 
     if board.side_to_move() == Color::White {

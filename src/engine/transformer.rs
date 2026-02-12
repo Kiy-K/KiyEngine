@@ -212,7 +212,10 @@ impl GQAttention {
         let total_proj = 3 * embed_dim; // 1536
 
         // Load fused in_proj_weight [embed_dim, total_proj] and split into Q/K/V
-        let in_proj = vb.get((total_proj, embed_dim), &format!("{}.in_proj_weight", prefix))?;
+        let in_proj = vb.get(
+            (total_proj, embed_dim),
+            &format!("{}.in_proj_weight", prefix),
+        )?;
         let in_proj_f32 = in_proj.flatten_all()?.to_vec1::<f32>()?;
 
         // Split: first embed_dim rows = Q, next embed_dim = K, last embed_dim = V
@@ -233,8 +236,12 @@ impl GQAttention {
         )?;
 
         // Load biases
-        let qkv_bias = vb.get((total_proj,), &format!("{}.in_proj_bias", prefix)).ok();
-        let o_bias = vb.get((embed_dim,), &format!("{}.out_proj.bias", prefix)).ok();
+        let qkv_bias = vb
+            .get((total_proj,), &format!("{}.in_proj_bias", prefix))
+            .ok();
+        let o_bias = vb
+            .get((embed_dim,), &format!("{}.out_proj.bias", prefix))
+            .ok();
 
         Ok(Self {
             q_proj,
@@ -310,7 +317,10 @@ impl GQAttention {
 
         // Apply RoPE to Q and K (v6 only; v5.2 uses learned pos_embed added before attention)
         let (q, k) = if self.use_rope {
-            (apply_rope(&q, rope_cos, rope_sin, 0)?, apply_rope(&k, rope_cos, rope_sin, 0)?)
+            (
+                apply_rope(&q, rope_cos, rope_sin, 0)?,
+                apply_rope(&k, rope_cos, rope_sin, 0)?,
+            )
         } else {
             (q, k)
         };
@@ -389,7 +399,10 @@ impl GQAttention {
 
         // RoPE with offset for cached positions (v6 only)
         let (q, k) = if self.use_rope {
-            (apply_rope(&q, rope_cos, rope_sin, cached_len)?, apply_rope(&k, rope_cos, rope_sin, cached_len)?)
+            (
+                apply_rope(&q, rope_cos, rope_sin, cached_len)?,
+                apply_rope(&k, rope_cos, rope_sin, cached_len)?,
+            )
         } else {
             (q, k)
         };
@@ -471,9 +484,15 @@ impl GQAttention {
             let bias_f32 = bias.flatten_all()?.to_vec1::<f32>()?;
             let q_dim = self.num_heads * self.head_dim;
             let kv_dim = self.num_kv_heads * self.head_dim;
-            for i in 0..q_dim { q_f32[i] += bias_f32[i]; }
-            for i in 0..kv_dim { k_f32[i] += bias_f32[q_dim + i]; }
-            for i in 0..kv_dim { v_f32[i] += bias_f32[q_dim + kv_dim + i]; }
+            for i in 0..q_dim {
+                q_f32[i] += bias_f32[i];
+            }
+            for i in 0..kv_dim {
+                k_f32[i] += bias_f32[q_dim + i];
+            }
+            for i in 0..kv_dim {
+                v_f32[i] += bias_f32[q_dim + kv_dim + i];
+            }
         }
 
         // Apply RoPE inline (v6 only; v5.2 uses pos_embed added before attention)

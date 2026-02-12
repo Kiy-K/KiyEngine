@@ -149,7 +149,12 @@ impl BitLinear {
 
     /// Load a plain linear layer (no RMSNorm) from VarBuilder.
     /// Used for v5.2 attention projections which are standard linear, not BitLinear.
-    pub fn load_plain(weight_key: &str, vb: &VarBuilder, in_dim: usize, out_dim: usize) -> Result<Self> {
+    pub fn load_plain(
+        weight_key: &str,
+        vb: &VarBuilder,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> Result<Self> {
         let weight = vb.get((out_dim, in_dim), weight_key)?;
         let raw = weight.flatten_all()?.to_vec1::<f32>()?;
         let weight_i8 = pack_f16_to_ternary_i8(&raw);
@@ -158,10 +163,17 @@ impl BitLinear {
         let ones = vec![1.0f32; in_dim];
         let rms_norm_weight = Tensor::from_vec(ones.clone(), (in_dim,), &candle_core::Device::Cpu)?;
         Ok(Self {
-            weight_i8, pos_bits, neg_bits, row_bytes,
-            scale: 1.0, in_dim, out_dim,
-            rms_norm_weight, rms_norm_weight_f32: ones,
-            eps: 1e-5, dequantized_cache_t: RwLock::new(None),
+            weight_i8,
+            pos_bits,
+            neg_bits,
+            row_bytes,
+            scale: 1.0,
+            in_dim,
+            out_dim,
+            rms_norm_weight,
+            rms_norm_weight_f32: ones,
+            eps: 1e-5,
+            dequantized_cache_t: RwLock::new(None),
             skip_norm: true,
         })
     }
@@ -174,10 +186,17 @@ impl BitLinear {
         let ones = vec![1.0f32; in_dim];
         let rms_norm_weight = Tensor::from_vec(ones.clone(), (in_dim,), &candle_core::Device::Cpu)?;
         Ok(Self {
-            weight_i8, pos_bits, neg_bits, row_bytes,
-            scale: 1.0, in_dim, out_dim,
-            rms_norm_weight, rms_norm_weight_f32: ones,
-            eps: 1e-5, dequantized_cache_t: RwLock::new(None),
+            weight_i8,
+            pos_bits,
+            neg_bits,
+            row_bytes,
+            scale: 1.0,
+            in_dim,
+            out_dim,
+            rms_norm_weight,
+            rms_norm_weight_f32: ones,
+            eps: 1e-5,
+            dequantized_cache_t: RwLock::new(None),
             skip_norm: true,
         })
     }
