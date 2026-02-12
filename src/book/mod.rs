@@ -123,14 +123,17 @@ fn simple_rand(max: u64) -> u64 {
     })
 }
 
+/// Embedded opening books (compiled into binary for single-file distribution)
+static EMBEDDED_BOOK1: &[u8] = include_bytes!("book1.bin");
+static EMBEDDED_BOOK2: &[u8] = include_bytes!("book2.bin");
+
 pub struct OpeningBook {
     books: Vec<Vec<u8>>,
 }
 
 impl OpeningBook {
-    /// Load multiple Polyglot .bin book files.
-    /// Paths are resolved relative to the executable's directory so the engine
-    /// works correctly regardless of the current working directory.
+    /// Load Polyglot .bin book files.
+    /// Tries disk files first, then falls back to embedded books compiled into the binary.
     pub fn load(paths: &[&str]) -> Self {
         let exe_dir = std::env::current_exe()
             .ok()
@@ -145,6 +148,7 @@ impl OpeningBook {
                 }
                 c
             };
+            let mut loaded = false;
             for candidate in &candidates {
                 if let Ok(data) = std::fs::read(candidate) {
                     if data.len() >= 16 {
@@ -154,8 +158,27 @@ impl OpeningBook {
                             data.len() / 16
                         );
                         books.push(data);
+                        loaded = true;
                         break;
                     }
+                }
+            }
+            if !loaded {
+                // Fall back to embedded books
+                let embedded = if path.contains("book1") {
+                    EMBEDDED_BOOK1
+                } else if path.contains("book2") {
+                    EMBEDDED_BOOK2
+                } else {
+                    &[]
+                };
+                if embedded.len() >= 16 {
+                    eprintln!(
+                        "Book loaded: embedded {} ({} entries)",
+                        path,
+                        embedded.len() / 16
+                    );
+                    books.push(embedded.to_vec());
                 }
             }
         }

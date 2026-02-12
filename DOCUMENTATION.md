@@ -1,4 +1,4 @@
-# KiyEngine v6.0.0 Documentation
+# KiyEngine v6.1.0 Documentation
 
 ## Table of Contents
 
@@ -20,14 +20,21 @@ KiyEngine is a high-performance UCI chess engine built in Rust with the followin
 
 ### Core Systems
 
-1. **Neural Network Evaluation** (`engine/`)
+1. **NNUE Evaluation** (`nnue/`) -- Primary evaluation at every search node
+   - Deep network: (768→512)×2 → SCReLU → L1(1024→16, i8) → CReLU → L2(16→8, i16) → bucket select
+   - Hand-tuned AVX2 SIMD: all-i16 SCReLU, 8-wide L1 matmul, SIMD CReLU/L2
+   - Fused accumulator updates: single-pass copy+sub+add for moves
+   - 10 input buckets (king-square), 8 output buckets (piece-count)
+   - Weights embedded in binary via `include_bytes!`
+
+2. **BitNet Transformer** (`engine/`) -- Optional root move ordering
    - BitNet 1.58-bit Transformer (12 layers, 512 d_model, 8 heads, GQA with 2 KV heads, 1536 hidden dim)
    - Bit-packed ternary weights with dual bitmask format (4x denser than i8)
    - SIMD-optimized packed GEMV (AVX-512, AVX2, NEON, scalar fallback)
    - KV Cache for incremental inference (4-5x speedup)
-   - Pre-transposed weights and fused RMSNorm+MatMul
+   - Loaded from disk (`kiyengine.gguf`) if present, otherwise skipped
 
-2. **Search Algorithm** (`search/`)
+3. **Search Algorithm** (`search/`)
    - Lazy SMP with configurable thread count, varied depth offsets, lock-free shared TT
    - Alpha-beta with PVS, aspiration windows (exponential widening)
    - Static Exchange Evaluation (SEE) with x-ray sliding attacks
@@ -39,13 +46,12 @@ KiyEngine is a high-performance UCI chess engine built in Rust with the followin
    - Extensions: singular, recapture, passed pawn push
    - Null move pruning, razoring, futility pruning, SEE pruning
 
-3. **Static Evaluation** (`search/eval.rs`)
-   - Material + PeSTO piece-square tables
+4. **Static Evaluation Fallback** (`search/eval.rs`)
+   - Material + PeSTO piece-square tables (used when NNUE unavailable)
    - Bishop pair bonus, rook on open/semi-open file
    - Passed pawn bonus (rank-scaled), doubled/isolated pawn penalties
-   - All positional terms use efficient bitboard operations
 
-4. **Time Management** (`search/time.rs`)
+5. **Time Management** (`search/time.rs`)
    - Stockfish-inspired soft/hard time bounds with ply-aware scaling
    - Dynamic adjustment: best move stability, falling eval, instability factor
 
@@ -97,10 +103,10 @@ KiyEngine/
 |   |   +-- mod.rs            Network loading and inference
 |   +-- simd/                SIMD utilities
 |   +-- uci/                 UCI protocol handler
-+-- Cargo.toml               Package manifest (v6.0.0)
++-- Cargo.toml               Package manifest (v6.1.0)
 +-- .cargo/config.toml       SIMD target features (AVX2/AVX-512/BMI2)
-+-- ARCHITECTURE.md           Detailed architecture with visual diagrams
-+-- README.md                Quick start guide
++-- kiyengine.nnue           NNUE weights (embedded in binary)
++-- kiyengine.gguf           BitNet model (optional, loaded from disk)
 ```
 
 For detailed architectural diagrams, see [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -116,7 +122,7 @@ Centralized constants to avoid magic numbers:
 | Constant | Value | Description |
 |----------|-------|-------------|
 | `ENGINE_NAME` | "KiyEngine" | Engine identifier |
-| `ENGINE_VERSION` | "6.0.0" | Current version |
+| `ENGINE_VERSION` | "6.1.0" | Current version |
 | `VOCAB_SIZE` | 4608 | NN move vocabulary (72 planes x 64 squares) |
 | `CONTEXT_LENGTH` | 256 | NN attention context length |
 | `D_MODEL` | 512 | NN embedding dimension |
@@ -180,7 +186,7 @@ Centralized constants to avoid magic numbers:
 - Countermove heuristic
 - Extensions: singular, recapture (same-square), passed pawn push (6th/7th rank)
 - Repetition detection: fixed-size search path array + game hash history
-- NNUE accumulator (infrastructure ready, evaluation not yet active)
+- NNUE evaluation (active, primary eval at every node via embedded weights)
 - Incremental move picking via `pick_next_move`
 
 **Transposition Table** -- lock-free atomic TT (Hyatt/Mann XOR trick)
@@ -315,7 +321,8 @@ instability    = 1.0 + 1.5 * best_move_changes / 10.0
 ### Prerequisites
 
 - Rust 1.70+ (stable toolchain)
-- Model file: `kiyengine.gguf` (GGUF format, ~28 MB)
+- NNUE weights and opening books are embedded in the binary (no external files required)
+- Optional: `kiyengine.gguf` for BitNet Transformer root policy
 
 ### Build Commands
 
@@ -324,20 +331,17 @@ instability    = 1.0 + 1.5 * best_move_changes / 10.0
 cargo build --release
 
 # Run engine (UCI mode)
-cargo run --release --bin kiy_engine_v5_alpha
+cargo run --release
 
-# Run model benchmarks
-cargo run --release --bin model_benchmark
-
-# CUDA support (if available)
-cargo build --release --features cuda
+# The binary is self-contained — no external model files needed
+# Optionally place kiyengine.gguf alongside for enhanced root policy
 ```
 
 ### UCI Usage Example
 
 ```text
 > uci
-id name KiyEngine V6.0.0
+id name KiyEngine V6.1.0
 id author Khoi
 option name Hash type spin default 512 min 64 max 65536
 option name Threads type spin default 4 min 1 max 256
@@ -412,7 +416,7 @@ cargo test --release
 cargo run --release --bin model_benchmark
 
 # Quick fixed-depth benchmark
-echo "uci\nisready\nposition fen <FEN>\ngo depth 14" | ./target/release/kiy_engine_v5_alpha
+echo "uci\nisready\nposition fen <FEN>\ngo depth 14" | ./target/release/kiy_engine
 ```
 
 ### Architecture Principles
@@ -432,8 +436,9 @@ echo "uci\nisready\nposition fen <FEN>\ngo depth 14" | ./target/release/kiy_engi
 
 ### "Failed to load engine"
 
-- Ensure `kiyengine.gguf` is in the executable directory or alongside `Cargo.toml`
-- Falls back to `kiyengine.safetensors` if GGUF not found
+- NNUE weights are embedded in the binary — no external file needed
+- If using the BitNet Transformer, ensure `kiyengine.gguf` is alongside the binary
+- Engine works standalone with just NNUE eval (GGUF is optional)
 
 ### Low NPS
 
@@ -458,3 +463,5 @@ echo "uci\nisready\nposition fen <FEN>\ngo depth 14" | ./target/release/kiy_engi
 Apache License 2.0 -- See LICENSE file for details.
 
 Copyright 2026 Khoi
+
+(Updated for v6.1.0)

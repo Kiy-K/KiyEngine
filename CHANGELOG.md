@@ -5,6 +5,52 @@ All notable changes to KiyEngine will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.1.0] - 2026-02-12
+
+### Added
+
+- **NNUE Deep Network Evaluation (Active)** -- replaces Material+PST as primary evaluation
+  - Architecture: (768→512)×2 → SCReLU → L1(1024→16, i8) → CReLU → L2(16→8, i16) → bucket select
+  - 10 input buckets (king-square based), 8 output buckets (piece-count based)
+  - Incrementally updated per-perspective HalfKP accumulators with lazy refresh fallback
+- **AVX2 SIMD Evaluation** -- hand-tuned intrinsics for entire NNUE forward pass
+  - All-i16 SCReLU div-255 trick: `(v²+(v²>>8)+1)>>8` (7 ops per 16 values, no i32 widening)
+  - 8-wide L1 matmul with `_mm256_madd_epi16` (i8 weights widened on-the-fly)
+  - SIMD CReLU via `pminsw`/`pmaxsw` clamp + `psrlw` shift
+  - SIMD L2 dot product with `madd_epi16` horizontal reduction
+- **Fused SIMD Accumulator Updates** -- single-pass memory operations
+  - `vec_copy_sub_add_i16`: fused copy+sub+add for quiet moves (1 memory pass)
+  - `vec_copy_sub2_add_i16`: fused copy+sub2+add for captures (1 memory pass)
+- **Embedded Assets** -- single self-contained binary distribution
+  - NNUE weights embedded via `include_bytes!` (7.6 MB, loaded from embedded if no disk file)
+  - Opening books embedded via `include_bytes!` (1.9 MB + 49 KB)
+  - Disk files take priority if present (allows overriding embedded weights)
+- **Syzygy Tablebase Support** -- WDL + DTZ probing via `shakmaty-syzygy`
+  - Auto-extraction from `syzygy.tar.zst` archive
+  - Configurable path via UCI `SyzygyPath` option
+- **Self-Play Match Script** -- `scripts/selfplay_match.py`
+  - Proper clock tracking (subtract elapsed, add increment)
+  - Draw detection: 50-move rule, 3-fold repetition approximation
+  - Reports max depth, NPS, remaining clock per game
+
+### Changed
+
+- **Evaluation** -- NNUE is now the primary evaluation at every node (was Material+PST)
+- **Distribution** -- single binary with embedded NNUE + books (was binary + external files)
+- **UCI version** -- reports `KiyEngine V6.1.0`
+- **Opening book loading** -- tries disk files first, falls back to embedded bytes
+- **NNUE loading** -- tries disk file first, falls back to embedded weights
+- **Self-play time control** -- increased to 10s+0.1s for more meaningful games
+
+### Performance
+
+- **~900K NPS** single-thread, **~1.6M NPS** 4 threads (with NNUE eval active)
+- **Max depth 26-64** in 10s+0.1s self-play games
+- **4.7x speedup** from AVX2 SIMD NNUE eval vs scalar
+- Fused accumulator updates reduce memory passes by ~50% for common move types
+
+---
+
 ## [6.0.0] - 2026-02-12
 
 ### Added

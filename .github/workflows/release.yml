@@ -10,9 +10,7 @@ permissions:
   contents: write
 
 env:
-  # Tên binary gốc trong Cargo.toml (Lưu ý: Phải khớp tên trong [package] name của Cargo.toml)
   CRATE_BIN_NAME: kiy_engine
-  # Tên binary muốn xuất bản
   RELEASE_BIN_NAME: kiyengine
 
 jobs:
@@ -30,53 +28,34 @@ jobs:
             target_name: linux-x86_64
             artifact_name: kiyengine-linux-x86_64
             binary_ext: ""
-            archive_ext: ".tar.gz"
             rustflags: "-C target-cpu=x86-64-v3"
           - os: windows-latest
             target_name: windows-x86_64
             artifact_name: kiyengine-windows-x86_64
             binary_ext: ".exe"
-            archive_ext: ".zip"
             rustflags: "-C target-cpu=x86-64-v3"
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          lfs: true # ✅ BẮT BUỘC: Để tải file thật (hàng GB) thay vì pointer file
+          lfs: true
 
-      # 🛡️ SAFETY CHECK: Bước kiểm tra file LFS "đểu"
-      - name: Verify LFS Assets (Pre-flight Check)
+      - name: Verify embedded assets exist
         run: |
-          echo "🔍 Checking LFS asset integrity..."
-          has_error=0
-          
-          # Hàm kiểm tra file
-          check_file() {
-            if [ -f "$1" ]; then
-              # Nếu file chứa chuỗi 'oid sha256', nghĩa là LFS pull thất bại
-              if grep -q "oid sha256" "$1"; then
-                echo "❌ CRITICAL ERROR: $1 is a Git LFS pointer file! (Fake file)"
-                echo "   -> Please check your Git LFS bandwidth quota or .gitattributes."
-                return 1
-              else
-                size=$(stat -c%s "$1" 2>/dev/null || stat -f%z "$1")
-                echo "✅ $1 verified (Size: $size bytes)."
-                return 0
-              fi
-            else
-              echo "⚠️ Warning: $1 not found (Is this expected?)."
-              return 0
+          echo "Checking assets that will be embedded via include_bytes!..."
+          for f in kiyengine.nnue src/book/book1.bin src/book/book2.bin; do
+            if [ ! -f "$f" ]; then
+              echo "ERROR: $f not found"
+              exit 1
             fi
-          }
-
-          check_file "kiyengine.gguf" || has_error=1
-          check_file "kiyengine.nnue" || has_error=1
-          
-          if [ $has_error -eq 1 ]; then
-            echo "🛑 Stopping build due to LFS errors."
-            exit 1
-          fi
+            if grep -q "oid sha256" "$f" 2>/dev/null; then
+              echo "ERROR: $f is a Git LFS pointer (not pulled)"
+              exit 1
+            fi
+            size=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
+            echo "OK: $f ($size bytes)"
+          done
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -90,45 +69,23 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: strip target/release/${{ env.CRATE_BIN_NAME }}${{ matrix.binary_ext }}
 
-      - name: Prepare Assets
+      - name: Prepare release binary
         run: |
-          mkdir -p dist
-          # Copy binary chính và đổi tên
-          # Thêm check để đảm bảo build thành công và đúng tên
-          if [ -f target/release/${{ env.CRATE_BIN_NAME }}${{ matrix.binary_ext }} ]; then
-            cp target/release/${{ env.CRATE_BIN_NAME }}${{ matrix.binary_ext }} dist/${{ env.RELEASE_BIN_NAME }}${{ matrix.binary_ext }}
-          else
-            echo "❌ Error: Binary not found at target/release/${{ env.CRATE_BIN_NAME }}${{ matrix.binary_ext }}"
-            echo "Did you rename [package] name in Cargo.toml to 'kiy_engine'?"
-            ls -R target/release/
+          BIN="target/release/${{ env.CRATE_BIN_NAME }}${{ matrix.binary_ext }}"
+          if [ ! -f "$BIN" ]; then
+            echo "ERROR: Binary not found at $BIN"
+            ls target/release/
             exit 1
           fi
-          
-          # Copy các file đi kèm
-          if [ -f kiyengine.gguf ]; then cp kiyengine.gguf dist/; fi
-          if [ -f kiyengine.nnue ]; then cp kiyengine.nnue dist/; fi
-          
-          # Copy sách khai cuộc (tìm trong toàn bộ thư mục src/ hoặc root)
-          find . -maxdepth 3 -name "*.bin" -not -path "./dist/*" -exec cp {} dist/ \;
+          # Rename to release name
+          cp "$BIN" "${{ env.RELEASE_BIN_NAME }}-${{ matrix.target_name }}${{ matrix.binary_ext }}"
+          ls -lh "${{ env.RELEASE_BIN_NAME }}-${{ matrix.target_name }}${{ matrix.binary_ext }}"
 
-      - name: Package Archive
-        run: |
-          cd dist
-          if [ "${{ matrix.os }}" == "windows-latest" ]; then
-            7z a ../${{ matrix.artifact_name }}.zip *
-            # Copy riêng file exe ra ngoài để upload bản lẻ
-            cp ${{ env.RELEASE_BIN_NAME }}${{ matrix.binary_ext }} ../${{ env.RELEASE_BIN_NAME }}-windows-standalone.exe
-          else
-            tar -czvf ../${{ matrix.artifact_name }}.tar.gz *
-          fi
-
-      - name: Upload Artifacts to Action
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: |
-            ${{ matrix.artifact_name }}${{ matrix.archive_ext }}
-            *.exe
+          path: ${{ env.RELEASE_BIN_NAME }}-${{ matrix.target_name }}${{ matrix.binary_ext }}
 
   release:
     name: Create GitHub Release
@@ -148,27 +105,30 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            release_assets/*.zip
-            release_assets/*.tar.gz
-            release_assets/*.exe
+          files: release_assets/*
           name: KiyEngine ${{ github.ref_name }}
           body: |
-            ## 🚀 KiyEngine ${{ github.ref_name }} - "Assassin Elite"
+            ## KiyEngine ${{ github.ref_name }}
             
-            **Sát thủ v6.1 với sức mạnh NNUE v2 + Hybrid Search!**
+            **Hybrid evaluation: BitNet 1.58-bit Transformer + NNUE Deep Network**
             
-            ### 📦 Assets
-            - **Windows:** - `.zip`: Đầy đủ Engine + Model + Book.
-              - `.exe`: File chạy độc lập (Standalone).
-            - **Linux:** `.tar.gz`.
+            ### Single Binary Distribution
+            Download the binary for your platform. **No external files needed** -- NNUE weights
+            and opening books are embedded in the binary at compile time.
             
-            ### 🛠️ Cải tiến Kỹ thuật
-            - **Hybrid Search:** BitNet Transformer (Move Ordering) + NNUE (Evaluation).
-            - **Dữ liệu:** Train trên 3 tỷ positions Broadcast tinh hoa.
-            - **Tốc độ:** Tối ưu hóa AVX2, đạt 600k+ NPS trên CPU.
+            | Platform | File |
+            |----------|------|
+            | Linux x86_64 | `kiyengine-linux-x86_64` |
+            | Windows x86_64 | `kiyengine-windows-x86_64.exe` |
             
-            > **Lưu ý:** Cần CPU hỗ trợ AVX2 (x86-64-v3) để chạy bản tối ưu này.
+            ### Architecture
+            - **NNUE Evaluation**: (768→512)×2 → SCReLU → L1(16) → CReLU → L2(8) per bucket
+            - **BitNet Transformer**: 12-layer, 512 d_model, GQA (optional, load `kiyengine.gguf`)
+            - **AVX2 SIMD**: Hand-tuned intrinsics for NNUE eval, accumulator updates, and BitNet GEMV
+            - **Search**: Alpha-beta PVS, Lazy SMP, SEE, LMR, Syzygy TB support
+            - **~900K NPS** single-thread, **~1.6M NPS** 4 threads
+            
+            > Requires CPU with AVX2 support (x86-64-v3).
           draft: false
           prerelease: false
           generate_release_notes: true

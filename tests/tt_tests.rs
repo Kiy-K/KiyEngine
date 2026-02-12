@@ -61,7 +61,10 @@ fn test_tt_clear() {
 #[test]
 fn test_tt_all_flags_with_static_eval() {
     let tt = TranspositionTable::new(1);
-    for (i, &flag) in [TTFlag::Exact, TTFlag::LowerBound, TTFlag::UpperBound].iter().enumerate() {
+    for (i, &flag) in [TTFlag::Exact, TTFlag::LowerBound, TTFlag::UpperBound]
+        .iter()
+        .enumerate()
+    {
         let entry = TTEntry {
             hash: 0xfeed0000 + i as u64,
             depth: 5,

@@ -126,12 +126,16 @@ impl Accumulator {
             let (wr, br) = delta.removed[0];
             let (wa, ba) = delta.added[0];
             vec_copy_sub_add_i16(
-                &mut self.white[..hs], &parent.white[..hs],
-                &ftw[wr * hs..wr * hs + hs], &ftw[wa * hs..wa * hs + hs],
+                &mut self.white[..hs],
+                &parent.white[..hs],
+                &ftw[wr * hs..wr * hs + hs],
+                &ftw[wa * hs..wa * hs + hs],
             );
             vec_copy_sub_add_i16(
-                &mut self.black[..hs], &parent.black[..hs],
-                &ftw[br * hs..br * hs + hs], &ftw[ba * hs..ba * hs + hs],
+                &mut self.black[..hs],
+                &parent.black[..hs],
+                &ftw[br * hs..br * hs + hs],
+                &ftw[ba * hs..ba * hs + hs],
             );
         } else if delta.num_removed == 2 && delta.num_added == 1 {
             // ── Capture: fused copy + sub2 + add (single pass per perspective) ──
@@ -139,13 +143,17 @@ impl Accumulator {
             let (wr2, br2) = delta.removed[1];
             let (wa, ba) = delta.added[0];
             vec_copy_sub2_add_i16(
-                &mut self.white[..hs], &parent.white[..hs],
-                &ftw[wr1 * hs..wr1 * hs + hs], &ftw[wr2 * hs..wr2 * hs + hs],
+                &mut self.white[..hs],
+                &parent.white[..hs],
+                &ftw[wr1 * hs..wr1 * hs + hs],
+                &ftw[wr2 * hs..wr2 * hs + hs],
                 &ftw[wa * hs..wa * hs + hs],
             );
             vec_copy_sub2_add_i16(
-                &mut self.black[..hs], &parent.black[..hs],
-                &ftw[br1 * hs..br1 * hs + hs], &ftw[br2 * hs..br2 * hs + hs],
+                &mut self.black[..hs],
+                &parent.black[..hs],
+                &ftw[br1 * hs..br1 * hs + hs],
+                &ftw[br2 * hs..br2 * hs + hs],
                 &ftw[ba * hs..ba * hs + hs],
             );
         } else {
@@ -408,14 +416,8 @@ impl FinnyTable {
         let wk_sq = board.king_square(Color::White).to_index();
         let bk_sq = board.king_square(Color::Black).to_index();
 
-        self.refresh_perspective(
-            &mut acc.white, &mut acc.psqt_white,
-            board, wk_sq, 0, net,
-        );
-        self.refresh_perspective(
-            &mut acc.black, &mut acc.psqt_black,
-            board, bk_sq, 1, net,
-        );
+        self.refresh_perspective(&mut acc.white, &mut acc.psqt_white, board, wk_sq, 0, net);
+        self.refresh_perspective(&mut acc.black, &mut acc.psqt_black, board, bk_sq, 1, net);
 
         acc.computed = true;
     }
@@ -516,7 +518,9 @@ fn vec_add_i16(dst: &mut [i16], src: &[i16]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            unsafe { return vec_add_i16_avx2(dst, src); }
+            unsafe {
+                return vec_add_i16_avx2(dst, src);
+            }
         }
     }
 
@@ -533,7 +537,9 @@ fn vec_sub_i16(dst: &mut [i16], src: &[i16]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            unsafe { return vec_sub_i16_avx2(dst, src); }
+            unsafe {
+                return vec_sub_i16_avx2(dst, src);
+            }
         }
     }
 
@@ -548,7 +554,9 @@ fn vec_copy_sub_add_i16(dst: &mut [i16], src: &[i16], sub: &[i16], add: &[i16]) 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            unsafe { return vec_copy_sub_add_i16_avx2(dst, src, sub, add); }
+            unsafe {
+                return vec_copy_sub_add_i16_avx2(dst, src, sub, add);
+            }
         }
     }
     for i in 0..dst.len() {
@@ -562,11 +570,16 @@ fn vec_copy_sub2_add_i16(dst: &mut [i16], src: &[i16], sub1: &[i16], sub2: &[i16
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            unsafe { return vec_copy_sub2_add_i16_avx2(dst, src, sub1, sub2, add); }
+            unsafe {
+                return vec_copy_sub2_add_i16_avx2(dst, src, sub1, sub2, add);
+            }
         }
     }
     for i in 0..dst.len() {
-        dst[i] = src[i].wrapping_sub(sub1[i]).wrapping_sub(sub2[i]).wrapping_add(add[i]);
+        dst[i] = src[i]
+            .wrapping_sub(sub1[i])
+            .wrapping_sub(sub2[i])
+            .wrapping_add(add[i]);
     }
 }
 
@@ -625,7 +638,11 @@ unsafe fn vec_copy_sub_add_i16_avx2(dst: &mut [i16], src: &[i16], sub: &[i16], a
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn vec_copy_sub2_add_i16_avx2(
-    dst: &mut [i16], src: &[i16], sub1: &[i16], sub2: &[i16], add: &[i16],
+    dst: &mut [i16],
+    src: &[i16],
+    sub1: &[i16],
+    sub2: &[i16],
+    add: &[i16],
 ) {
     let n = dst.len();
     let (dp, sp) = (dst.as_mut_ptr(), src.as_ptr());
@@ -721,7 +738,8 @@ mod tests {
         finny.refresh(&mut acc, &board1, &net);
 
         // Make a move: e2e4
-        let board2 = Board::from_str("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1").unwrap();
+        let board2 =
+            Board::from_str("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1").unwrap();
 
         // Full refresh on new position
         let mut acc_full = Accumulator::new(net.hidden_size);
@@ -768,12 +786,14 @@ mod tests {
             assert_eq!(
                 &acc_full.white[..net.hidden_size],
                 &acc_finny.white[..net.hidden_size],
-                "White mismatch at FEN: {}", fen
+                "White mismatch at FEN: {}",
+                fen
             );
             assert_eq!(
                 &acc_full.black[..net.hidden_size],
                 &acc_finny.black[..net.hidden_size],
-                "Black mismatch at FEN: {}", fen
+                "Black mismatch at FEN: {}",
+                fen
             );
         }
     }

@@ -476,8 +476,14 @@ impl Searcher {
                     std::thread::Builder::new()
                         .stack_size(64 * 1024 * 1024) // 64MB stack for deep recursion
                         .spawn(move || {
-                            let mut worker =
-                                SearchWorker::with_shared_nodes(tt_clone, board_clone, stop_clone, nnue_clone, syzygy_clone, nodes_clone);
+                            let mut worker = SearchWorker::with_shared_nodes(
+                                tt_clone,
+                                board_clone,
+                                stop_clone,
+                                nnue_clone,
+                                syzygy_clone,
+                                nodes_clone,
+                            );
                             worker.set_game_history((*pos_hist_clone).clone());
                             let mut best_move = None;
                             let mut last_score = 0;
@@ -603,8 +609,9 @@ impl Searcher {
                                             let elapsed =
                                                 start_time.elapsed().as_secs_f64().max(0.001);
                                             // Use shared counter for accurate multi-thread NPS
-                                            let total_nodes = worker.shared_nodes.load(Ordering::Relaxed)
-                                                + (worker.nodes & 4095); // add unflushed remainder
+                                            let total_nodes =
+                                                worker.shared_nodes.load(Ordering::Relaxed)
+                                                    + (worker.nodes & 4095); // add unflushed remainder
                                             let nps = (total_nodes as f64 / elapsed) as u64;
 
                                             // Extract full PV from triangular PV table
@@ -739,7 +746,14 @@ impl SearchWorker {
         nnue: Option<Arc<NnueNetwork>>,
         syzygy: Option<Arc<SyzygyTB>>,
     ) -> Self {
-        Self::with_shared_nodes(tt, board, stop_flag, nnue, syzygy, Arc::new(AtomicU64::new(0)))
+        Self::with_shared_nodes(
+            tt,
+            board,
+            stop_flag,
+            nnue,
+            syzygy,
+            Arc::new(AtomicU64::new(0)),
+        )
     }
 
     pub fn with_shared_nodes(
@@ -855,7 +869,8 @@ impl SearchWorker {
             for pt in 0..64 {
                 for cp in 0..12 {
                     for ct in 0..64 {
-                        self.cont_history[pp][pt][cp][ct] = self.cont_history[pp][pt][cp][ct] * 3 / 4;
+                        self.cont_history[pp][pt][cp][ct] =
+                            self.cont_history[pp][pt][cp][ct] * 3 / 4;
                     }
                 }
             }
@@ -974,7 +989,11 @@ impl SearchWorker {
         // 2. Pawn correction history
         let pawn_hash = self.board.get_pawn_hash();
         let pawn_idx = (pawn_hash as usize) % CORRECTION_HIST_SIZE;
-        let stm = if self.board.side_to_move() == Color::White { 0 } else { 1 };
+        let stm = if self.board.side_to_move() == Color::White {
+            0
+        } else {
+            1
+        };
         let pawn_corr = self.pawn_correction[pawn_idx][stm];
 
         // 3. Material correction history
@@ -989,8 +1008,8 @@ impl SearchWorker {
         // 4. Material scaling: reduce eval magnitude when total material is low
         // This helps avoid overconfident evals in drawish endgames
         let total_pieces = self.board.combined().0.count_ones() as i32; // 2-32
-        // Scale: full eval at 32 pieces, 60% at minimum (2 kings)
-        // scale_factor = 600 + 400 * (pieces - 2) / 30, in millipawns
+                                                                        // Scale: full eval at 32 pieces, 60% at minimum (2 kings)
+                                                                        // scale_factor = 600 + 400 * (pieces - 2) / 30, in millipawns
         let scale = (600 + 13 * (total_pieces - 2)).min(1000);
         eval = eval * scale / 1000;
 
@@ -1044,7 +1063,11 @@ impl SearchWorker {
         let diff = search_score - static_eval;
         let scaled_diff = diff * CORRECTION_GRAIN;
         let weight = (depth as i32).min(16);
-        let stm = if self.board.side_to_move() == Color::White { 0 } else { 1 };
+        let stm = if self.board.side_to_move() == Color::White {
+            0
+        } else {
+            1
+        };
 
         // Pawn correction
         let pawn_hash = self.board.get_pawn_hash();
@@ -1533,7 +1556,11 @@ impl SearchWorker {
 
         // --- Step 9: Real Null Move Pruning ---
         // Actually pass the move and search with reduced depth
-        if !is_pv && !in_check && depth >= 3 && eval_for_pruning >= beta && self.has_non_pawn_material()
+        if !is_pv
+            && !in_check
+            && depth >= 3
+            && eval_for_pruning >= beta
+            && self.has_non_pawn_material()
         {
             if let Some(null_board) = self.board.null_move() {
                 let old_board = self.board;
@@ -1686,8 +1713,13 @@ impl SearchWorker {
             if !is_root && !in_check && !is_tactical && depth <= 4 && moves_searched > 0 {
                 let moved_piece_local = self.board.piece_on(mv.get_source()).unwrap_or(Piece::Pawn);
                 let moved_color_local = self.board.side_to_move();
-                let side_local = if moved_color_local == Color::White { 0 } else { 1 };
-                let h = self.history[side_local][mv.get_source().to_index()][mv.get_dest().to_index()];
+                let side_local = if moved_color_local == Color::White {
+                    0
+                } else {
+                    1
+                };
+                let h =
+                    self.history[side_local][mv.get_source().to_index()][mv.get_dest().to_index()];
                 let threshold = -2000 * (depth as i32);
                 if h < threshold {
                     continue;

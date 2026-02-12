@@ -1,6 +1,6 @@
 # KiyEngine Architecture
 
-This document describes the internal architecture of KiyEngine v6.0.0 -- a high-performance UCI chess engine written in Rust, combining a BitNet 1.58-bit Transformer neural network with a heavily optimized alpha-beta search.
+This document describes the internal architecture of KiyEngine v6.1.0 -- a high-performance UCI chess engine written in Rust, featuring a hybrid evaluation system combining a BitNet 1.58-bit Transformer for root move ordering with a NNUE deep network for per-node evaluation, all powered by hand-tuned AVX2 SIMD.
 
 ---
 
@@ -25,20 +25,20 @@ This document describes the internal architecture of KiyEngine v6.0.0 -- a high-
 
 ```text
 +---------------------------------------------------------------------+
-|                         KiyEngine v6.0.0                            |
+|                         KiyEngine v6.1.0                            |
 |                                                                     |
 |  +------------+    +----------------+    +------------------------+ |
 |  |            |    |                |    |                        | |
-|  |  UCI Layer |--->|  Search Core   |--->|  Evaluation            | |
-|  |            |    |  (Lazy SMP)    |    |  (Material+PST+Pawn)   | |
+|  |  UCI Layer |--->|  Search Core   |--->|  NNUE Evaluation       | |
+|  |            |    |  (Lazy SMP)    |    |  (SCReLU Deep Network) | |
 |  +-----+------+    +-------+--------+    +------------------------+ |
 |        |                   |                                        |
 |        v                   v                                        |
 |  +------------+    +----------------+    +------------------------+ |
 |  |            |    |                |    |                        | |
-|  | Opening    |    | Transposition  |    |  Neural Network        | |
-|  | Book       |    | Table (atomic) |    |  (BitNet 1.58-bit)    | |
-|  |            |    |                |    |                        | |
+|  | Opening    |    | Transposition  |    |  BitNet Transformer    | |
+|  | Book       |    | Table (atomic) |    |  (Root Policy, opt.)  | |
+|  | (embedded) |    |                |    |                        | |
 |  +------------+    +----------------+    +------------------------+ |
 +---------------------------------------------------------------------+
 ```
@@ -47,9 +47,10 @@ KiyEngine is composed of five major subsystems:
 
 - **UCI Layer** -- Protocol handler, position management, game history tracking
 - **Search Core** -- Lazy SMP alpha-beta with PVS, pruning, and reductions
-- **Evaluation** -- Static evaluation with material, PST, and positional terms
-- **Neural Network** -- BitNet 1.58-bit Transformer for root policy and value
+- **NNUE Evaluation** -- Deep network with AVX2 SIMD, incrementally updated accumulators
+- **BitNet Transformer** -- 1.58-bit Transformer for root policy (optional, loaded from disk)
 - **Transposition Table** -- Lock-free shared hash table across all threads
+- **Embedded Assets** -- NNUE weights and opening books compiled into the binary
 
 ---
 
@@ -344,25 +345,25 @@ Incremental inference (subsequent calls):
 +-----------------------------------------------+
 |              Evaluation Stack                  |
 |                                                |
-|  [Root Only]  Neural Network                   |
+|  [Root Only]  BitNet Transformer (optional)    |
 |               - Policy logits (move ordering)  |
-|               - Value score (position eval)    |
+|               - Value score (unused in search) |
 |               - Shared via Arc across threads  |
+|               - Loaded from disk if present    |
 |                                                |
-|  [Every Node] Static Evaluation               |
-|               - Material counting              |
-|               - Piece-square tables (PeSTO)    |
-|               - Bishop pair bonus (+30cp)      |
-|               - Rook on open file (+20cp)      |
-|               - Rook on semi-open file (+10cp) |
-|               - Passed pawn bonus (5-100cp)    |
-|               - Doubled pawn penalty (-10cp)   |
-|               - Isolated pawn penalty (-15cp)  |
+|  [Every Node] NNUE Deep Network (primary)     |
+|               - (768->512)x2 per perspective   |
+|               - SCReLU activation              |
+|               - L1: 1024->16 (i8 weights)     |
+|               - CReLU activation               |
+|               - L2: 16->8 (i16 weights)       |
+|               - Output bucket by piece count   |
+|               - AVX2 SIMD throughout           |
+|               - Incrementally updated accum.   |
+|               - Embedded in binary             |
 |                                                |
-|  [Planned]    NNUE Evaluation                  |
-|               - Efficiently updatable          |
-|               - Accumulator-based              |
-|               - HalfKP feature set             |
+|  [Fallback]   Material + PST + Positional      |
+|               - Used when NNUE unavailable     |
 +-----------------------------------------------+
 ```
 
@@ -704,10 +705,12 @@ KiyEngine/
 |   +-- constants.rs            Centralized constants (engine, NN, search)
 |   |
 |   +-- book/
-|   |   +-- mod.rs              Polyglot book probing, Zobrist hashing
+|   |   +-- mod.rs              Polyglot book probing, Zobrist hashing, embedded fallback
 |   |   +-- polyglot_keys.rs    781-key Random64 array
+|   |   +-- book1.bin           Polyglot book 1 (embedded via include_bytes!)
+|   |   +-- book2.bin           Polyglot book 2 (embedded via include_bytes!)
 |   |
-|   +-- engine/                 Neural network inference
+|   +-- engine/                 BitNet Transformer inference (optional)
 |   |   +-- mod.rs              Engine struct, forward / forward_with_cache
 |   |   +-- bitlinear.rs        BitLinear: packed ternary weights, SIMD GEMV
 |   |   +-- transformer.rs      MultiheadAttention, BitSwiGLU, KVCache
@@ -715,21 +718,19 @@ KiyEngine/
 |   |   +-- gguf.rs             GGUF format parser and mmap loader
 |   |
 |   +-- eval/                   Evaluation tables
-|   |   +-- mod.rs              Module exports
 |   |   +-- pst.rs              PeSTO piece-square tables
 |   |
 |   +-- search/                 Search algorithms
-|   |   +-- mod.rs              Alpha-beta, TT, move ordering, quiescence,
-|   |   |                       SearchWorker, Searcher, iterative deepening
-|   |   +-- eval.rs             Static evaluation (material + PST + positional)
+|   |   +-- mod.rs              Alpha-beta, TT, move ordering, quiescence
+|   |   +-- eval.rs             Static evaluation (NNUE primary, Material+PST fallback)
 |   |   +-- time.rs             TimeManager (soft/hard bounds, dynamic factors)
 |   |   +-- lazy_smp.rs         Lazy SMP thread management
-|   |   +-- mcts*.rs            MCTS implementations (experimental)
+|   |   +-- syzygy.rs           Syzygy tablebase probing (WDL + DTZ)
 |   |
-|   +-- nnue/                   NNUE evaluation (planned)
-|   |   +-- accumulator.rs      Incrementally updated accumulator
-|   |   +-- features.rs         HalfKP feature extraction
-|   |   +-- mod.rs              Network loading and inference
+|   +-- nnue/                   NNUE evaluation (active, embedded)
+|   |   +-- mod.rs              Network struct, quantized inference, AVX2 SIMD
+|   |   +-- accumulator.rs      Per-perspective accumulators, fused SIMD updates
+|   |   +-- features.rs         HalfKP feature extraction, delta computation
 |   |
 |   +-- simd/                   SIMD utilities and intrinsics
 |   |
@@ -737,32 +738,29 @@ KiyEngine/
 |       +-- mod.rs              Command parsing, option management,
 |                               position history, game state
 |
-+-- Cargo.toml                  Package manifest (v6.0.0)
++-- Cargo.toml                  Package manifest (v6.1.0)
 +-- .cargo/config.toml          SIMD target features (AVX2/AVX-512/BMI2)
-+-- kiyengine.gguf              Neural network model (~28 MB, mmap)
-+-- kiyengine.nnue              NNUE weights (planned)
-+-- book1.bin / book2.bin       Polyglot opening books
++-- kiyengine.gguf              BitNet Transformer model (~79 MB, optional)
++-- kiyengine.nnue              NNUE weights (~7.6 MB, embedded in binary)
 ```
 
 ---
 
 ## Performance Characteristics
 
-### Benchmark Summary (v6.0.0)
+### Benchmark Summary (v6.1.0)
 
 ```text
-Test Position: 3r2k1/pp3pp1/2p1bn1p/8/4P3/2N2N2/PPP2PPP/3R2K1 w
+Self-play (10s+0.1s, single-thread):
+    - Max depth: 26-64 per game
+    - NPS: ~900K single-thread, ~1.6M (4 threads)
+    - NNUE eval active at every node
+    - Decisive games with proper time control
 
-Configuration      Depth   Nodes       NPS         Time
---------------     -----   ----------  ----------  --------
-4 threads, d20     20      23,358,906  1,931,426   ~12.1s
-4 threads, d20*    20      33,900,000  2,180,000   ~15.6s   (* v5.2.0 baseline)
-
-Improvement from v5.2.0 to v6.0.0:
-    - ~1.93M NPS with full SEE and extensions
-    - Full PV lines in UCI info output
-    - SEE pruning, recapture/passed pawn extensions
-    - Stronger evaluation (positional terms)
+NNUE SIMD Performance:
+    - Scalar deep eval: ~337K NPS (4T)
+    - AVX2 deep eval:   ~1.6M NPS (4T)
+    - Speedup: ~4.7x from hand-tuned AVX2
 ```
 
 ### Key Optimization Techniques
@@ -780,7 +778,9 @@ Improvement from v5.2.0 to v6.0.0:
 | History gravity (Stockfish)   | Better move ordering convergence |
 | Incremental move picking      | Avoids sorting pruned moves      |
 | Fixed-size search path        | Zero-alloc repetition detection  |
-| NNUE acc skip (when unused)   | +19% NPS                         |
+| NNUE AVX2 deep eval           | 4.7x speedup vs scalar           |
+| Fused accumulator updates     | 50% fewer memory passes          |
+| Embedded NNUE + books         | Single binary, zero I/O at start |
 | Pre-computed LMR table        | No transcendentals in hot path   |
 | Lock-free TT (XOR trick)     | Zero mutex contention in SMP     |
 +-------------------------------+----------------------------------+
@@ -799,3 +799,5 @@ Improvement from v5.2.0 to v6.0.0:
 ---
 
 Copyright 2026 Khoi. Licensed under the Apache License 2.0.
+
+(Updated for v6.1.0)

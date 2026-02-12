@@ -5,7 +5,7 @@
 
 /// Engine identification
 pub const ENGINE_NAME: &str = "KiyEngine";
-pub const ENGINE_VERSION: &str = "6.0.0";
+pub const ENGINE_VERSION: &str = "6.1.0";
 pub const ENGINE_AUTHOR: &str = "Khoi";
 
 /// Default model file path for V5 (GGUF format)

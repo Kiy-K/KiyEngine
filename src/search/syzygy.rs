@@ -148,9 +148,9 @@ impl SyzygyTB {
 pub fn wdl_to_score(wdl: TbWdl, ply: usize) -> i32 {
     match wdl {
         TbWdl::Win => 20000 - ply as i32, // Large win, prefer shorter path
-        TbWdl::CursedWin => 50,            // Slight advantage (can't force win under 50-move)
+        TbWdl::CursedWin => 50,           // Slight advantage (can't force win under 50-move)
         TbWdl::Draw => 0,
-        TbWdl::BlessedLoss => -50,         // Slight disadvantage (can't lose under 50-move)
+        TbWdl::BlessedLoss => -50, // Slight disadvantage (can't lose under 50-move)
         TbWdl::Loss => -20000 + ply as i32, // Large loss, prefer longer path
     }
 }

@@ -2,8 +2,8 @@
 
 use crate::book::OpeningBook;
 use crate::engine::{Engine, KVCache};
-use crate::search::{Searcher, TranspositionTable};
 use crate::search::syzygy::SyzygyTB;
+use crate::search::{Searcher, TranspositionTable};
 use chess::{Board, ChessMove, MoveGen, Square};
 use std::io::{self, BufRead};
 use std::str::FromStr;
@@ -180,18 +180,22 @@ impl UciHandler {
         let tt = Arc::new(TranspositionTable::new(512));
         let mut searcher = Searcher::new(Arc::clone(&engine), Arc::clone(&tt));
 
-        // Try loading NNUE evaluation network
+        // Load NNUE: try disk file first, then fall back to embedded weights
         let nnue_path = crate::nnue::DEFAULT_NNUE_PATH;
-        if std::path::Path::new(nnue_path).exists() {
-            match crate::nnue::NnueNetwork::load(nnue_path) {
-                Ok(net) => {
-                    println!("info string NNUE loaded: {}", nnue_path);
-                    searcher.nnue = Some(std::sync::Arc::new(net));
-                }
-                Err(e) => {
-                    eprintln!("info string NNUE load failed: {}", e);
-                }
-            }
+        let nnue_result = if std::path::Path::new(nnue_path).exists() {
+            crate::nnue::NnueNetwork::load(nnue_path).map(|net| {
+                eprintln!("info string NNUE loaded: {}", nnue_path);
+                net
+            })
+        } else {
+            crate::nnue::NnueNetwork::from_bytes(crate::nnue::EMBEDDED_NNUE).map(|net| {
+                eprintln!("info string NNUE loaded: embedded");
+                net
+            })
+        };
+        match nnue_result {
+            Ok(net) => searcher.nnue = Some(std::sync::Arc::new(net)),
+            Err(e) => eprintln!("info string NNUE load failed: {}", e),
         }
 
         // Try auto-loading Syzygy tablebases from default directory
@@ -203,14 +207,21 @@ impl UciHandler {
         {
             println!("info string Extracting {} ...", DEFAULT_SYZYGY_ARCHIVE);
             match extract_syzygy_archive(DEFAULT_SYZYGY_ARCHIVE) {
-                Ok(count) => println!("info string Extracted {} files to {}/", count, DEFAULT_SYZYGY_PATH),
+                Ok(count) => println!(
+                    "info string Extracted {} files to {}/",
+                    count, DEFAULT_SYZYGY_PATH
+                ),
                 Err(e) => eprintln!("info string Syzygy extract failed: {}", e),
             }
         }
         if std::path::Path::new(DEFAULT_SYZYGY_PATH).is_dir() {
             match SyzygyTB::new(DEFAULT_SYZYGY_PATH) {
                 Ok(tb) => {
-                    println!("info string Syzygy TB loaded: {} (max {} pieces)", DEFAULT_SYZYGY_PATH, tb.max_pieces());
+                    println!(
+                        "info string Syzygy TB loaded: {} (max {} pieces)",
+                        DEFAULT_SYZYGY_PATH,
+                        tb.max_pieces()
+                    );
                     searcher.syzygy = Some(std::sync::Arc::new(tb));
                 }
                 Err(e) => {
@@ -263,7 +274,7 @@ impl UciHandler {
         let parts: Vec<&str> = command.split_whitespace().collect();
         match parts.get(0).copied() {
             Some("uci") => {
-                println!("id name KiyEngine V6.0.0");
+                println!("id name KiyEngine V6.1.0");
                 println!("id author Khoi");
                 println!("option name Hash type spin default 512 min 64 max 65536");
                 println!("option name Threads type spin default 4 min 1 max 256");
@@ -387,7 +398,11 @@ impl UciHandler {
                 if !value.is_empty() && value != "<empty>" {
                     match SyzygyTB::new(&value) {
                         Ok(tb) => {
-                            println!("info string Syzygy TB loaded: {} (max {} pieces)", value, tb.max_pieces());
+                            println!(
+                                "info string Syzygy TB loaded: {} (max {} pieces)",
+                                value,
+                                tb.max_pieces()
+                            );
                             self.searcher.syzygy = Some(std::sync::Arc::new(tb));
                         }
                         Err(e) => {

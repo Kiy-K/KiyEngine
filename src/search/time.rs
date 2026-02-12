@@ -61,13 +61,11 @@ impl TimeManager {
         let (opt_scale, max_scale) = if movestogo == 0 {
             // Sudden death / increment: Stockfish-style opt/max scaling
             // optScale: grows with ply but capped conservatively at 0.039
-            let opt_raw =
-                (0.0120 + (ply as f64 + 2.43).powf(0.462) * 0.0084).min(0.039);
+            let opt_raw = (0.0120 + (ply as f64 + 2.43).powf(0.462) * 0.0084).min(0.039);
             let opt = opt_raw * time_left;
 
             // maxScale: allows extending for unstable positions but capped
-            let max_raw =
-                (0.054 + (ply as f64 + 2.0).powf(0.442) * 0.074).min(6.0);
+            let max_raw = (0.054 + (ply as f64 + 2.0).powf(0.442) * 0.074).min(6.0);
             let max_from_pool = max_raw * time_left;
             // Hard cap: never burn more than 25% of remaining clock on one move
             let max = max_from_pool.min(0.25 * time_ms - overhead);

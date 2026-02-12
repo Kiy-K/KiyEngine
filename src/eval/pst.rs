@@ -157,7 +157,9 @@ impl PST {
     pub fn game_phase(board: &chess::Board) -> i32 {
         let mut phase = 0i32;
         for &(piece, val) in &PHASE_VALS {
-            if val == 0 { continue; }
+            if val == 0 {
+                continue;
+            }
             let count = board.pieces(piece).popcnt() as i32;
             phase += count * val;
         }

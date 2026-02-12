@@ -201,14 +201,30 @@ fn king_pawn_shield(board: &Board, color: Color, our_pawns: BitBoard) -> i32 {
     for f in start_file..=end_file {
         // Check 1-2 ranks ahead of king for friendly pawns
         let ahead1 = if color == Color::White {
-            if k_rank < 7 { Some((k_rank + 1) * 8 + f) } else { None }
+            if k_rank < 7 {
+                Some((k_rank + 1) * 8 + f)
+            } else {
+                None
+            }
         } else {
-            if k_rank > 0 { Some((k_rank - 1) * 8 + f) } else { None }
+            if k_rank > 0 {
+                Some((k_rank - 1) * 8 + f)
+            } else {
+                None
+            }
         };
         let ahead2 = if color == Color::White {
-            if k_rank < 6 { Some((k_rank + 2) * 8 + f) } else { None }
+            if k_rank < 6 {
+                Some((k_rank + 2) * 8 + f)
+            } else {
+                None
+            }
         } else {
-            if k_rank > 1 { Some((k_rank - 2) * 8 + f) } else { None }
+            if k_rank > 1 {
+                Some((k_rank - 2) * 8 + f)
+            } else {
+                None
+            }
         };
 
         if let Some(sq_idx) = ahead1 {

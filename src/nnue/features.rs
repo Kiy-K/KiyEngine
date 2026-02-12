@@ -132,7 +132,9 @@ pub const fn total_input_features(num_input_buckets: usize) -> usize {
 /// Uses king-bucketed features (HalfKAv2 with horizontal mirroring).
 ///
 /// Returns (white_features, black_features, count).
-pub fn extract_features_bucketed(board: &Board) -> ([usize; MAX_ACTIVE], [usize; MAX_ACTIVE], usize) {
+pub fn extract_features_bucketed(
+    board: &Board,
+) -> ([usize; MAX_ACTIVE], [usize; MAX_ACTIVE], usize) {
     let mut white_feats = [0usize; MAX_ACTIVE];
     let mut black_feats = [0usize; MAX_ACTIVE];
     let mut count = 0;
@@ -310,8 +312,11 @@ pub fn compute_delta(board: &Board, mv: chess::ChessMove) -> Option<FeatureDelta
     }
 
     if moving_piece == Piece::King {
-        if stm == Color::White { delta.white_king_moved = true; }
-        else { delta.black_king_moved = true; }
+        if stm == Color::White {
+            delta.white_king_moved = true;
+        } else {
+            delta.black_king_moved = true;
+        }
     }
 
     delta.removed[delta.num_removed] = (

@@ -65,6 +65,9 @@ pub const NUM_BUCKETS: usize = 8;
 /// Default NNUE file path
 pub const DEFAULT_NNUE_PATH: &str = "kiyengine.nnue";
 
+/// Embedded NNUE weights (compiled into binary for single-file distribution)
+pub static EMBEDDED_NNUE: &[u8] = include_bytes!("../../kiyengine.nnue");
+
 // ============================================================================
 // NETWORK
 // ============================================================================
@@ -313,13 +316,19 @@ impl NnueNetwork {
                         );
                     };
                 }
-                madd!(a0, 0); madd!(a1, 1); madd!(a2, 2); madd!(a3, 3);
-                madd!(a4, 4); madd!(a5, 5); madd!(a6, 6); madd!(a7, 7);
+                madd!(a0, 0);
+                madd!(a1, 1);
+                madd!(a2, 2);
+                madd!(a3, 3);
+                madd!(a4, 4);
+                madd!(a5, 5);
+                madd!(a6, 6);
+                madd!(a7, 7);
                 k += 16;
             }
 
             let b = self.l1_biases.as_ptr().add(j);
-            l1_out[j    ] = hsum_i32_avx2(a0) + *b;
+            l1_out[j] = hsum_i32_avx2(a0) + *b;
             l1_out[j + 1] = hsum_i32_avx2(a1) + *b.add(1);
             l1_out[j + 2] = hsum_i32_avx2(a2) + *b.add(2);
             l1_out[j + 3] = hsum_i32_avx2(a3) + *b.add(3);
@@ -340,7 +349,7 @@ impl NnueNetwork {
                     _mm256_madd_epi16(
                         s,
                         _mm256_cvtepi8_epi16(_mm_loadu_si128(
-                            l1w.add(j * in_size + k) as *const __m128i,
+                            l1w.add(j * in_size + k) as *const __m128i
                         )),
                     ),
                 );
@@ -361,9 +370,7 @@ impl NnueNetwork {
         // packs_epi32 interleaves 128-bit lanes; permute restores linear order
         let crelu_i16 = _mm256_permute4x64_epi64(_mm256_packs_epi32(clo, chi), 0xD8);
 
-        let l2w = _mm256_loadu_si256(
-            self.l2_weights.as_ptr().add(bucket * l1s) as *const __m256i,
-        );
+        let l2w = _mm256_loadu_si256(self.l2_weights.as_ptr().add(bucket * l1s) as *const __m256i);
         let dot = _mm256_madd_epi16(crelu_i16, l2w);
         let output = hsum_i32_avx2(dot) as i64 + self.l2_biases[bucket] as i64;
 
@@ -392,10 +399,10 @@ impl NnueNetwork {
 
         // sum is in QA² * QB units
         // Bullet dequantization: (sum/QA + bias) * SCALE / (QA * QB)
-        sum /= qa;                                       // QA²*QB → QA*QB
-        sum += self.output_biases[bucket] as i64;         // bias in QA*QB units
-        sum *= SCALE as i64;                              // → centipawn-scaled
-        sum /= qa * QB as i64;                            // remove quantization
+        sum /= qa; // QA²*QB → QA*QB
+        sum += self.output_biases[bucket] as i64; // bias in QA*QB units
+        sum *= SCALE as i64; // → centipawn-scaled
+        sum /= qa * QB as i64; // remove quantization
         sum as i32
     }
 
@@ -421,7 +428,9 @@ impl NnueNetwork {
         let mut i = 0;
         while i < hs {
             let acc = _mm256_load_si256(us.as_ptr().add(i) as *const __m256i);
-            let wgt = _mm256_loadu_si256(self.output_weights.as_ptr().add(w_offset + i) as *const __m256i);
+            let wgt = _mm256_loadu_si256(
+                self.output_weights.as_ptr().add(w_offset + i) as *const __m256i
+            );
 
             let clamped = _mm256_min_epi16(_mm256_max_epi16(acc, zero), qa_vec);
 
@@ -436,8 +445,9 @@ impl NnueNetwork {
         i = 0;
         while i < hs {
             let acc = _mm256_load_si256(them.as_ptr().add(i) as *const __m256i);
-            let wgt =
-                _mm256_loadu_si256(self.output_weights.as_ptr().add(w_offset + hs + i) as *const __m256i);
+            let wgt = _mm256_loadu_si256(
+                self.output_weights.as_ptr().add(w_offset + hs + i) as *const __m256i
+            );
 
             let clamped = _mm256_min_epi16(_mm256_max_epi16(acc, zero), qa_vec);
 
@@ -454,10 +464,10 @@ impl NnueNetwork {
 
         // Bullet dequantization: (sum/QA + bias) * SCALE / (QA * QB)
         let qa = QA as i64;
-        let mut result = dot / qa;                              // QA²*QB → QA*QB
-        result += self.output_biases[bucket] as i64;             // bias in QA*QB units
-        result *= SCALE as i64;                                  // → centipawn-scaled
-        result /= qa * QB as i64;                                // remove quantization
+        let mut result = dot / qa; // QA²*QB → QA*QB
+        result += self.output_biases[bucket] as i64; // bias in QA*QB units
+        result *= SCALE as i64; // → centipawn-scaled
+        result /= qa * QB as i64; // remove quantization
         result as i32
     }
 
@@ -500,7 +510,11 @@ impl NnueNetwork {
         let mut buf4 = [0u8; 4];
         cursor.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != NNUE_VERSION && version != NNUE_VERSION_V4 && version != NNUE_VERSION_V3 && version != NNUE_VERSION_V2 {
+        if version != NNUE_VERSION
+            && version != NNUE_VERSION_V4
+            && version != NNUE_VERSION_V3
+            && version != NNUE_VERSION_V2
+        {
             anyhow::bail!(
                 "Unsupported NNUE version: {} (expected 2, 3, 4, or 5)",
                 version,
@@ -571,7 +585,8 @@ impl NnueNetwork {
             // Output biases: [num_buckets]
             let output_biases = read_i16_vec(&mut cursor, num_buckets)?;
 
-            let total_bytes = ft_count * 2 + hidden_size * 2
+            let total_bytes = ft_count * 2
+                + hidden_size * 2
                 + NUM_FEATURES * num_buckets * 2
                 + num_buckets * 2 * hidden_size * 2
                 + num_buckets * 2;
@@ -613,7 +628,8 @@ impl NnueNetwork {
             let output_weights = read_i16_vec(&mut cursor, num_buckets * 2 * hidden_size)?;
             let output_biases = read_i16_vec(&mut cursor, num_buckets)?;
 
-            let total_bytes = ft_count * 2 + hidden_size * 2
+            let total_bytes = ft_count * 2
+                + hidden_size * 2
                 + num_buckets * 2 * hidden_size * 2
                 + num_buckets * 2;
             println!(
@@ -662,9 +678,12 @@ impl NnueNetwork {
             let l2_weights = read_i16_vec(&mut cursor, l2_w_count)?;
             let l2_biases = read_i16_vec(&mut cursor, num_buckets)?;
 
-            let total_bytes = ft_count * 2 + hidden_size * 2
-                + l1_w_count + l1_size * 4
-                + l2_w_count * 2 + num_buckets * 2;
+            let total_bytes = ft_count * 2
+                + hidden_size * 2
+                + l1_w_count
+                + l1_size * 4
+                + l2_w_count * 2
+                + num_buckets * 2;
             println!(
                 "  NNUE v5 loaded: hidden_size={}, l1_size={}, input_buckets={}, output_buckets={}, total={:.1}KB",
                 hidden_size, l1_size, num_input_buckets, num_buckets, total_bytes as f64 / 1024.0,
@@ -799,12 +818,24 @@ impl NnueNetwork {
             buf.extend_from_slice(&(self.num_input_buckets as u32).to_le_bytes());
             buf.extend_from_slice(&(self.l1_size as u32).to_le_bytes());
 
-            for &w in &self.ft_weights { buf.extend_from_slice(&w.to_le_bytes()); }
-            for &b in &self.ft_biases { buf.extend_from_slice(&b.to_le_bytes()); }
-            for &w in &self.l1_weights { buf.push(w as u8); }
-            for &b in &self.l1_biases { buf.extend_from_slice(&b.to_le_bytes()); }
-            for &w in &self.l2_weights { buf.extend_from_slice(&w.to_le_bytes()); }
-            for &b in &self.l2_biases { buf.extend_from_slice(&b.to_le_bytes()); }
+            for &w in &self.ft_weights {
+                buf.extend_from_slice(&w.to_le_bytes());
+            }
+            for &b in &self.ft_biases {
+                buf.extend_from_slice(&b.to_le_bytes());
+            }
+            for &w in &self.l1_weights {
+                buf.push(w as u8);
+            }
+            for &b in &self.l1_biases {
+                buf.extend_from_slice(&b.to_le_bytes());
+            }
+            for &w in &self.l2_weights {
+                buf.extend_from_slice(&w.to_le_bytes());
+            }
+            for &b in &self.l2_biases {
+                buf.extend_from_slice(&b.to_le_bytes());
+            }
         } else {
             // v4: shallow network
             buf.extend_from_slice(&NNUE_VERSION_V4.to_le_bytes());
@@ -812,10 +843,18 @@ impl NnueNetwork {
             buf.extend_from_slice(&(self.num_buckets as u32).to_le_bytes());
             buf.extend_from_slice(&(self.num_input_buckets as u32).to_le_bytes());
 
-            for &w in &self.ft_weights { buf.extend_from_slice(&w.to_le_bytes()); }
-            for &b in &self.ft_biases { buf.extend_from_slice(&b.to_le_bytes()); }
-            for &w in &self.output_weights { buf.extend_from_slice(&w.to_le_bytes()); }
-            for &b in &self.output_biases { buf.extend_from_slice(&b.to_le_bytes()); }
+            for &w in &self.ft_weights {
+                buf.extend_from_slice(&w.to_le_bytes());
+            }
+            for &b in &self.ft_biases {
+                buf.extend_from_slice(&b.to_le_bytes());
+            }
+            for &w in &self.output_weights {
+                buf.extend_from_slice(&w.to_le_bytes());
+            }
+            for &b in &self.output_biases {
+                buf.extend_from_slice(&b.to_le_bytes());
+            }
         }
 
         buf
