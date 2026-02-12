@@ -113,65 +113,75 @@ impl Accumulator {
 
     /// Incremental update: apply feature deltas from a move.
     ///
-    /// Copies parent accumulator, then adds/subtracts changed feature columns.
-    /// Also incrementally updates PSQT shortcut scores.
+    /// Uses fused SIMD operations for the common cases:
+    /// - Quiet move (1 rem + 1 add): single-pass copy-sub-add  → 3× fewer memory passes
+    /// - Capture   (2 rem + 1 add): single-pass copy-sub2-add → 4× fewer memory passes
+    /// Falls back to sequential copy+sub+add for rare edge cases.
     pub fn update_from(&mut self, parent: &Accumulator, delta: &FeatureDelta, net: &NnueNetwork) {
         let hs = net.hidden_size;
-        let nb = net.num_buckets;
-        let has_psqt = !net.psqt_weights.is_empty();
+        let ftw = &net.ft_weights;
 
-        // Copy parent state
-        self.white[..hs].copy_from_slice(&parent.white[..hs]);
-        self.black[..hs].copy_from_slice(&parent.black[..hs]);
-
-        // Copy PSQT state
-        if has_psqt {
-            self.psqt_white[..nb].copy_from_slice(&parent.psqt_white[..nb]);
-            self.psqt_black[..nb].copy_from_slice(&parent.psqt_black[..nb]);
-        }
-
-        // Subtract removed features
-        for r in 0..delta.num_removed {
-            let (wf, bf) = delta.removed[r];
-            let w_offset = wf * hs;
-            let b_offset = bf * hs;
-            vec_sub_i16(
-                &mut self.white[..hs],
-                &net.ft_weights[w_offset..w_offset + hs],
+        if delta.num_removed == 1 && delta.num_added == 1 {
+            // ── Quiet move: fused copy + sub + add (single pass per perspective) ──
+            let (wr, br) = delta.removed[0];
+            let (wa, ba) = delta.added[0];
+            vec_copy_sub_add_i16(
+                &mut self.white[..hs], &parent.white[..hs],
+                &ftw[wr * hs..wr * hs + hs], &ftw[wa * hs..wa * hs + hs],
             );
-            vec_sub_i16(
-                &mut self.black[..hs],
-                &net.ft_weights[b_offset..b_offset + hs],
+            vec_copy_sub_add_i16(
+                &mut self.black[..hs], &parent.black[..hs],
+                &ftw[br * hs..br * hs + hs], &ftw[ba * hs..ba * hs + hs],
             );
-            if has_psqt {
-                let w_psqt = wf * nb;
-                let b_psqt = bf * nb;
-                for b in 0..nb {
-                    self.psqt_white[b] -= net.psqt_weights[w_psqt + b] as i32;
-                    self.psqt_black[b] -= net.psqt_weights[b_psqt + b] as i32;
-                }
+        } else if delta.num_removed == 2 && delta.num_added == 1 {
+            // ── Capture: fused copy + sub2 + add (single pass per perspective) ──
+            let (wr1, br1) = delta.removed[0];
+            let (wr2, br2) = delta.removed[1];
+            let (wa, ba) = delta.added[0];
+            vec_copy_sub2_add_i16(
+                &mut self.white[..hs], &parent.white[..hs],
+                &ftw[wr1 * hs..wr1 * hs + hs], &ftw[wr2 * hs..wr2 * hs + hs],
+                &ftw[wa * hs..wa * hs + hs],
+            );
+            vec_copy_sub2_add_i16(
+                &mut self.black[..hs], &parent.black[..hs],
+                &ftw[br1 * hs..br1 * hs + hs], &ftw[br2 * hs..br2 * hs + hs],
+                &ftw[ba * hs..ba * hs + hs],
+            );
+        } else {
+            // ── Fallback: sequential copy then add/sub ──
+            self.white[..hs].copy_from_slice(&parent.white[..hs]);
+            self.black[..hs].copy_from_slice(&parent.black[..hs]);
+            for r in 0..delta.num_removed {
+                let (wf, bf) = delta.removed[r];
+                vec_sub_i16(&mut self.white[..hs], &ftw[wf * hs..wf * hs + hs]);
+                vec_sub_i16(&mut self.black[..hs], &ftw[bf * hs..bf * hs + hs]);
+            }
+            for a in 0..delta.num_added {
+                let (wf, bf) = delta.added[a];
+                vec_add_i16(&mut self.white[..hs], &ftw[wf * hs..wf * hs + hs]);
+                vec_add_i16(&mut self.black[..hs], &ftw[bf * hs..bf * hs + hs]);
             }
         }
 
-        // Add new features
-        for a in 0..delta.num_added {
-            let (wf, bf) = delta.added[a];
-            let w_offset = wf * hs;
-            let b_offset = bf * hs;
-            vec_add_i16(
-                &mut self.white[..hs],
-                &net.ft_weights[w_offset..w_offset + hs],
-            );
-            vec_add_i16(
-                &mut self.black[..hs],
-                &net.ft_weights[b_offset..b_offset + hs],
-            );
-            if has_psqt {
-                let w_psqt = wf * nb;
-                let b_psqt = bf * nb;
+        // PSQT incremental update (v3 only, empty for v5 deep networks)
+        let nb = net.num_buckets;
+        let has_psqt = !net.psqt_weights.is_empty();
+        if has_psqt {
+            self.psqt_white[..nb].copy_from_slice(&parent.psqt_white[..nb]);
+            self.psqt_black[..nb].copy_from_slice(&parent.psqt_black[..nb]);
+            for r in 0..delta.num_removed {
+                let (wf, bf) = delta.removed[r];
                 for b in 0..nb {
-                    self.psqt_white[b] += net.psqt_weights[w_psqt + b] as i32;
-                    self.psqt_black[b] += net.psqt_weights[b_psqt + b] as i32;
+                    self.psqt_white[b] -= net.psqt_weights[wf * nb + b] as i32;
+                    self.psqt_black[b] -= net.psqt_weights[bf * nb + b] as i32;
+                }
+            }
+            for a in 0..delta.num_added {
+                let (wf, bf) = delta.added[a];
+                for b in 0..nb {
+                    self.psqt_white[b] += net.psqt_weights[wf * nb + b] as i32;
+                    self.psqt_black[b] += net.psqt_weights[bf * nb + b] as i32;
                 }
             }
         }
@@ -532,6 +542,34 @@ fn vec_sub_i16(dst: &mut [i16], src: &[i16]) {
     }
 }
 
+/// Fused: dst[i] = src[i] - sub[i] + add[i]  (quiet move: 3× fewer memory passes)
+#[inline(always)]
+fn vec_copy_sub_add_i16(dst: &mut [i16], src: &[i16], sub: &[i16], add: &[i16]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { return vec_copy_sub_add_i16_avx2(dst, src, sub, add); }
+        }
+    }
+    for i in 0..dst.len() {
+        dst[i] = src[i].wrapping_sub(sub[i]).wrapping_add(add[i]);
+    }
+}
+
+/// Fused: dst[i] = src[i] - sub1[i] - sub2[i] + add[i]  (capture: 4× fewer passes)
+#[inline(always)]
+fn vec_copy_sub2_add_i16(dst: &mut [i16], src: &[i16], sub1: &[i16], sub2: &[i16], add: &[i16]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { return vec_copy_sub2_add_i16_avx2(dst, src, sub1, sub2, add); }
+        }
+    }
+    for i in 0..dst.len() {
+        dst[i] = src[i].wrapping_sub(sub1[i]).wrapping_sub(sub2[i]).wrapping_add(add[i]);
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -560,6 +598,48 @@ unsafe fn vec_sub_i16_avx2(dst: &mut [i16], src: &[i16]) {
         let a = _mm256_load_si256(dst_ptr.add(i) as *const __m256i);
         let b = _mm256_loadu_si256(src_ptr.add(i) as *const __m256i);
         _mm256_store_si256(dst_ptr.add(i) as *mut __m256i, _mm256_sub_epi16(a, b));
+        i += 16;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn vec_copy_sub_add_i16_avx2(dst: &mut [i16], src: &[i16], sub: &[i16], add: &[i16]) {
+    let n = dst.len();
+    let (dp, sp, subp, addp) = (dst.as_mut_ptr(), src.as_ptr(), sub.as_ptr(), add.as_ptr());
+    let mut i = 0;
+    while i + 16 <= n {
+        let s = _mm256_load_si256(sp.add(i) as *const __m256i);
+        let r = _mm256_loadu_si256(subp.add(i) as *const __m256i);
+        let a = _mm256_loadu_si256(addp.add(i) as *const __m256i);
+        _mm256_store_si256(
+            dp.add(i) as *mut __m256i,
+            _mm256_add_epi16(_mm256_sub_epi16(s, r), a),
+        );
+        i += 16;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn vec_copy_sub2_add_i16_avx2(
+    dst: &mut [i16], src: &[i16], sub1: &[i16], sub2: &[i16], add: &[i16],
+) {
+    let n = dst.len();
+    let (dp, sp) = (dst.as_mut_ptr(), src.as_ptr());
+    let (s1p, s2p, ap) = (sub1.as_ptr(), sub2.as_ptr(), add.as_ptr());
+    let mut i = 0;
+    while i + 16 <= n {
+        let s = _mm256_load_si256(sp.add(i) as *const __m256i);
+        let r1 = _mm256_loadu_si256(s1p.add(i) as *const __m256i);
+        let r2 = _mm256_loadu_si256(s2p.add(i) as *const __m256i);
+        let a = _mm256_loadu_si256(ap.add(i) as *const __m256i);
+        _mm256_store_si256(
+            dp.add(i) as *mut __m256i,
+            _mm256_add_epi16(_mm256_sub_epi16(_mm256_sub_epi16(s, r1), r2), a),
+        );
         i += 16;
     }
 }

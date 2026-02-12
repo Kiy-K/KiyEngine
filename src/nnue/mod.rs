@@ -242,11 +242,10 @@ impl NnueNetwork {
 
     /// AVX2-optimized deep network evaluate (v5).
     ///
-    /// Strategy (Stockfish-inspired):
-    /// 1. Pre-compute SCReLU into i16 buffer: clamp(v,0,QA)²/QA → [0,255]
-    ///    Uses exact integer division: (v² * 257 + 256) >> 16
-    /// 2. L1 matmul: madd_epi16(screlu_i16, widen(l1_weight_i8)) → i32, 4 outputs at a time
-    /// 3. CReLU + L2 scalar (only 16 values, not worth SIMD)
+    /// Strategy (Stockfish-inspired, tuned for L1_SIZE=16):
+    /// 1. SCReLU into aligned i16 buffer: all-i16 div-255 trick
+    /// 2. L1 matmul: 8 outputs at a time (halves buffer reads vs 4-wide)
+    /// 3. CReLU + L2 fully vectorized (no scalar loops)
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     unsafe fn evaluate_deep_avx2(&self, us: &[i16], them: &[i16], bucket: usize) -> i32 {
@@ -258,122 +257,117 @@ impl NnueNetwork {
         let qa_vec = _mm256_set1_epi16(QA);
         let one16 = _mm256_set1_epi16(1);
 
-        // ── Step 1: Pre-compute SCReLU into aligned i16 buffer ──
-        // SCReLU(v) = clamp(v,0,QA)²/QA → [0,255]
-        //
-        // All-i16 "div-255" trick (avoids expensive i32 widening):
-        //   v_sq = mullo_epi16(v, v)           — u16 bit pattern, no overflow (255²=65025<65536)
-        //   result = (v_sq + (v_sq >> 8) + 1) >> 8  — exact truncated division by 255
+        // ── Step 1: SCReLU → aligned i16 buffer ──
+        // clamp(v,0,QA)²/QA via all-i16 div-255: (v²+(v²>>8)+1)>>8
         #[repr(align(64))]
         struct AlignedBuf([i16; 1024]);
         let mut screlu_buf = AlignedBuf([0i16; 1024]);
 
-        // Process "us" perspective
-        let mut i = 0;
-        while i < hs {
-            let v = _mm256_load_si256(us.as_ptr().add(i) as *const __m256i);
-            let clamped = _mm256_min_epi16(_mm256_max_epi16(v, zero), qa_vec);
-            let v_sq = _mm256_mullo_epi16(clamped, clamped);
-            let v_sq_hi = _mm256_srli_epi16(v_sq, 8);
-            let temp = _mm256_add_epi16(_mm256_add_epi16(v_sq, v_sq_hi), one16);
-            let result = _mm256_srli_epi16(temp, 8);
-            _mm256_store_si256(screlu_buf.0.as_mut_ptr().add(i) as *mut __m256i, result);
-            i += 16;
+        macro_rules! screlu_block {
+            ($src:expr, $dst_off:expr, $count:expr) => {{
+                let mut i = 0;
+                while i < $count {
+                    let v = _mm256_load_si256($src.as_ptr().add(i) as *const __m256i);
+                    let c = _mm256_min_epi16(_mm256_max_epi16(v, zero), qa_vec);
+                    let sq = _mm256_mullo_epi16(c, c);
+                    let r = _mm256_srli_epi16(
+                        _mm256_add_epi16(_mm256_add_epi16(sq, _mm256_srli_epi16(sq, 8)), one16),
+                        8,
+                    );
+                    _mm256_store_si256(
+                        screlu_buf.0.as_mut_ptr().add($dst_off + i) as *mut __m256i,
+                        r,
+                    );
+                    i += 16;
+                }
+            }};
         }
+        screlu_block!(us, 0, hs);
+        screlu_block!(them, hs, hs);
 
-        // Process "them" perspective
-        i = 0;
-        while i < hs {
-            let v = _mm256_load_si256(them.as_ptr().add(i) as *const __m256i);
-            let clamped = _mm256_min_epi16(_mm256_max_epi16(v, zero), qa_vec);
-            let v_sq = _mm256_mullo_epi16(clamped, clamped);
-            let v_sq_hi = _mm256_srli_epi16(v_sq, 8);
-            let temp = _mm256_add_epi16(_mm256_add_epi16(v_sq, v_sq_hi), one16);
-            let result = _mm256_srli_epi16(temp, 8);
-            _mm256_store_si256(screlu_buf.0.as_mut_ptr().add(hs + i) as *mut __m256i, result);
-            i += 16;
-        }
+        // ── Step 2: L1 matmul — 8 outputs at a time ──
+        // Processes screlu buffer in 2 passes instead of 4, halving read traffic.
+        // madd_epi16(screlu_i16, widen(w_i8)) → i32; max 33.4M per output, fits i32.
+        let mut l1_out = [0i32; 16];
+        let l1w = self.l1_weights.as_ptr();
+        let sbuf = screlu_buf.0.as_ptr();
 
-        // ── Step 2: L1 matmul — 4 outputs at a time, reuse SCReLU buffer ──
-        // madd_epi16(screlu_i16, widen(w_i8)) → i32 dot product
-        // Max per pair: 255*128 + 255*128 = 65280, fits i32
-        // Over 512 pairs (1024 inputs): 512 * 65280 = 33.4M, fits i32 ✓
-        let mut l1_out = [0i32; 64];
+        let mut j = 0usize;
+        while j + 8 <= l1s {
+            let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
+            let (mut a4, mut a5, mut a6, mut a7) = (zero, zero, zero, zero);
 
-        let mut j = 0;
-        while j + 4 <= l1s {
-            let mut sum0 = _mm256_setzero_si256();
-            let mut sum1 = _mm256_setzero_si256();
-            let mut sum2 = _mm256_setzero_si256();
-            let mut sum3 = _mm256_setzero_si256();
-
-            let mut k = 0;
+            let mut k = 0usize;
             while k < in_size {
-                let s = _mm256_load_si256(screlu_buf.0.as_ptr().add(k) as *const __m256i);
-
-                let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
-                    self.l1_weights.as_ptr().add((j + 0) * in_size + k) as *const __m128i,
-                ));
-                let w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
-                    self.l1_weights.as_ptr().add((j + 1) * in_size + k) as *const __m128i,
-                ));
-                let w2 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
-                    self.l1_weights.as_ptr().add((j + 2) * in_size + k) as *const __m128i,
-                ));
-                let w3 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
-                    self.l1_weights.as_ptr().add((j + 3) * in_size + k) as *const __m128i,
-                ));
-
-                sum0 = _mm256_add_epi32(sum0, _mm256_madd_epi16(s, w0));
-                sum1 = _mm256_add_epi32(sum1, _mm256_madd_epi16(s, w1));
-                sum2 = _mm256_add_epi32(sum2, _mm256_madd_epi16(s, w2));
-                sum3 = _mm256_add_epi32(sum3, _mm256_madd_epi16(s, w3));
-
+                let s = _mm256_load_si256(sbuf.add(k) as *const __m256i);
+                macro_rules! madd {
+                    ($acc:ident, $off:expr) => {
+                        $acc = _mm256_add_epi32(
+                            $acc,
+                            _mm256_madd_epi16(
+                                s,
+                                _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                                    l1w.add((j + $off) * in_size + k) as *const __m128i,
+                                )),
+                            ),
+                        );
+                    };
+                }
+                madd!(a0, 0); madd!(a1, 1); madd!(a2, 2); madd!(a3, 3);
+                madd!(a4, 4); madd!(a5, 5); madd!(a6, 6); madd!(a7, 7);
                 k += 16;
             }
 
-            // Horizontal sum each __m256i → scalar i32
-            l1_out[j + 0] = hsum_i32_avx2(sum0) + self.l1_biases[j + 0];
-            l1_out[j + 1] = hsum_i32_avx2(sum1) + self.l1_biases[j + 1];
-            l1_out[j + 2] = hsum_i32_avx2(sum2) + self.l1_biases[j + 2];
-            l1_out[j + 3] = hsum_i32_avx2(sum3) + self.l1_biases[j + 3];
-
-            j += 4;
+            let b = self.l1_biases.as_ptr().add(j);
+            l1_out[j    ] = hsum_i32_avx2(a0) + *b;
+            l1_out[j + 1] = hsum_i32_avx2(a1) + *b.add(1);
+            l1_out[j + 2] = hsum_i32_avx2(a2) + *b.add(2);
+            l1_out[j + 3] = hsum_i32_avx2(a3) + *b.add(3);
+            l1_out[j + 4] = hsum_i32_avx2(a4) + *b.add(4);
+            l1_out[j + 5] = hsum_i32_avx2(a5) + *b.add(5);
+            l1_out[j + 6] = hsum_i32_avx2(a6) + *b.add(6);
+            l1_out[j + 7] = hsum_i32_avx2(a7) + *b.add(7);
+            j += 8;
         }
-
-        // Handle remaining outputs (l1_size not divisible by 4)
+        // Tail: handle remaining outputs if l1_size % 8 != 0
         while j < l1s {
-            let mut sum = _mm256_setzero_si256();
-            let mut k = 0;
+            let mut acc = zero;
+            let mut k = 0usize;
             while k < in_size {
-                let s = _mm256_load_si256(screlu_buf.0.as_ptr().add(k) as *const __m256i);
-                let w = _mm256_cvtepi8_epi16(_mm_loadu_si128(
-                    self.l1_weights.as_ptr().add(j * in_size + k) as *const __m128i,
-                ));
-                sum = _mm256_add_epi32(sum, _mm256_madd_epi16(s, w));
+                let s = _mm256_load_si256(sbuf.add(k) as *const __m256i);
+                acc = _mm256_add_epi32(
+                    acc,
+                    _mm256_madd_epi16(
+                        s,
+                        _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            l1w.add(j * in_size + k) as *const __m128i,
+                        )),
+                    ),
+                );
                 k += 16;
             }
-            l1_out[j] = hsum_i32_avx2(sum) + self.l1_biases[j];
+            l1_out[j] = hsum_i32_avx2(acc) + *self.l1_biases.as_ptr().add(j);
             j += 1;
         }
 
-        // ── Step 3: CReLU (scalar — only 16 values) ──
-        let qa = QA as i32;
-        let mut crelu = [0i32; 64];
-        for idx in 0..l1s {
-            crelu[idx] = (l1_out[idx] / Q1).clamp(0, qa);
-        }
+        // ── Step 3: SIMD CReLU + L2 ──
+        // CReLU: clamp(x, 0, QA*Q1) >> 6  ≡  clamp(x/Q1, 0, QA)
+        // Then pack i32→i16, dot with L2 weights, hsum.
+        let upper = _mm256_set1_epi32(QA as i32 * Q1);
+        let lo = _mm256_loadu_si256(l1_out.as_ptr() as *const __m256i);
+        let hi = _mm256_loadu_si256(l1_out.as_ptr().add(8) as *const __m256i);
+        let clo = _mm256_srli_epi32(_mm256_min_epi32(_mm256_max_epi32(lo, zero), upper), 6);
+        let chi = _mm256_srli_epi32(_mm256_min_epi32(_mm256_max_epi32(hi, zero), upper), 6);
+        // packs_epi32 interleaves 128-bit lanes; permute restores linear order
+        let crelu_i16 = _mm256_permute4x64_epi64(_mm256_packs_epi32(clo, chi), 0xD8);
 
-        // ── Step 4: L2 per-bucket output (scalar — only 16 values) ──
-        let l2_w_base = bucket * l1s;
-        let mut output = self.l2_biases[bucket] as i64;
-        for idx in 0..l1s {
-            output += crelu[idx] as i64 * self.l2_weights[l2_w_base + idx] as i64;
-        }
+        let l2w = _mm256_loadu_si256(
+            self.l2_weights.as_ptr().add(bucket * l1s) as *const __m256i,
+        );
+        let dot = _mm256_madd_epi16(crelu_i16, l2w);
+        let output = hsum_i32_avx2(dot) as i64 + self.l2_biases[bucket] as i64;
 
-        // ── Step 5: Dequant ──
-        let result = output * SCALE as i64 / (qa as i64 * QB as i64);
-        result as i32
+        (output * SCALE as i64 / (QA as i64 * QB as i64)) as i32
     }
 
     /// Scalar fallback evaluate (no SIMD).
