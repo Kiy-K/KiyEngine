@@ -1066,10 +1066,7 @@ impl SearchWorker {
     fn adjust_eval(&self, raw: i32) -> i32 {
         let mut eval = raw;
 
-        // 1. Tempo bonus: small advantage for having the move (~15cp in Stockfish)
-        eval += 16;
-
-        // 2. Pawn correction history
+        // 1. Pawn correction history (tempo bonus now in eval.rs)
         let pawn_hash = self.board.get_pawn_hash();
         let pawn_idx = (pawn_hash as usize) % CORRECTION_HIST_SIZE;
         let stm = if self.board.side_to_move() == Color::White {
@@ -1099,111 +1096,6 @@ impl SearchWorker {
         }
 
         eval
-    }
-
-    /// King safety correction: penalize uncastled king that has moved to rank 2-3
-    /// in the opening/middlegame. Scaled by opponent's attacking material.
-    #[inline]
-    fn king_safety_correction(&self) -> i32 {
-        let stm = self.board.side_to_move();
-        let opp = !stm;
-        let our_king = self.board.king_square(stm);
-        let opp_king = self.board.king_square(opp);
-
-        // Game phase: higher = more pieces = more dangerous for exposed king
-        let opp_material = {
-            let opp_bb = *self.board.color_combined(opp);
-            let n = (self.board.pieces(Piece::Knight) & opp_bb).0.count_ones() as i32;
-            let b = (self.board.pieces(Piece::Bishop) & opp_bb).0.count_ones() as i32;
-            let r = (self.board.pieces(Piece::Rook) & opp_bb).0.count_ones() as i32;
-            let q = (self.board.pieces(Piece::Queen) & opp_bb).0.count_ones() as i32;
-            n * 1 + b * 1 + r * 2 + q * 4 // phase-like weight
-        };
-
-        // Only apply when opponent has significant material (midgame)
-        if opp_material < 4 {
-            return 0;
-        }
-
-        let mut penalty = 0i32;
-
-        // Our king exposure
-        penalty -= Self::king_exposure_penalty(our_king, stm, opp_material);
-        // Opponent king exposure (bonus for us)
-        penalty += Self::king_exposure_penalty(opp_king, opp, opp_material) / 2;
-
-        penalty
-    }
-
-    /// Calculate penalty for a single king based on rank and castling status.
-    /// Returns a positive value (penalty).
-    #[inline]
-    fn king_exposure_penalty(king_sq: Square, color: Color, opp_material: i32) -> i32 {
-        let rank = king_sq.to_index() / 8; // 0=rank1, 7=rank8
-        let file = king_sq.to_index() % 8;
-
-        // Effective rank from this color's perspective (0 = back rank)
-        let eff_rank = if color == Color::White {
-            rank
-        } else {
-            7 - rank
-        };
-
-        // King on back rank in corner area = likely castled = safe
-        if eff_rank == 0 && (file <= 2 || file >= 5) {
-            return 0;
-        }
-
-        // Penalty for king advanced beyond rank 1 (not castled)
-        // Scaled by opponent's attacking material
-        let rank_penalty = match eff_rank {
-            0 => {
-                // Back rank but in center (d1/e1) = hasn't castled
-                if file >= 3 && file <= 4 {
-                    15
-                } else {
-                    0
-                }
-            }
-            1 => 30, // Rank 2: moderate danger (Kd2, Ke2)
-            2 => 60, // Rank 3: serious danger (Kd3 in midgame = suicidal)
-            3 => 80, // Rank 4+: extreme
-            _ => 100,
-        };
-
-        // Scale penalty by opponent material (more pieces = more dangerous)
-        (rank_penalty * opp_material) / 8
-    }
-
-    /// Pawn chain correction: bonus for pawns defending each other diagonally.
-    /// From side-to-move perspective.
-    #[inline]
-    fn pawn_chain_correction(&self) -> i32 {
-        let white_bb = *self.board.color_combined(Color::White);
-        let black_bb = *self.board.color_combined(Color::Black);
-        let white_pawns = (self.board.pieces(Piece::Pawn) & white_bb).0;
-        let black_pawns = (self.board.pieces(Piece::Pawn) & black_bb).0;
-
-        // White pawn chains: pawn on (file, rank) defended by pawn on (file±1, rank-1)
-        // Shift white pawns NE and NW to find defenders
-        let w_defend_ne = (white_pawns >> 9) & 0xFEFEFEFEFEFEFEFE; // shift down-left
-        let w_defend_nw = (white_pawns >> 7) & 0x7F7F7F7F7F7F7F7F; // shift down-right
-        let w_defended = white_pawns & (w_defend_ne | w_defend_nw);
-        let w_chain = w_defended.count_ones() as i32;
-
-        // Black pawn chains: pawn defended by pawn on (file±1, rank+1)
-        let b_defend_se = (black_pawns << 7) & 0xFEFEFEFEFEFEFEFE; // shift up-left
-        let b_defend_sw = (black_pawns << 9) & 0x7F7F7F7F7F7F7F7F; // shift up-right
-        let b_defended = black_pawns & (b_defend_se | b_defend_sw);
-        let b_chain = b_defended.count_ones() as i32;
-
-        let chain_score = (w_chain - b_chain) * 8; // 8cp per connected pawn
-
-        if self.board.side_to_move() == Color::White {
-            chain_score
-        } else {
-            -chain_score
-        }
     }
 
     /// Compute a simple material configuration hash for correction history.

@@ -101,29 +101,6 @@ const MAX_BOOK_PLY: usize = 16;
 /// Raised from 2 to 10 to avoid weak lines (especially as Black).
 const MIN_WEIGHT: u32 = 10;
 
-/// Simple thread-local RNG for weighted book move selection.
-/// Uses xorshift64 seeded from system time — no external crate needed.
-fn simple_rand(max: u64) -> u64 {
-    use std::cell::Cell;
-    thread_local! {
-        static STATE: Cell<u64> = Cell::new({
-            let t = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            if t == 0 { 0xDEADBEEFCAFE } else { t }
-        });
-    }
-    STATE.with(|s| {
-        let mut x = s.get();
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        s.set(x);
-        x % max
-    })
-}
-
 /// Embedded opening books (compiled into binary for single-file distribution)
 static EMBEDDED_BOOK1: &[u8] = include_bytes!("book1.bin");
 static EMBEDDED_BOOK2: &[u8] = include_bytes!("book2.bin");
