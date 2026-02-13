@@ -1076,7 +1076,7 @@ impl SearchWorker {
         };
         let pawn_corr = self.pawn_correction[pawn_idx][stm];
 
-        // 3. Material correction history
+        // 2. Material correction history
         let mat_hash = self.material_hash();
         let mat_idx = (mat_hash as usize) % CORRECTION_HIST_SIZE;
         let mat_corr = self.material_correction[mat_idx][stm];
@@ -1085,7 +1085,7 @@ impl SearchWorker {
         let correction = (pawn_corr + mat_corr) / CORRECTION_GRAIN;
         eval += correction;
 
-        // 4. Material scaling: very mild reduction only for near-bare-king positions
+        // 3. Material scaling: very mild reduction only for near-bare-king positions
         // Endgame advantages are MORE decisive, so we only scale down when
         // material is extremely low (e.g., KP vs K scenarios where draws are likely)
         let total_pieces = self.board.combined().0.count_ones() as i32; // 2-32
