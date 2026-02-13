@@ -359,6 +359,9 @@ pub struct Searcher {
     pub move_overhead: u32,
     pub nnue: Option<Arc<NnueNetwork>>,
     pub syzygy: Option<Arc<SyzygyTB>>,
+    /// Handle to the outer search thread — joined before starting a new search
+    /// to prevent stop_flag race conditions between old and new workers.
+    prev_search_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Searcher {
@@ -370,11 +373,12 @@ impl Searcher {
             move_overhead: 60, // Default 60ms overhead
             nnue: None,
             syzygy: None,
+            prev_search_handle: None,
         }
     }
 
     pub fn search_async(
-        &self,
+        &mut self,
         board: Board,
         move_history: Vec<usize>,
         max_depth: u8,
@@ -399,10 +403,20 @@ impl Searcher {
         let ply = move_history.len() as u32;
         let pos_hist = Arc::new(position_history);
 
+        // --- Kill previous search threads before starting new ones ---
+        // Set stop_flag to signal old workers, then join the old outer thread.
+        // This prevents the race where an old worker's final stop_flag.store(true)
+        // poisons the new search (caused depth-1 collapse on Lichess).
+        stop_flag.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.prev_search_handle.take() {
+            let _ = handle.join();
+        }
+        stop_flag.store(false, Ordering::SeqCst);
+
         // Increment TT generation so stale entries get replaced
         tt.new_search();
 
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let time_manager = Arc::new(TimeManager::new(
                 wtime,
                 btime,
@@ -561,17 +575,21 @@ impl Searcher {
                                     worker.age_history();
                                 }
 
-                                // Time abort checks (only after minimum depth)
-                                if worker.stop_flag.load(Ordering::Relaxed) {
-                                    break;
-                                }
-                                if !depth_only && depth > MIN_DEPTH && depth > mate_verify_until {
-                                    if is_main {
-                                        if tm_clone.should_stop_soft() {
+                                // Time abort checks (only after minimum depth).
+                                // IMPORTANT: stop_flag must also respect MIN_DEPTH to prevent
+                                // depth-1 collapses from race conditions or stale signals.
+                                if depth > MIN_DEPTH && depth > mate_verify_until {
+                                    if worker.stop_flag.load(Ordering::Relaxed) {
+                                        break;
+                                    }
+                                    if !depth_only {
+                                        if is_main {
+                                            if tm_clone.should_stop_soft() {
+                                                break;
+                                            }
+                                        } else if tm_clone.should_stop() {
                                             break;
                                         }
-                                    } else if tm_clone.should_stop() {
-                                        break;
                                     }
                                 }
 
@@ -702,6 +720,7 @@ impl Searcher {
                 let _ = handle.join();
             }
         });
+        self.prev_search_handle = Some(handle);
     }
 }
 
