@@ -1018,7 +1018,7 @@ impl SearchWorker {
     // Classical eval (Material + PeSTO PSTs + positional terms) is the reliable
     // base.  The NNUE network is undertrained (material-blind), so we extract
     // only its *positional* component (nnue_score − material_balance) and clamp
-    // it to ±150 cp.  This preserves any positional patterns NNUE learned
+    // it to ±250 cp.  This preserves any positional patterns NNUE learned
     // without letting its material blindness pollute the evaluation.
     // =========================================================================
     #[inline(always)]
@@ -1040,7 +1040,7 @@ impl SearchWorker {
                 // Extract NNUE positional component by subtracting material.
                 // Clamp to prevent material-blind hallucinations.
                 let material = self.material_balance();
-                let nnue_positional = (nnue_score - material).clamp(-150, 150);
+                let nnue_positional = (nnue_score - material).clamp(-250, 250);
                 return classical + nnue_positional;
             }
         }
